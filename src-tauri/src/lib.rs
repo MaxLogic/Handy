@@ -9,6 +9,7 @@ mod chinese_script;
 pub mod cli;
 mod clipboard;
 mod commands;
+mod dictation_timing;
 pub mod engine_supervisor;
 mod helpers;
 mod input;
@@ -186,6 +187,9 @@ fn should_force_show_permissions_window(app: &AppHandle) -> bool {
 }
 
 fn initialize_core_logic(app_handle: &AppHandle) {
+    // Opt-in dictation timing records (HANDY_DICTATION_TIMING_FILE).
+    dictation_timing::init();
+
     // Note: Enigo (keyboard/mouse simulation) is NOT initialized here.
     // The frontend is responsible for calling the `initialize_enigo` command
     // after onboarding completes. This avoids triggering permission dialogs
@@ -1119,10 +1123,12 @@ pub fn run(cli_args: CliArgs) {
             }
             show_main_window(app);
         }
-        // No transcription teardown on exit: transcribe.cpp runs only in the
+        // Only the timing log's end marker is written on exit. There is no
+        // transcription teardown: transcribe.cpp runs only in the
         // worker process, which exits by itself as soon as this process's end
         // of its stdin closes, even if it is hung. Waiting on an unload here
         // could block quitting behind a hung model load.
+        tauri::RunEvent::Exit => dictation_timing::finish_session(),
         _ => {}
     });
 }

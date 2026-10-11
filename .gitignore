@@ -45,3 +45,6 @@ result
 
 # Python bytecode (scripts/)
 __pycache__/
+
+# Local measurement output (dictation timing records, correctness outputs)
+artifacts/

@@ -587,6 +587,8 @@ impl TranscriptionManager {
             .get_model_path(model_id)
             .inspect_err(|error| emit_loading_failed(&error.to_string()))?;
 
+        crate::dictation_timing::note_model_load_attempt();
+
         // Drop the current engine BEFORE building the new one so the previous
         // model is freed first — avoids holding two models at once (peak memory
         // on large GGUFs). A transcribe-cpp load replaces its worker the same
@@ -1088,13 +1090,15 @@ impl TranscriptionManager {
         let settings = get_settings(&self.app_handle);
         // Streaming models do not receive a decode prompt, so custom words
         // always go through the shared fuzzy post-correction path.
-        let filtered = post_process_transcription_text(
-            finalized.text,
-            &settings,
-            false,
-            &finalized.output_language,
-            &finalized.supported_languages,
-        );
+        let filtered = crate::dictation_timing::time_text_cleanup(|| {
+            post_process_transcription_text(
+                finalized.text,
+                &settings,
+                false,
+                &finalized.output_language,
+                &finalized.supported_languages,
+            )
+        });
 
         self.maybe_unload_immediately("streaming transcription");
         Ok(Some(filtered))
@@ -1209,13 +1213,15 @@ impl TranscriptionManager {
         // family). We don't pass a prompt to non-whisper models (it requires the
         // whisper-kind run extension), so they still get fuzzy correction here,
         // same as the ONNX engines.
-        let filtered_result = post_process_transcription_text(
-            run.text,
-            &settings,
-            run.model_is_whisper,
-            &output_language,
-            &run.languages,
-        );
+        let filtered_result = crate::dictation_timing::time_text_cleanup(|| {
+            post_process_transcription_text(
+                run.text,
+                &settings,
+                run.model_is_whisper,
+                &output_language,
+                &run.languages,
+            )
+        });
 
         let et = std::time::Instant::now();
         let translation_note = if settings.translate_to_english {

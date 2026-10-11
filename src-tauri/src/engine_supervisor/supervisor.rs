@@ -354,6 +354,8 @@ impl EngineSupervisor {
     }
 
     fn ask<T>(&self, command: impl FnOnce(Reply<T>) -> Command) -> Option<T> {
+        // Counts this command as outstanding until its answer arrives.
+        let _pending = crate::dictation_timing::engine_pending_guard();
         let (reply, answer) = mpsc::channel();
         self.commands.send(command(reply)).ok()?;
         answer.recv().ok()
@@ -1132,6 +1134,7 @@ impl Worker {
         }
         let mut child = command.spawn()?;
         let pid = child.id();
+        crate::dictation_timing::note_worker_spawned(pid);
         let stdin = child.stdin.take().expect("stdin is piped");
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
