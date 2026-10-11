@@ -6,54 +6,74 @@
 //! requests the data — that message is the read receipt. The previous
 //! clipboard contents (snapshotted with full format fidelity) are restored
 //! once receipts go quiet (see `paste_tx::evaluate`), guarded by the clipboard
-//! sequence number so we never clobber a newer user copy.
+//! owner and sequence number, both rechecked under the clipboard lock, so we
+//! never clobber a newer user copy.
 //!
 //! Threading: clipboard ownership and delayed rendering are per-thread and
 //! need a message pump, so the whole transaction lives on a dedicated worker
 //! thread. The calling thread only sends the paste chord once the worker
 //! signals the transcript is published, then returns; the wait, guarded
 //! restore and auto-submit all finish on the worker.
+//!
+//! Two transaction modes share this machinery:
+//! - `Dictation`: the debug-gated reliable dictation paste (best-effort
+//!   snapshot, optional auto-submit, legacy fallback on start failure).
+//! - `Strict`: the assistant replacement commit (`StrictClipboardTx`): a
+//!   lossless snapshot or refusal, no auto-submit, and an explicit settlement
+//!   report the caller waits for.
 
-use std::sync::{mpsc::Sender, Arc, Mutex, Once};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, Once};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use log::{error, info, warn};
 use tauri::Manager;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    SetLastError, ERROR_SUCCESS, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
+    GetLastError, GlobalFree, SetLastError, ERROR_SUCCESS, HANDLE, HGLOBAL, HINSTANCE, HWND,
+    LPARAM, LRESULT, WPARAM,
 };
-
-use super::{evaluate, send_chord, TxState, WaitDecision};
-use crate::clipboard::send_return_key;
-use crate::input::EnigoState;
-use crate::settings::{AutoSubmitKey, ClipboardHandling, PasteMethod};
-use windows::Win32::Foundation::GlobalFree;
+use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardOwner,
-    GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
-use windows::Win32::System::Ole::{
-    CF_BITMAP, CF_DSPBITMAP, CF_DSPENHMETAFILE, CF_DSPMETAFILEPICT, CF_DSPTEXT, CF_ENHMETAFILE,
-    CF_OWNERDISPLAY, CF_PALETTE, CF_UNICODETEXT,
-};
 use windows::Win32::UI::WindowsAndMessaging::{
     CopyImage, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, KillTimer, PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW,
-    GDI_IMAGE_TYPE, GWLP_USERDATA, HWND_MESSAGE, IMAGE_FLAGS, MSG, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_DESTROYCLIPBOARD, WM_RENDERALLFORMATS, WM_RENDERFORMAT, WM_TIMER, WNDCLASSW,
+    GetWindowLongPtrW, KillTimer, MsgWaitForMultipleObjectsEx, PeekMessageW, PostQuitMessage,
+    RegisterClassW, SetTimer, SetWindowLongPtrW, GDI_IMAGE_TYPE, GWLP_USERDATA, HWND_MESSAGE,
+    IMAGE_FLAGS, MSG, MWMO_INPUTAVAILABLE, PM_NOREMOVE, PM_QS_SENDMESSAGE, QS_SENDMESSAGE,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROYCLIPBOARD, WM_RENDERALLFORMATS, WM_RENDERFORMAT,
+    WM_TIMER, WNDCLASSW,
 };
+
+use super::{
+    adopt_render_sequence, evaluate, format_action, judge_read, on_render_all_request,
+    on_render_request, preempt, retry_aborted_restore, retry_clipboard_open, send_chord,
+    settle_guarded, snapshot_and_publish, strict_settle_action, ClipboardOps, ClipboardSettlement,
+    FormatAction, FormatRead, LossyFormat, LossyReason, PublishError, SettleAction, SnapshotPolicy,
+    StrictSettlement, TxState, WaitDecision, CF_BITMAP, CF_UNICODETEXT, RESTORE_TIMEOUT,
+};
+use crate::clipboard::send_return_key;
+use crate::input::EnigoState;
+use crate::settings::{AutoSubmitKey, ClipboardHandling, PasteMethod};
 
 const CLASS_NAME: PCWSTR = w!("HandyPasteTxWindow");
 const TIMER_ID: usize = 1;
 const TIMER_INTERVAL_MS: u32 = 25;
-/// Skip clipboard formats larger than this when snapshotting.
-const MAX_FORMAT_BYTES: usize = 64 * 1024 * 1024;
+/// `OpenClipboard` attempts before giving up (another process may hold it).
+const OPEN_ATTEMPTS: u32 = 10;
+const OPEN_RETRY_DELAY: Duration = Duration::from_millis(25);
+/// How long a strict caller waits for the worker to publish.
+const STRICT_PUBLISH_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a preemptor, or an abort, waits for a settlement in progress.
+const SETTLE_WAIT: Duration = Duration::from_secs(2);
 
 const IMAGE_BITMAP_TYPE: GDI_IMAGE_TYPE = GDI_IMAGE_TYPE(0);
 const LR_CREATEDIBSECTION_FLAG: IMAGE_FLAGS = IMAGE_FLAGS(0x2000);
@@ -63,19 +83,105 @@ struct SavedFormat {
     data: Vec<u8>,
 }
 
+/// Clipboard snapshot. Owns a copied HBITMAP until it is handed to the
+/// clipboard; dropping it otherwise deletes the bitmap.
+#[derive(Default)]
+pub(super) struct WinSnapshot {
+    formats: Vec<SavedFormat>,
+    /// Copied HBITMAP as a raw value (HBITMAP is not `Send`).
+    bitmap: Option<usize>,
+}
+
+impl Drop for WinSnapshot {
+    fn drop(&mut self) {
+        if let Some(raw) = self.bitmap.take() {
+            // SAFETY: the bitmap was created by CopyImage for this snapshot
+            // and was never handed to the clipboard (that path takes it).
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(raw as *mut _));
+            }
+        }
+    }
+}
+
+/// Sends the dictation auto-submit key. Built by the dictation entry point so
+/// the shared settle code never references tauri state.
+type AutoSubmitAction = Box<dyn Fn() + Send + Sync>;
+
+enum TxMode {
+    Dictation {
+        /// `Some` when auto-submit is enabled.
+        auto_submit: Option<AutoSubmitAction>,
+        /// ClipboardHandling::CopyToClipboard — settle by leaving the
+        /// transcript on the clipboard as plain text instead of restoring.
+        preserve_transcript: bool,
+    },
+    Strict {
+        after_success: ClipboardHandling,
+    },
+}
+
 pub(super) struct WinTxShared {
     state: Mutex<TxState>,
     text: String,
-    snapshot: Mutex<Vec<SavedFormat>>,
-    /// Copied HBITMAP (as raw usize), restored via SetClipboardData.
-    saved_bitmap: Mutex<Option<usize>>,
+    policy: SnapshotPolicy,
+    snapshot: Mutex<Option<WinSnapshot>>,
     sequence: Mutex<u32>,
-    app_handle: tauri::AppHandle,
-    auto_submit: bool,
-    auto_submit_key: AutoSubmitKey,
-    /// ClipboardHandling::CopyToClipboard — settle by leaving the transcript
-    /// on the clipboard as plain text instead of restoring the snapshot.
-    preserve_transcript: bool,
+    /// The owner window (raw HWND), 0 until created.
+    hwnd: AtomicUsize,
+    /// The publishing caller gave up waiting: do not publish.
+    abandoned: AtomicBool,
+    /// A settlement is in progress or completed. Cleared for abort retries.
+    settled: AtomicBool,
+    /// Set once settlement completed.
+    outcome: Mutex<Option<StrictSettlement>>,
+    outcome_ready: Condvar,
+    mode: TxMode,
+}
+
+impl WinTxShared {
+    fn new(text: &str, policy: SnapshotPolicy, mode: TxMode) -> Self {
+        Self {
+            state: Mutex::new(TxState::new()),
+            text: text.to_string(),
+            policy,
+            snapshot: Mutex::new(None),
+            sequence: Mutex::new(0),
+            hwnd: AtomicUsize::new(0),
+            abandoned: AtomicBool::new(false),
+            settled: AtomicBool::new(false),
+            outcome: Mutex::new(None),
+            outcome_ready: Condvar::new(),
+            mode,
+        }
+    }
+
+    fn hwnd(&self) -> HWND {
+        HWND(self.hwnd.load(Ordering::SeqCst) as *mut _)
+    }
+
+    fn sequence(&self) -> u32 {
+        *self.sequence.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Waits until settlement completed, bounded.
+    fn wait_outcome(&self, timeout: Duration) -> Option<StrictSettlement> {
+        let deadline = Instant::now() + timeout;
+        let mut slot = self.outcome.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if let Some(outcome) = slot.as_ref() {
+                return Some(outcome.clone());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            slot = match self.outcome_ready.wait_timeout(slot, deadline - now) {
+                Ok((guard, _)) => guard,
+                Err(p) => p.into_inner().0,
+            };
+        }
+    }
 }
 
 /// The transaction currently holding the clipboard, if any. A new
@@ -93,6 +199,13 @@ unsafe fn shared_ptr(hwnd: HWND) -> *const WinTxShared {
 /// Sends the auto-submit Enter. Uses `try_lock` because the paste caller may
 /// currently hold the enigo lock while waiting for this worker.
 fn send_auto_submit(shared: &WinTxShared) {
+    let TxMode::Dictation {
+        auto_submit: Some(action),
+        ..
+    } = &shared.mode
+    else {
+        return;
+    };
     {
         let mut st = match shared.state.lock() {
             Ok(st) => st,
@@ -103,38 +216,32 @@ fn send_auto_submit(shared: &WinTxShared) {
         }
         st.auto_submit_sent = true;
     }
-    if let Some(enigo_state) = shared.app_handle.try_state::<EnigoState>() {
-        match enigo_state.0.try_lock() {
-            Ok(mut enigo) => {
-                let _ = send_return_key(&mut enigo, shared.auto_submit_key);
-            }
-            Err(_) => warn!("[reliable-paste] skipping auto-submit: input state busy"),
-        }
-    }
+    action();
 }
 
-/// Renders the promised transcript into the clipboard, which must already be
+/// Writes `text` as CF_UNICODETEXT into the clipboard, which must already be
 /// open: the system opens it on our behalf for WM_RENDERFORMAT; every other
 /// caller has to wrap this in OpenClipboard/CloseClipboard itself.
-unsafe fn render_text(shared: &WinTxShared) {
-    let wide_text: Vec<u16> = shared
-        .text
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let Ok(hg) = GlobalAlloc(GMEM_MOVEABLE, wide_text.len() * 2) else {
-        return;
-    };
+unsafe fn render_text(text: &str) -> Result<(), String> {
+    #[cfg(test)]
+    let before = GetClipboardSequenceNumber();
+    let wide_text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let hg = GlobalAlloc(GMEM_MOVEABLE, wide_text.len() * 2)
+        .map_err(|e| format!("GlobalAlloc failed: {e}"))?;
     let ptr = GlobalLock(hg) as *mut u16;
     if ptr.is_null() {
         let _ = GlobalFree(Some(hg));
-        return;
+        return Err("GlobalLock failed".into());
     }
     std::ptr::copy_nonoverlapping(wide_text.as_ptr(), ptr, wide_text.len());
     let _ = GlobalUnlock(hg);
-    if SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hg.0))).is_err() {
+    if let Err(e) = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(hg.0))) {
         let _ = GlobalFree(Some(hg));
+        return Err(format!("SetClipboardData failed: {e}"));
     }
+    #[cfg(test)]
+    diag::note_locked_change(before, GetClipboardSequenceNumber());
+    Ok(())
 }
 
 unsafe extern "system" fn paste_wnd_proc(
@@ -148,11 +255,40 @@ unsafe extern "system" fn paste_wnd_proc(
         WM_RENDERFORMAT => {
             if !shared.is_null() {
                 let shared = &*shared;
-                if let Ok(mut st) = shared.state.lock() {
-                    st.record_receipt(Instant::now());
-                }
-                if wparam.0 as u32 == CF_UNICODETEXT.0 as u32 {
-                    render_text(shared);
+                let strict = matches!(shared.mode, TxMode::Strict { .. });
+                // See `on_render_request` for the strict pre-injection rule.
+                let render = match shared.state.lock() {
+                    Ok(mut st) => {
+                        // Only the ignored diagnostic can disable D1. Production
+                        // always declines eager reads before injection.
+                        #[cfg(test)]
+                        let strict = strict && diag::DECLINE.load(Ordering::SeqCst);
+                        #[cfg(test)]
+                        let injected = st.injected_at;
+                        let r = on_render_request(&mut st, strict, Instant::now());
+                        #[cfg(test)]
+                        diag::record(diag::Event::Render {
+                            at: Instant::now(),
+                            after_injection: injected.is_some(),
+                            rendered: r,
+                            reader_pid: diag::open_clipboard_pid(),
+                        });
+                        r
+                    }
+                    Err(_) => !strict,
+                };
+                if render && wparam.0 as u32 == CF_UNICODETEXT {
+                    // Whether rendering bumps the sequence number is not
+                    // documented; adopt a bump only if the value before it
+                    // was ours, so the settle guard keeps working either way.
+                    let before = GetClipboardSequenceNumber();
+                    if let Err(e) = render_text(&shared.text) {
+                        warn!("[reliable-paste] rendering the promise failed: {e}");
+                    }
+                    let after = GetClipboardSequenceNumber();
+                    if let Ok(mut seq) = shared.sequence.lock() {
+                        *seq = adopt_render_sequence(*seq, before, after);
+                    }
                 }
             }
             LRESULT(0)
@@ -164,12 +300,21 @@ unsafe extern "system" fn paste_wnd_proc(
             // our behalf here: open it and confirm we still own it first.
             if !shared.is_null() {
                 let shared = &*shared;
+                let strict = matches!(shared.mode, TxMode::Strict { .. });
+                let allowed = shared
+                    .state
+                    .lock()
+                    .map(|st| on_render_all_request(&st, strict))
+                    .unwrap_or(!strict);
+                if !allowed {
+                    return LRESULT(0);
+                }
                 if OpenClipboard(Some(hwnd)).is_ok() {
                     if GetClipboardOwner()
                         .map(|owner| owner == hwnd)
                         .unwrap_or(false)
                     {
-                        render_text(shared);
+                        let _ = render_text(&shared.text);
                     }
                     let _ = CloseClipboard();
                 }
@@ -186,7 +331,7 @@ unsafe extern "system" fn paste_wnd_proc(
         }
         WM_TIMER => {
             if !shared.is_null() {
-                on_timer(hwnd, &*shared);
+                on_timer(&*shared);
             }
             LRESULT(0)
         }
@@ -209,164 +354,269 @@ fn ensure_window_class(hinstance: HINSTANCE) {
     });
 }
 
-/// If a previous transaction is still holding the clipboard, settle it now so
-/// the snapshot below captures the user's original clipboard content. The
-/// previous worker observes `cancelled` on its next timer tick and tears down
-/// without restoring.
-fn flush_pending() {
-    let previous = match PENDING.lock() {
-        Ok(mut slot) => slot.take(),
-        Err(_) => None,
-    };
-    let Some(previous) = previous else {
-        return;
-    };
-    let receipt = {
-        let mut st = match previous.state.lock() {
-            Ok(st) => st,
-            Err(_) => return,
-        };
-        st.cancelled = true;
-        st.any_receipt_after_injection()
-    };
-    if previous.auto_submit && receipt {
-        send_auto_submit(&previous);
-    }
-    let sequence = *previous.sequence.lock().unwrap();
-    let still_ours = unsafe { GetClipboardSequenceNumber() } == sequence;
-    if still_ours {
-        unsafe { settle_clipboard(&previous) };
-    }
+/// `ClipboardOps` over the Win32 clipboard for one transaction.
+struct WinClipboard<'a> {
+    shared: &'a WinTxShared,
+    /// Window passed to `OpenClipboard`. Publishing must use the owner window
+    /// (EmptyClipboard then makes it the owner of the delayed promise);
+    /// settlement opens with `None`, as the restore path always has.
+    open_as: Option<HWND>,
+    is_open: bool,
+    #[cfg(test)]
+    opened_sequence: u32,
 }
 
-/// Settle-time clipboard handling once we know we still own the clipboard:
-/// restore the snapshot, or — for ClipboardHandling::CopyToClipboard — replace
-/// the concealed promise with plain transcript text, so clipboard history and
-/// managers record it and it survives this transaction's window going away.
-unsafe fn settle_clipboard(shared: &WinTxShared) {
-    if !shared.preserve_transcript {
-        restore_snapshot(shared);
-        return;
-    }
-    if OpenClipboard(None).is_err() {
-        warn!("[reliable-paste] could not open clipboard to leave transcript");
-        return;
-    }
-    let _ = EmptyClipboard();
-    render_text(shared);
-    let _ = CloseClipboard();
-    info!("[reliable-paste] left transcript on clipboard as plain text");
-}
-
-/// Restores the snapshotted clipboard contents. Safe to call from any thread.
-unsafe fn restore_snapshot(shared: &WinTxShared) {
-    if OpenClipboard(None).is_err() {
-        warn!("[reliable-paste] could not open clipboard to restore");
-        return;
-    }
-    let _ = EmptyClipboard();
-    if let Ok(formats) = shared.snapshot.lock() {
-        for saved in formats.iter() {
-            if saved.data.is_empty() {
-                continue;
-            }
-            let Ok(hg) = GlobalAlloc(GMEM_MOVEABLE, saved.data.len()) else {
-                continue;
-            };
-            let ptr = GlobalLock(hg) as *mut u8;
-            if ptr.is_null() {
-                let _ = GlobalFree(Some(hg));
-                continue;
-            }
-            std::ptr::copy_nonoverlapping(saved.data.as_ptr(), ptr, saved.data.len());
-            let _ = GlobalUnlock(hg);
-            // SetClipboardData takes ownership of the handle on success.
-            if SetClipboardData(saved.format, Some(HANDLE(hg.0))).is_err() {
-                let _ = GlobalFree(Some(hg));
-            }
+impl<'a> WinClipboard<'a> {
+    fn new(shared: &'a WinTxShared, open_as: Option<HWND>) -> Self {
+        Self {
+            shared,
+            open_as,
+            is_open: false,
+            #[cfg(test)]
+            opened_sequence: 0,
         }
     }
-    if let Ok(mut bitmap) = shared.saved_bitmap.lock() {
-        if let Some(raw) = bitmap.take() {
-            let _ = SetClipboardData(CF_BITMAP.0 as u32, Some(HANDLE(raw as *mut _)));
-        }
-    }
-    let _ = CloseClipboard();
-    info!("[reliable-paste] restored previous clipboard");
 }
 
-unsafe fn snapshot_clipboard(hwnd: HWND, shared: &WinTxShared) -> Result<(), String> {
-    OpenClipboard(Some(hwnd)).map_err(|e| format!("OpenClipboard failed: {e}"))?;
-    let mut formats = Vec::new();
-    let mut format = 0u32;
+impl Drop for WinClipboard<'_> {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// A format whose explicit write failed is still restored when the system
+/// synthesizes it from a format already written (e.g. CF_DIBV5 and CF_BITMAP
+/// from CF_DIB, CF_TEXT from CF_UNICODETEXT); observed live for CF_DIB.
+unsafe fn synthesized(format: u32) -> bool {
+    IsClipboardFormatAvailable(format).is_ok()
+}
+
+/// Dispatch only nonqueued sent messages while waiting for a clipboard reader.
+/// A GetClipboardData sender can hold the clipboard until our WM_RENDERFORMAT
+/// returns. Do not dispatch timers here: settlement holds the snapshot lock.
+fn wait_for_clipboard_retry(delay: Duration) {
+    #[cfg(test)]
+    diag::run_on_clipboard_retry();
+    let deadline = Instant::now() + delay;
     loop {
-        format = EnumClipboardFormats(format);
-        if format == 0 {
-            break;
+        // SAFETY: PeekMessage dispatches sent messages without removing queued
+        // messages; WM_RENDERFORMAT takes no snapshot lock and declines D1 reads.
+        unsafe {
+            let mut msg = MSG::default();
+            let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let _ = MsgWaitForMultipleObjectsEx(
+                None,
+                remaining.as_millis().max(1) as u32,
+                QS_SENDMESSAGE,
+                MWMO_INPUTAVAILABLE,
+            );
         }
-        if format == CF_BITMAP.0 as u32 {
-            // GDI object, not global memory: duplicate the handle instead.
-            if let Ok(handle) = GetClipboardData(CF_BITMAP.0 as u32) {
-                if let Ok(copy) =
-                    CopyImage(handle, IMAGE_BITMAP_TYPE, 0, 0, LR_CREATEDIBSECTION_FLAG)
-                {
-                    if let Ok(mut slot) = shared.saved_bitmap.lock() {
-                        *slot = Some(copy.0 as usize);
+    }
+}
+
+/// Reads one global-memory format. Returns the read classification and the
+/// bytes when they could be copied.
+unsafe fn read_memory_format(format: u32) -> (FormatRead, Option<Vec<u8>>) {
+    let Ok(handle) = GetClipboardData(format) else {
+        return (FormatRead::Unreadable, None);
+    };
+    let hg = HGLOBAL(handle.0);
+    let size = GlobalSize(hg);
+    if size == 0 || size > super::MAX_FORMAT_BYTES {
+        return (
+            FormatRead::Memory {
+                size,
+                locked: false,
+            },
+            None,
+        );
+    }
+    let ptr = GlobalLock(hg) as *const u8;
+    if ptr.is_null() {
+        return (
+            FormatRead::Memory {
+                size,
+                locked: false,
+            },
+            None,
+        );
+    }
+    let data = std::slice::from_raw_parts(ptr, size).to_vec();
+    let _ = GlobalUnlock(hg);
+    (FormatRead::Memory { size, locked: true }, Some(data))
+}
+
+impl ClipboardOps for WinClipboard<'_> {
+    type Snapshot = WinSnapshot;
+
+    fn open(&mut self) -> Result<(), String> {
+        retry_clipboard_open(
+            OPEN_ATTEMPTS,
+            OPEN_RETRY_DELAY,
+            || unsafe { OpenClipboard(self.open_as) }.map_err(|e| e.to_string()),
+            wait_for_clipboard_retry,
+        )?;
+        self.is_open = true;
+        #[cfg(test)]
+        {
+            self.opened_sequence = self.sequence();
+            diag::note_locked_change(self.opened_sequence, self.opened_sequence);
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        if self.is_open {
+            #[cfg(test)]
+            diag::note_locked_change(self.opened_sequence, self.sequence());
+            self.is_open = false;
+            if let Err(e) = unsafe { CloseClipboard() } {
+                warn!("[reliable-paste] CloseClipboard failed: {e}");
+            }
+        }
+    }
+
+    fn sequence(&self) -> u32 {
+        unsafe { GetClipboardSequenceNumber() }
+    }
+
+    fn owned_by_tx(&self) -> bool {
+        let ours = self.shared.hwnd();
+        !ours.is_invalid()
+            && unsafe { GetClipboardOwner() }
+                .map(|owner| owner == ours)
+                .unwrap_or(false)
+    }
+
+    fn snapshot(&mut self, policy: SnapshotPolicy) -> Result<WinSnapshot, LossyFormat> {
+        let mut snapshot = WinSnapshot::default();
+        let mut format = 0u32;
+        loop {
+            // EnumClipboardFormats returns 0 both at the end and on failure;
+            // only a nonzero thread error distinguishes them.
+            unsafe { SetLastError(ERROR_SUCCESS) };
+            format = unsafe { EnumClipboardFormats(format) };
+            if format == 0 {
+                if unsafe { GetLastError() } != ERROR_SUCCESS && policy == SnapshotPolicy::Strict {
+                    return Err(LossyFormat {
+                        format: 0,
+                        reason: LossyReason::EnumerationFailed,
+                    });
+                }
+                break;
+            }
+            match format_action(policy, format) {
+                FormatAction::Skip => {}
+                FormatAction::Reject(reason) => return Err(LossyFormat { format, reason }),
+                FormatAction::CopyBitmap => {
+                    // GDI object, not global memory: duplicate the bitmap.
+                    let copy = unsafe {
+                        GetClipboardData(CF_BITMAP).ok().and_then(|handle| {
+                            CopyImage(handle, IMAGE_BITMAP_TYPE, 0, 0, LR_CREATEDIBSECTION_FLAG)
+                                .ok()
+                        })
+                    };
+                    let read = FormatRead::Bitmap {
+                        copied: copy.is_some(),
+                    };
+                    match judge_read(policy, read) {
+                        Ok(true) => {
+                            if let Some(copy) = copy {
+                                if let Some(old) = snapshot.bitmap.replace(copy.0 as usize) {
+                                    unsafe {
+                                        let _ = DeleteObject(HGDIOBJ(old as *mut _));
+                                    }
+                                }
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(reason) => return Err(LossyFormat { format, reason }),
+                    }
+                }
+                FormatAction::ReadMemory => {
+                    let (read, data) = unsafe { read_memory_format(format) };
+                    match judge_read(policy, read) {
+                        Ok(true) => {
+                            if let Some(data) = data {
+                                snapshot.formats.push(SavedFormat { format, data });
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(reason) => return Err(LossyFormat { format, reason }),
                     }
                 }
             }
-            continue;
         }
-        // Formats whose handles are not plain global memory cannot be
-        // byte-copied; skipping them matches what the legacy path restored.
-        if format == CF_ENHMETAFILE.0 as u32
-            || format == CF_DSPENHMETAFILE.0 as u32
-            || format == CF_DSPBITMAP.0 as u32
-            || format == CF_DSPMETAFILEPICT.0 as u32
-            || format == CF_DSPTEXT.0 as u32
-            || format == CF_OWNERDISPLAY.0 as u32
-            || format == CF_PALETTE.0 as u32
-        {
-            continue;
-        }
-        if let Ok(handle) = GetClipboardData(format) {
-            let hg = HGLOBAL(handle.0);
-            let size = GlobalSize(hg);
-            if size == 0 || size > MAX_FORMAT_BYTES {
-                continue;
+        Ok(snapshot)
+    }
+
+    fn publish_promise(&mut self) -> Result<(), String> {
+        unsafe { publish_formats() }
+    }
+
+    fn write_snapshot(&mut self, snapshot: &mut WinSnapshot) -> Result<(), String> {
+        unsafe {
+            EmptyClipboard().map_err(|e| format!("EmptyClipboard failed: {e}"))?;
+            let mut failed: Vec<u32> = Vec::new();
+            for saved in snapshot.formats.iter() {
+                if saved.data.is_empty() {
+                    continue;
+                }
+                let Ok(hg) = GlobalAlloc(GMEM_MOVEABLE, saved.data.len()) else {
+                    failed.push(saved.format);
+                    continue;
+                };
+                let ptr = GlobalLock(hg) as *mut u8;
+                if ptr.is_null() {
+                    let _ = GlobalFree(Some(hg));
+                    failed.push(saved.format);
+                    continue;
+                }
+                std::ptr::copy_nonoverlapping(saved.data.as_ptr(), ptr, saved.data.len());
+                let _ = GlobalUnlock(hg);
+                // SetClipboardData takes ownership of the handle on success.
+                if SetClipboardData(saved.format, Some(HANDLE(hg.0))).is_err() {
+                    let _ = GlobalFree(Some(hg));
+                    if !synthesized(saved.format) {
+                        failed.push(saved.format);
+                    }
+                }
             }
-            let ptr = GlobalLock(hg) as *const u8;
-            if ptr.is_null() {
-                continue;
+            if let Some(raw) = snapshot.bitmap.take() {
+                if SetClipboardData(CF_BITMAP, Some(HANDLE(raw as *mut _))).is_err() {
+                    let _ = DeleteObject(HGDIOBJ(raw as *mut _));
+                    if !synthesized(CF_BITMAP) {
+                        failed.push(CF_BITMAP);
+                    }
+                }
             }
-            let data = std::slice::from_raw_parts(ptr, size).to_vec();
-            let _ = GlobalUnlock(hg);
-            formats.push(SavedFormat { format, data });
+            if failed.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("could not restore clipboard formats {failed:?}"))
+            }
         }
     }
-    let _ = CloseClipboard();
-    if let Ok(mut slot) = shared.snapshot.lock() {
-        *slot = formats;
+
+    fn write_text(&mut self, text: &str) -> Result<(), String> {
+        unsafe {
+            EmptyClipboard().map_err(|e| format!("EmptyClipboard failed: {e}"))?;
+            render_text(text)
+        }
     }
-    Ok(())
+
+    fn abandoned(&self) -> bool {
+        self.shared.abandoned.load(Ordering::SeqCst)
+    }
 }
 
 /// Publishes the transcript as a delayed-render promise plus clipboard
 /// history / cloud / monitoring opt-out markers (the same formats Chrome uses
-/// for Incognito copies). Returns the new clipboard sequence number.
-unsafe fn publish(hwnd: HWND) -> Result<u32, String> {
-    OpenClipboard(Some(hwnd)).map_err(|e| format!("OpenClipboard failed: {e}"))?;
-    let published = publish_formats();
-    let closed = CloseClipboard();
-    published?;
-    closed.map_err(|e| format!("CloseClipboard failed: {e}"))?;
-    Ok(GetClipboardSequenceNumber())
-}
-
-/// Everything `publish` does while the clipboard is open, split out so
-/// `publish` closes the clipboard on every path — bailing out while holding it
-/// open (and possibly already emptied) would strand the clipboard and leave
-/// the legacy fallback snapshotting nothing.
+/// for Incognito copies). The clipboard must be open with the owner window.
 unsafe fn publish_formats() -> Result<(), String> {
     EmptyClipboard().map_err(|e| format!("EmptyClipboard failed: {e}"))?;
 
@@ -402,7 +652,7 @@ unsafe fn publish_formats() -> Result<(), String> {
     // thread error must be cleared first so a stale value from an earlier
     // call can't masquerade as one.
     SetLastError(ERROR_SUCCESS);
-    if let Err(e) = SetClipboardData(CF_UNICODETEXT.0 as u32, None) {
+    if let Err(e) = SetClipboardData(CF_UNICODETEXT, None) {
         if e.code().is_err() {
             return Err(format!("SetClipboardData failed: {e}"));
         }
@@ -410,7 +660,135 @@ unsafe fn publish_formats() -> Result<(), String> {
     Ok(())
 }
 
-fn on_timer(_hwnd: HWND, shared: &WinTxShared) {
+/// Settles a transaction exactly once: optional auto-submit (dictation), then
+/// the lock-guarded clipboard settlement, then the outcome report.
+/// `auto_submit_now` overrides the receipt-based auto-submit decision (used by
+/// a preemptor); `None` means "auto-submit iff the target read the text".
+fn finish_tx(shared: &WinTxShared, auto_submit_now: Option<bool>) {
+    if shared.settled.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let (receipt, ownership_lost, injected, injection_failed, aborted, preempted) = {
+        let st = shared.state.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            st.any_receipt_after_injection(),
+            st.ownership_lost,
+            st.injected_at.is_some(),
+            st.injection_failed,
+            st.aborted,
+            st.preempted,
+        )
+    };
+    if ownership_lost {
+        info!("[reliable-paste] settling: clipboard ownership lost");
+    } else if aborted {
+        info!("[reliable-paste] settling: transaction aborted before delivery");
+    } else if preempted {
+        info!("[reliable-paste] settling: preempted by a newer paste");
+    } else if receipt {
+        info!("[reliable-paste] settling: reads went quiet");
+    } else if injection_failed {
+        info!("[reliable-paste] settling: chord injection failed, restoring quickly");
+    } else {
+        info!("[reliable-paste] settling: no read within timeout, restoring anyway");
+    }
+
+    let action = match &shared.mode {
+        TxMode::Dictation {
+            auto_submit,
+            preserve_transcript,
+            ..
+        } => {
+            // Auto-submit only once the target demonstrably read the
+            // transcript; pressing Enter after an unconfirmed paste could
+            // submit stale content.
+            if auto_submit.is_some() && auto_submit_now.unwrap_or(receipt) {
+                send_auto_submit(shared);
+            }
+            if *preserve_transcript {
+                SettleAction::LeaveText
+            } else {
+                SettleAction::Restore
+            }
+        }
+        TxMode::Strict { after_success } => {
+            strict_settle_action(injected, injection_failed, aborted, *after_success)
+        }
+    };
+
+    let expected = shared.sequence();
+    let clipboard = {
+        let mut clip = WinClipboard::new(shared, None);
+        let mut snapshot = shared.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        settle_guarded(
+            &mut clip,
+            snapshot.as_mut(),
+            expected,
+            ownership_lost,
+            action,
+            &shared.text,
+        )
+    };
+    match &clipboard {
+        ClipboardSettlement::Restored => info!("[reliable-paste] restored previous clipboard"),
+        ClipboardSettlement::LeftReplacement => {
+            info!("[reliable-paste] left transcript on clipboard as plain text")
+        }
+        ClipboardSettlement::ExternallyChanged => {
+            info!("[reliable-paste] clipboard changed externally; leaving it untouched")
+        }
+        ClipboardSettlement::RestoreFailed(e) => {
+            warn!("[reliable-paste] clipboard settlement failed: {e}")
+        }
+        other => info!("[reliable-paste] clipboard settlement: {other:?}"),
+    }
+
+    if retry_aborted_restore(
+        matches!(shared.mode, TxMode::Strict { .. }),
+        aborted || !injected || injection_failed,
+        &clipboard,
+    ) {
+        shared.settled.store(false, Ordering::SeqCst);
+        // No outcome yet: on_timer retains the window and retries. A later
+        // ownership/sequence change will finish as ExternallyChanged.
+        return;
+    }
+    let report = StrictSettlement {
+        receipt_after_injection: receipt,
+        ownership_lost,
+        preempted,
+        clipboard,
+    };
+    let mut slot = shared.outcome.lock().unwrap_or_else(|p| p.into_inner());
+    *slot = Some(report);
+    shared.outcome_ready.notify_all();
+}
+
+/// If a previous transaction is still holding the clipboard, settle it now so
+/// the snapshot below captures the user's original clipboard content. A
+/// strict caller passes `allow_auto_submit = false`, so a pending dictation
+/// Enter can never land in the assistant's target.
+fn flush_pending(allow_auto_submit: bool) {
+    let previous = match PENDING.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(_) => None,
+    };
+    let Some(previous) = previous else {
+        return;
+    };
+    let auto_submit_now = {
+        let mut st = previous.state.lock().unwrap_or_else(|p| p.into_inner());
+        preempt(&mut st, allow_auto_submit)
+    };
+    finish_tx(&previous, Some(auto_submit_now));
+    // The old worker may have been mid-settlement; do not snapshot until it
+    // finished, or the snapshot could capture a half-restored clipboard.
+    if previous.wait_outcome(SETTLE_WAIT).is_none() {
+        warn!("[reliable-paste] previous transaction did not settle in time");
+    }
+}
+
+fn on_timer(shared: &WinTxShared) {
     let now = Instant::now();
     let finish = {
         let mut st = match shared.state.lock() {
@@ -433,45 +811,25 @@ fn on_timer(_hwnd: HWND, shared: &WinTxShared) {
         return;
     }
 
-    let (receipt, ownership_lost, injection_failed) = {
-        let st = match shared.state.lock() {
-            Ok(st) => st,
-            Err(_) => return,
-        };
-        (
-            st.any_receipt_after_injection(),
-            st.ownership_lost,
-            st.injection_failed,
-        )
-    };
-    if ownership_lost {
-        info!("[reliable-paste] settling: clipboard ownership lost");
-    } else if receipt {
-        info!("[reliable-paste] settling: reads went quiet");
-    } else if injection_failed {
-        info!("[reliable-paste] settling: chord injection failed, restoring quickly");
-    } else {
-        info!("[reliable-paste] settling: no read within timeout, restoring anyway");
-    }
-
-    // Auto-submit only once the target demonstrably read the transcript;
-    // pressing Enter after an unconfirmed paste could submit stale content.
-    if shared.auto_submit && receipt {
-        send_auto_submit(shared);
-    }
-
-    let sequence = *shared.sequence.lock().unwrap();
-    let still_ours = !ownership_lost && unsafe { GetClipboardSequenceNumber() } == sequence;
-    if still_ours {
-        unsafe { settle_clipboard(shared) };
-    } else {
-        info!("[reliable-paste] clipboard changed externally; leaving it untouched");
+    finish_tx(shared, None);
+    // A preemptor may be settling this transaction on another thread. Keep
+    // the owner window alive and pumping until it is done: its ownership
+    // check needs the window, and its EmptyClipboard sends this window
+    // WM_DESTROYCLIPBOARD, so blocking here would stall it. Check again on
+    // the next tick.
+    let settled = shared
+        .outcome
+        .lock()
+        .map(|slot| slot.is_some())
+        .unwrap_or(true);
+    if !settled {
+        return;
     }
 
     if let Ok(mut slot) = PENDING.lock() {
         let is_us = slot
             .as_ref()
-            .map(|pending| Arc::as_ptr(pending) as *const WinTxShared == shared as *const _)
+            .map(|pending| std::ptr::eq(Arc::as_ptr(pending), shared))
             .unwrap_or(false);
         if is_us {
             *slot = None;
@@ -491,16 +849,22 @@ unsafe fn destroy_window_and_shared(hwnd: HWND) {
     }
 }
 
-fn pump_thread(shared: Arc<WinTxShared>, ready: Sender<Result<(), String>>) {
+fn pump_thread(
+    shared: Arc<WinTxShared>,
+    allow_auto_submit_on_flush: bool,
+    ready: mpsc::Sender<Result<(), PublishError>>,
+) {
     unsafe {
         // Settle any previous transaction first so the snapshot captures the
         // user's original clipboard, not the previous transcript.
-        flush_pending();
+        flush_pending(allow_auto_submit_on_flush);
 
         let hinstance = match GetModuleHandleW(PCWSTR::null()) {
             Ok(hmodule) => HINSTANCE(hmodule.0),
             Err(e) => {
-                let _ = ready.send(Err(format!("GetModuleHandle failed: {e}")));
+                let _ = ready.send(Err(PublishError::Busy(format!(
+                    "GetModuleHandle failed: {e}"
+                ))));
                 return;
             }
         };
@@ -522,39 +886,41 @@ fn pump_thread(shared: Arc<WinTxShared>, ready: Sender<Result<(), String>>) {
         ) {
             Ok(hwnd) => hwnd,
             Err(e) => {
-                let _ = ready.send(Err(format!("CreateWindowEx failed: {e}")));
+                let _ = ready.send(Err(PublishError::Busy(format!(
+                    "CreateWindowEx failed: {e}"
+                ))));
                 return;
             }
         };
+        shared.hwnd.store(hwnd.0 as usize, Ordering::SeqCst);
         SetWindowLongPtrW(
             hwnd,
             GWLP_USERDATA,
             Arc::into_raw(shared.clone()) as *const _ as isize,
         );
 
-        let published = match snapshot_clipboard(hwnd, &shared) {
-            Ok(()) => match publish(hwnd) {
-                Ok(sequence) => Ok(sequence),
-                Err(e) => {
-                    // publish may have emptied the clipboard before failing;
-                    // put the snapshot back so the legacy fallback's own
-                    // snapshot captures the user's clipboard, not an empty one.
-                    restore_snapshot(&shared);
-                    Err(e)
-                }
-            },
-            Err(e) => Err(e),
+        let published = {
+            let mut clip = WinClipboard::new(&shared, Some(hwnd));
+            snapshot_and_publish(&mut clip, shared.policy)
         };
-        let sequence = match published {
-            Ok(sequence) => sequence,
+        let (snapshot, sequence) = match published {
+            Ok(published) => published,
             Err(e) => {
+                // Nothing to settle: either nothing changed, or the publish
+                // failure path already wrote the snapshot back.
+                shared.settled.store(true, Ordering::SeqCst);
                 destroy_window_and_shared(hwnd);
                 let _ = ready.send(Err(e));
                 return;
             }
         };
-        *shared.sequence.lock().unwrap() = sequence;
-        shared.state.lock().unwrap().published_at = Instant::now();
+        *shared.snapshot.lock().unwrap_or_else(|p| p.into_inner()) = Some(snapshot);
+        *shared.sequence.lock().unwrap_or_else(|p| p.into_inner()) = sequence;
+        shared
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .published_at = Instant::now();
         if let Ok(mut slot) = PENDING.lock() {
             *slot = Some(shared.clone());
         }
@@ -580,27 +946,38 @@ pub(super) fn run(
     auto_submit_key: AutoSubmitKey,
     clipboard_handling: ClipboardHandling,
 ) -> Result<(), String> {
-    let shared = Arc::new(WinTxShared {
-        state: Mutex::new(TxState::new()),
-        text: text.to_string(),
-        snapshot: Mutex::new(Vec::new()),
-        saved_bitmap: Mutex::new(None),
-        sequence: Mutex::new(0),
-        app_handle: app_handle.clone(),
-        auto_submit,
-        auto_submit_key,
-        preserve_transcript: clipboard_handling == ClipboardHandling::CopyToClipboard,
-    });
+    let shared = Arc::new(WinTxShared::new(
+        text,
+        SnapshotPolicy::BestEffort,
+        TxMode::Dictation {
+            auto_submit: auto_submit.then(|| {
+                let app_handle = app_handle.clone();
+                Box::new(move || {
+                    if let Some(enigo_state) = app_handle.try_state::<EnigoState>() {
+                        match enigo_state.0.try_lock() {
+                            Ok(mut enigo) => {
+                                let _ = send_return_key(&mut enigo, auto_submit_key);
+                            }
+                            Err(_) => {
+                                warn!("[reliable-paste] skipping auto-submit: input state busy")
+                            }
+                        }
+                    }
+                }) as AutoSubmitAction
+            }),
+            preserve_transcript: clipboard_handling == ClipboardHandling::CopyToClipboard,
+        },
+    ));
 
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::channel();
     let shared_for_pump = shared.clone();
-    thread::spawn(move || pump_thread(shared_for_pump, ready_tx));
+    thread::spawn(move || pump_thread(shared_for_pump, true, ready_tx));
 
     // Wait until the transcript is actually published (or the worker reports
     // why it could not) before injecting the chord.
     match ready_rx.recv() {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e),
+        Ok(Err(e)) => return Err(format!("{e:?}")),
         Err(_) => return Err("reliable paste worker died before publishing".to_string()),
     }
     info!("[reliable-paste] published transcript (delayed render)");
@@ -621,4 +998,319 @@ pub(super) fn run(
     }
 
     Ok(())
+}
+
+/// Strict (assistant) clipboard transaction: lossless snapshot or refusal,
+/// receipt-sequenced restore, no auto-submit, explicit settlement report.
+pub(crate) struct StrictClipboardTx {
+    shared: Arc<WinTxShared>,
+}
+
+impl StrictClipboardTx {
+    /// Snapshots and publishes `text` (verbatim) on a new pump thread.
+    /// Waits at most `STRICT_PUBLISH_TIMEOUT`.
+    pub(crate) fn publish(
+        text: &str,
+        after_success: ClipboardHandling,
+    ) -> Result<Self, PublishError> {
+        let shared = Arc::new(WinTxShared::new(
+            text,
+            SnapshotPolicy::Strict,
+            TxMode::Strict { after_success },
+        ));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let shared_for_pump = shared.clone();
+        thread::Builder::new()
+            .name("handy-strict-paste".into())
+            .spawn(move || pump_thread(shared_for_pump, false, ready_tx))
+            .map_err(|e| PublishError::Busy(format!("could not start paste worker: {e}")))?;
+        match ready_rx.recv_timeout(STRICT_PUBLISH_TIMEOUT) {
+            Ok(Ok(())) => Ok(Self { shared }),
+            Ok(Err(e)) => Err(e),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Stop a late publish; if it already published, the pump sees
+                // `aborted` and restores on its own.
+                shared.abandoned.store(true, Ordering::SeqCst);
+                if let Ok(mut st) = shared.state.lock() {
+                    st.aborted = true;
+                    st.cancelled = true;
+                }
+                Err(PublishError::Timeout)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(PublishError::Busy(
+                "paste worker exited before publishing".into(),
+            )),
+        }
+    }
+
+    /// The published promise is still the clipboard content. Advisory check
+    /// before injection; settlement re-checks under the clipboard lock.
+    pub(crate) fn still_owned(&self) -> bool {
+        let lost = self
+            .shared
+            .state
+            .lock()
+            .map(|st| st.ownership_lost)
+            .unwrap_or(true);
+        if lost {
+            return false;
+        }
+        let clip = WinClipboard::new(&self.shared, None);
+        clip.owned_by_tx() && clip.sequence() == self.shared.sequence()
+    }
+
+    /// Call immediately before sending the chord: only reads after this
+    /// count as receipts.
+    pub(crate) fn mark_injecting(&self) {
+        if let Ok(mut st) = self.shared.state.lock() {
+            st.injected_at = Some(Instant::now());
+        }
+        #[cfg(test)]
+        diag::record(diag::Event::Injecting {
+            at: Instant::now(),
+            holder_pid: diag::open_clipboard_pid(),
+        });
+    }
+
+    /// No process (including this one) has the clipboard open right now.
+    /// Checked by acquiring and immediately releasing it, because readers
+    /// that open the clipboard without a window are invisible to
+    /// `GetOpenClipboardWindow`. Opening and closing does not change the
+    /// clipboard content or sequence number.
+    pub(crate) fn clipboard_free() -> bool {
+        // SAFETY: balanced open/close on this thread; nothing is written.
+        let free = unsafe {
+            if OpenClipboard(None).is_ok() {
+                let _ = CloseClipboard();
+                true
+            } else {
+                false
+            }
+        };
+        #[cfg(test)]
+        let holder_pid = if free { 0 } else { diag::open_clipboard_pid() };
+        #[cfg(test)]
+        diag::record(diag::Event::FreeCheck {
+            at: Instant::now(),
+            free,
+            holder_pid,
+        });
+        free
+    }
+
+    /// No paste keystroke reached the target; restore quickly.
+    pub(crate) fn mark_injection_failed(&self) {
+        if let Ok(mut st) = self.shared.state.lock() {
+            st.injection_failed = true;
+        }
+    }
+
+    /// Pre-delivery abort: restore if still owned and wait for the result.
+    pub(crate) fn abort(&self) -> ClipboardSettlement {
+        if let Ok(mut st) = self.shared.state.lock() {
+            st.aborted = true;
+            st.cancelled = true;
+        }
+        self.shared
+            .wait_outcome(SETTLE_WAIT)
+            .map(|s| s.clipboard)
+            .unwrap_or(ClipboardSettlement::Unknown)
+    }
+
+    /// Waits for the pump's settlement report.
+    pub(crate) fn wait_settled(&self, timeout: Duration) -> Option<StrictSettlement> {
+        self.shared.wait_outcome(timeout)
+    }
+
+    /// Upper bound for `wait_settled` after injection.
+    pub(crate) fn settle_timeout() -> Duration {
+        RESTORE_TIMEOUT + SETTLE_WAIT
+    }
+}
+
+/// Session-wide backup for the ignored native probe. It uses the production
+/// lossless snapshot/writer and refuses rollback after an external copy.
+#[cfg(test)]
+pub(crate) struct ProbeClipboardSession {
+    shared: WinTxShared,
+    snapshot: Option<WinSnapshot>,
+}
+
+#[cfg(test)]
+impl ProbeClipboardSession {
+    pub(crate) fn begin() -> Result<Self, String> {
+        let shared = WinTxShared::new(
+            "",
+            SnapshotPolicy::Strict,
+            TxMode::Strict {
+                after_success: ClipboardHandling::DontModify,
+            },
+        );
+        let mut clip = WinClipboard::new(&shared, None);
+        clip.open()?;
+        let snapshot = clip
+            .snapshot(SnapshotPolicy::Strict)
+            .map_err(|e| format!("cannot preserve the session clipboard: {e:?}"))?;
+        diag::arm_session(clip.sequence());
+        clip.close();
+        drop(clip);
+        Ok(Self {
+            shared,
+            snapshot: Some(snapshot),
+        })
+    }
+
+    pub(crate) fn restore(&mut self) -> ClipboardSettlement {
+        let Some(mut snapshot) = self.snapshot.take() else {
+            return ClipboardSettlement::Untouched;
+        };
+        let mut clip = WinClipboard::new(&self.shared, None);
+        let result = match clip.open() {
+            Err(e) => ClipboardSettlement::RestoreFailed(e),
+            Ok(()) if !diag::session_current(clip.sequence()) => {
+                ClipboardSettlement::ExternallyChanged
+            }
+            Ok(()) => match clip.write_snapshot(&mut snapshot) {
+                Ok(()) => ClipboardSettlement::Restored,
+                Err(e) => ClipboardSettlement::RestoreFailed(e),
+            },
+        };
+        clip.close();
+        diag::disarm_session();
+        result
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProbeClipboardSession {
+    fn drop(&mut self) {
+        let result = self.restore();
+        if !matches!(
+            result,
+            ClipboardSettlement::Untouched | ClipboardSettlement::Restored
+        ) {
+            eprintln!("probe session clipboard cleanup: {result:?}");
+        }
+    }
+}
+
+/// Test-only toggles and event recorder for
+/// the clipboard-contention probe. Compiled to no-ops outside tests.
+#[cfg(test)]
+pub(crate) mod diag {
+    use std::time::Instant;
+
+    #[derive(Debug, Clone)]
+    pub(crate) enum Event {
+        FreeCheck {
+            at: Instant,
+            free: bool,
+            holder_pid: u32,
+        },
+        Injecting {
+            at: Instant,
+            holder_pid: u32,
+        },
+        Render {
+            at: Instant,
+            after_injection: bool,
+            rendered: bool,
+            reader_pid: u32,
+        },
+    }
+
+    #[cfg(test)]
+    pub(crate) static DECLINE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
+
+    #[cfg(test)]
+    static EVENTS: std::sync::Mutex<Vec<Event>> = std::sync::Mutex::new(Vec::new());
+
+    #[cfg(test)]
+    static SESSION_SEQUENCE: std::sync::Mutex<Option<(u32, bool)>> = std::sync::Mutex::new(None);
+    pub(crate) static AFTER_PUBLISH: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+        std::sync::Mutex::new(None);
+    /// Ignored native probe only: ask the holding reader for the format once
+    /// the owner has entered the abort-settlement retry loop.
+    #[cfg(test)]
+    pub(crate) static ON_CLIPBOARD_RETRY: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+        std::sync::Mutex::new(None);
+    #[cfg(test)]
+    pub(crate) fn run_on_clipboard_retry() {
+        let hook = ON_CLIPBOARD_RETRY.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    pub(crate) fn run_after_publish() {
+        let hook = AFTER_PUBLISH.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_session(sequence: u32) {
+        *SESSION_SEQUENCE.lock().unwrap() = Some((sequence, false));
+    }
+
+    /// Called only with the clipboard lock held, for the probe's own reads
+    /// and writes. An unobserved external copy permanently disables rollback.
+    #[cfg(test)]
+    pub(crate) fn note_locked_change(before: u32, after: u32) {
+        if let Some((expected, lost)) = SESSION_SEQUENCE.lock().unwrap().as_mut() {
+            if *expected != before && *expected != after {
+                *lost = true;
+            }
+            *expected = after;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_current(sequence: u32) -> bool {
+        SESSION_SEQUENCE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|(expected, lost)| !lost && *expected == sequence)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disarm_session() {
+        *SESSION_SEQUENCE.lock().unwrap() = None;
+    }
+
+    pub(crate) fn record(event: Event) {
+        #[cfg(test)]
+        if let Ok(mut events) = EVENTS.lock() {
+            events.push(event);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take() -> Vec<Event> {
+        EVENTS
+            .lock()
+            .map(|mut e| std::mem::take(&mut *e))
+            .unwrap_or_default()
+    }
+
+    /// PID owning the window that has the clipboard open (0 if none or the
+    /// opener passed no window).
+    pub(crate) fn open_clipboard_pid() -> u32 {
+        #[cfg(test)]
+        {
+            use windows::Win32::System::DataExchange::GetOpenClipboardWindow;
+            use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+            let mut pid = 0u32;
+            // SAFETY: plain Win32 queries.
+            unsafe {
+                if let Ok(hwnd) = GetOpenClipboardWindow() {
+                    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                }
+            }
+            pid
+        }
+    }
 }

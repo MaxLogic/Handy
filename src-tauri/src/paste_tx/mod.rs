@@ -42,6 +42,10 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+mod strict;
+#[allow(unused_imports)]
+pub(crate) use strict::*;
+
 #[cfg(target_os = "macos")]
 use macos as platform;
 #[cfg(target_os = "windows")]
@@ -86,6 +90,13 @@ pub(crate) struct TxState {
     pub auto_submit_sent: bool,
     /// First post-injection receipt has been logged.
     pub logged_receipt: bool,
+    /// The strict caller abandoned the transaction before delivery; settle by
+    /// restoring the snapshot regardless of the after-success policy.
+    #[allow(dead_code)]
+    pub aborted: bool,
+    /// A newer paste transaction settled this one early.
+    #[allow(dead_code)]
+    pub preempted: bool,
 }
 
 impl TxState {
@@ -99,6 +110,8 @@ impl TxState {
             cancelled: false,
             auto_submit_sent: false,
             logged_receipt: false,
+            aborted: false,
+            preempted: false,
         }
     }
 
@@ -211,8 +224,15 @@ pub(crate) fn try_reliable_paste(
     )
 }
 
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) use platform::diag;
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) use platform::ProbeClipboardSession;
+#[cfg(target_os = "windows")]
+pub(crate) use platform::StrictClipboardTx;
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn state_after_publish(published_ago: Duration) -> TxState {
@@ -279,5 +299,643 @@ mod tests {
         let mut s = state_after_publish(Duration::from_millis(10));
         s.ownership_lost = true;
         assert!(matches!(evaluate(&s, Instant::now()), WaitDecision::Finish));
+    }
+
+    // --- strict snapshot / publish / settle -------------------------------
+
+    use crate::settings::ClipboardHandling;
+
+    /// Contents of the fake system clipboard.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Content {
+        User(&'static str),
+        Promise,
+        Text(String),
+    }
+
+    /// In-memory clipboard that records every call.
+    struct FakeClipboard {
+        content: Content,
+        sequence: u32,
+        owner_is_tx: bool,
+        is_open: bool,
+        open_error: Option<String>,
+        /// Simulates another process copying while we wait for the lock:
+        /// applied inside `open()` before it returns.
+        external_copy_during_open: bool,
+        lossy: Option<LossyFormat>,
+        publish_error: Option<String>,
+        write_error: Option<String>,
+        abandoned: bool,
+        calls: Vec<&'static str>,
+    }
+
+    impl FakeClipboard {
+        fn new() -> Self {
+            Self {
+                content: Content::User("original"),
+                sequence: 10,
+                owner_is_tx: false,
+                is_open: false,
+                open_error: None,
+                external_copy_during_open: false,
+                lossy: None,
+                publish_error: None,
+                write_error: None,
+                abandoned: false,
+                calls: Vec::new(),
+            }
+        }
+
+        fn mutate(&mut self, content: Content, ours: bool) {
+            assert!(self.is_open, "clipboard written while not open");
+            self.content = content;
+            self.sequence += 1;
+            self.owner_is_tx = ours;
+        }
+
+        fn wrote(&self) -> bool {
+            self.calls
+                .iter()
+                .any(|c| matches!(*c, "publish" | "write_snapshot" | "write_text"))
+        }
+    }
+
+    impl ClipboardOps for FakeClipboard {
+        type Snapshot = Content;
+        fn open(&mut self) -> Result<(), String> {
+            self.calls.push("open");
+            if let Some(e) = &self.open_error {
+                return Err(e.clone());
+            }
+            if self.external_copy_during_open {
+                self.external_copy_during_open = false;
+                self.content = Content::User("newer user copy");
+                self.sequence += 1;
+                self.owner_is_tx = false;
+            }
+            self.is_open = true;
+            Ok(())
+        }
+        fn close(&mut self) {
+            self.calls.push("close");
+            self.is_open = false;
+        }
+        fn sequence(&self) -> u32 {
+            self.sequence
+        }
+        fn owned_by_tx(&self) -> bool {
+            self.owner_is_tx
+        }
+        fn snapshot(&mut self, policy: SnapshotPolicy) -> Result<Content, LossyFormat> {
+            self.calls.push("snapshot");
+            assert!(self.is_open);
+            match (&self.lossy, policy) {
+                (Some(l), SnapshotPolicy::Strict) => Err(l.clone()),
+                _ => Ok(self.content.clone()),
+            }
+        }
+        fn publish_promise(&mut self) -> Result<(), String> {
+            self.calls.push("publish");
+            // Publishing empties first, so a failure still loses the content.
+            self.mutate(Content::Promise, true);
+            match &self.publish_error {
+                Some(e) => {
+                    self.content = Content::Text(String::new());
+                    Err(e.clone())
+                }
+                None => Ok(()),
+            }
+        }
+        fn write_snapshot(&mut self, snapshot: &mut Content) -> Result<(), String> {
+            self.calls.push("write_snapshot");
+            if let Some(e) = &self.write_error {
+                return Err(e.clone());
+            }
+            self.mutate(snapshot.clone(), false);
+            Ok(())
+        }
+        fn write_text(&mut self, text: &str) -> Result<(), String> {
+            self.calls.push("write_text");
+            if let Some(e) = &self.write_error {
+                return Err(e.clone());
+            }
+            self.mutate(Content::Text(text.to_string()), false);
+            Ok(())
+        }
+        fn abandoned(&self) -> bool {
+            self.abandoned
+        }
+    }
+
+    #[test]
+    fn strict_format_accepts_text_image_and_registered() {
+        for format in [1, 7, CF_UNICODETEXT, 8, 17, 15, 16, 0xC000, 0xC123, 0xFFFF] {
+            assert_eq!(
+                format_action(SnapshotPolicy::Strict, format),
+                FormatAction::ReadMemory,
+                "format {format:#x}"
+            );
+        }
+        assert_eq!(
+            format_action(SnapshotPolicy::Strict, CF_BITMAP),
+            FormatAction::CopyBitmap
+        );
+        assert_eq!(
+            judge_read(SnapshotPolicy::Strict, FormatRead::Bitmap { copied: true }),
+            Ok(true)
+        );
+        assert_eq!(
+            judge_read(
+                SnapshotPolicy::Strict,
+                FormatRead::Memory {
+                    size: MAX_FORMAT_BYTES,
+                    locked: true
+                }
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn strict_format_rejects_metafiles_owner_display_palette() {
+        for format in [
+            CF_METAFILEPICT,
+            CF_ENHMETAFILE,
+            CF_DSPENHMETAFILE,
+            CF_DSPMETAFILEPICT,
+            CF_DSPBITMAP,
+            CF_OWNERDISPLAY,
+            CF_PALETTE,
+        ] {
+            assert_eq!(
+                format_action(SnapshotPolicy::Strict, format),
+                FormatAction::Reject(LossyReason::NonMemoryHandle),
+                "format {format:#x}"
+            );
+        }
+        assert_eq!(
+            judge_read(SnapshotPolicy::Strict, FormatRead::Bitmap { copied: false }),
+            Err(LossyReason::BitmapCopyFailed)
+        );
+    }
+
+    #[test]
+    fn strict_format_rejects_private_and_gdi_ranges() {
+        for format in [0x0200, 0x02FF, 0x0300, 0x03FF] {
+            assert_eq!(
+                format_action(SnapshotPolicy::Strict, format),
+                FormatAction::Reject(LossyReason::PrivateOrGdiRange),
+                "format {format:#x}"
+            );
+        }
+        assert_eq!(
+            format_action(SnapshotPolicy::Strict, 0x0400),
+            FormatAction::ReadMemory
+        );
+    }
+
+    #[test]
+    fn strict_format_rejects_oversized_zero_and_unreadable() {
+        let strict = SnapshotPolicy::Strict;
+        assert_eq!(
+            judge_read(
+                strict,
+                FormatRead::Memory {
+                    size: MAX_FORMAT_BYTES + 1,
+                    locked: false
+                }
+            ),
+            Err(LossyReason::TooLarge(MAX_FORMAT_BYTES + 1))
+        );
+        assert_eq!(
+            judge_read(
+                strict,
+                FormatRead::Memory {
+                    size: 0,
+                    locked: true
+                }
+            ),
+            Err(LossyReason::Unreadable)
+        );
+        assert_eq!(
+            judge_read(
+                strict,
+                FormatRead::Memory {
+                    size: 16,
+                    locked: false
+                }
+            ),
+            Err(LossyReason::Unreadable)
+        );
+        assert_eq!(
+            judge_read(strict, FormatRead::Unreadable),
+            Err(LossyReason::Unreadable)
+        );
+    }
+
+    #[test]
+    fn best_effort_policy_skips_instead_of_failing() {
+        let best = SnapshotPolicy::BestEffort;
+        for read in [
+            FormatRead::Unreadable,
+            FormatRead::Memory {
+                size: 0,
+                locked: true,
+            },
+            FormatRead::Memory {
+                size: MAX_FORMAT_BYTES + 1,
+                locked: false,
+            },
+            FormatRead::Memory {
+                size: 8,
+                locked: false,
+            },
+            FormatRead::Bitmap { copied: false },
+        ] {
+            assert_eq!(judge_read(best, read), Ok(false), "{read:?}");
+        }
+        // The historical skip list, including CF_DSPTEXT, is unchanged and
+        // nothing is ever rejected.
+        for format in [
+            CF_ENHMETAFILE,
+            CF_DSPENHMETAFILE,
+            CF_DSPBITMAP,
+            CF_DSPMETAFILEPICT,
+            CF_DSPTEXT,
+            CF_OWNERDISPLAY,
+            CF_PALETTE,
+        ] {
+            assert_eq!(format_action(best, format), FormatAction::Skip);
+        }
+        for format in [CF_METAFILEPICT, 0x0200, 0x0300, CF_UNICODETEXT, 0xC000] {
+            assert_eq!(format_action(best, format), FormatAction::ReadMemory);
+        }
+    }
+
+    #[test]
+    fn publish_snapshots_and_publishes_in_one_session() {
+        let mut c = FakeClipboard::new();
+        let (snapshot, sequence) =
+            snapshot_and_publish(&mut c, SnapshotPolicy::Strict).expect("published");
+        assert_eq!(snapshot, Content::User("original"));
+        assert_eq!(c.content, Content::Promise);
+        assert_eq!(sequence, c.sequence);
+        assert_eq!(c.calls, vec!["open", "snapshot", "publish", "close"]);
+    }
+
+    #[test]
+    fn publish_refuses_lossy_snapshot_without_emptying() {
+        let mut c = FakeClipboard::new();
+        let lossy = LossyFormat {
+            format: CF_ENHMETAFILE,
+            reason: LossyReason::NonMemoryHandle,
+        };
+        c.lossy = Some(lossy.clone());
+        let result = snapshot_and_publish(&mut c, SnapshotPolicy::Strict);
+        assert_eq!(result.err(), Some(PublishError::Lossy(lossy)));
+        assert_eq!(c.content, Content::User("original"));
+        assert_eq!(c.sequence, 10);
+        assert!(!c.wrote());
+        assert!(!c.is_open);
+    }
+
+    #[test]
+    fn publish_abandoned_after_snapshot_leaves_clipboard_unchanged() {
+        let mut c = FakeClipboard::new();
+        c.abandoned = true;
+        let result = snapshot_and_publish(&mut c, SnapshotPolicy::Strict);
+        assert_eq!(result.err(), Some(PublishError::Abandoned));
+        assert_eq!(c.content, Content::User("original"));
+        assert!(!c.wrote());
+        assert!(!c.is_open);
+    }
+
+    #[test]
+    fn publish_busy_clipboard_changes_nothing() {
+        let mut c = FakeClipboard::new();
+        c.open_error = Some("held by another process".into());
+        let result = snapshot_and_publish(&mut c, SnapshotPolicy::Strict);
+        assert!(matches!(result, Err(PublishError::Busy(_))));
+        assert_eq!(c.content, Content::User("original"));
+        assert!(!c.wrote());
+    }
+
+    #[test]
+    fn publish_failure_rewrites_snapshot() {
+        let mut c = FakeClipboard::new();
+        c.publish_error = Some("SetClipboardData failed".into());
+        let result = snapshot_and_publish(&mut c, SnapshotPolicy::BestEffort);
+        assert_eq!(
+            result.err(),
+            Some(PublishError::Failed {
+                error: "SetClipboardData failed".into(),
+                restore: ClipboardSettlement::Restored,
+            })
+        );
+        assert_eq!(c.content, Content::User("original"));
+        assert_eq!(
+            c.calls,
+            vec!["open", "snapshot", "publish", "write_snapshot", "close"]
+        );
+    }
+
+    /// Publishes, returning the fake and the sequence a transaction would record.
+    fn published() -> (FakeClipboard, Content, u32) {
+        let mut c = FakeClipboard::new();
+        let (snapshot, sequence) = snapshot_and_publish(&mut c, SnapshotPolicy::Strict).unwrap();
+        c.calls.clear();
+        (c, snapshot, sequence)
+    }
+
+    #[test]
+    fn settle_rechecks_sequence_after_acquiring_lock() {
+        assert_eq!(
+            settle_with_external_copy_during_open(),
+            ClipboardSettlement::ExternallyChanged
+        );
+    }
+
+    /// Reused by the selection commit test so both proof filters exercise the
+    /// real guarded settlement when a newer copy lands while acquiring its lock.
+    pub(crate) fn settle_with_external_copy_during_open() -> ClipboardSettlement {
+        let (mut c, mut snapshot, sequence) = published();
+        // Before the lock, everything still looks like ours...
+        assert!(c.owned_by_tx() && c.sequence() == sequence);
+        // ...but a user copy lands while we wait for OpenClipboard.
+        c.external_copy_during_open = true;
+        let result = settle_guarded(
+            &mut c,
+            Some(&mut snapshot),
+            sequence,
+            false,
+            SettleAction::Restore,
+            "replacement",
+        );
+        assert_eq!(result, ClipboardSettlement::ExternallyChanged);
+        assert_eq!(c.content, Content::User("newer user copy"));
+        assert!(!c.wrote());
+        assert_eq!(c.calls, vec!["open", "close"]);
+        result
+    }
+
+    #[test]
+    fn settle_requires_owner_under_lock() {
+        let (mut c, mut snapshot, sequence) = published();
+        // Same sequence number but another owner (e.g. sequence wrapped or an
+        // owner change that did not bump it): never write.
+        c.owner_is_tx = false;
+        let result = settle_guarded(
+            &mut c,
+            Some(&mut snapshot),
+            sequence,
+            false,
+            SettleAction::Restore,
+            "replacement",
+        );
+        assert_eq!(result, ClipboardSettlement::ExternallyChanged);
+        assert!(!c.wrote());
+    }
+
+    #[test]
+    fn settle_skips_after_ownership_lost() {
+        let (mut c, mut snapshot, sequence) = published();
+        let result = settle_guarded(
+            &mut c,
+            Some(&mut snapshot),
+            sequence,
+            true,
+            SettleAction::Restore,
+            "replacement",
+        );
+        assert_eq!(result, ClipboardSettlement::ExternallyChanged);
+        assert!(c.calls.is_empty(), "must not even open: {:?}", c.calls);
+    }
+
+    #[test]
+    fn settle_open_failure_is_restore_failed() {
+        let (mut c, mut snapshot, sequence) = published();
+        c.open_error = Some("busy".into());
+        let result = settle_guarded(
+            &mut c,
+            Some(&mut snapshot),
+            sequence,
+            false,
+            SettleAction::Restore,
+            "replacement",
+        );
+        assert_eq!(result, ClipboardSettlement::RestoreFailed("busy".into()));
+        assert_eq!(c.content, Content::Promise);
+    }
+
+    #[test]
+    fn settle_restores_or_leaves_text_per_policy() {
+        let (mut c, mut snapshot, sequence) = published();
+        let result = settle_guarded(
+            &mut c,
+            Some(&mut snapshot),
+            sequence,
+            false,
+            SettleAction::Restore,
+            "replacement",
+        );
+        assert_eq!(result, ClipboardSettlement::Restored);
+        assert_eq!(c.content, Content::User("original"));
+
+        let (mut c, mut snapshot, sequence) = published();
+        let result = settle_guarded(
+            &mut c,
+            Some(&mut snapshot),
+            sequence,
+            false,
+            SettleAction::LeaveText,
+            "replacement",
+        );
+        assert_eq!(result, ClipboardSettlement::LeftReplacement);
+        assert_eq!(c.content, Content::Text("replacement".into()));
+
+        let (mut c, mut snapshot, sequence) = published();
+        c.write_error = Some("SetClipboardData failed".into());
+        let result = settle_guarded(
+            &mut c,
+            Some(&mut snapshot),
+            sequence,
+            false,
+            SettleAction::Restore,
+            "replacement",
+        );
+        assert_eq!(
+            result,
+            ClipboardSettlement::RestoreFailed("SetClipboardData failed".into())
+        );
+    }
+
+    #[test]
+    fn strict_settle_restores_after_failed_or_aborted_injection() {
+        use ClipboardHandling::*;
+        // Never injected, injection failed or aborted: restore, whatever the
+        // after-success policy says.
+        for handling in [DontModify, CopyToClipboard] {
+            assert_eq!(
+                strict_settle_action(false, false, false, handling),
+                SettleAction::Restore
+            );
+            assert_eq!(
+                strict_settle_action(true, true, false, handling),
+                SettleAction::Restore
+            );
+            assert_eq!(
+                strict_settle_action(true, false, true, handling),
+                SettleAction::Restore
+            );
+        }
+        assert_eq!(
+            strict_settle_action(true, false, false, DontModify),
+            SettleAction::Restore
+        );
+        assert_eq!(
+            strict_settle_action(true, false, false, CopyToClipboard),
+            SettleAction::LeaveText
+        );
+    }
+
+    #[test]
+    fn strict_read_before_injection_is_declined_and_not_counted() {
+        let mut s = state_after_publish(Duration::from_millis(20));
+        // Eager listener before the chord: not rendered, not a receipt.
+        assert!(!on_render_request(&mut s, true, Instant::now()));
+        assert!(s.receipts.is_empty());
+        assert!(!s.any_receipt_after_injection());
+        // The target's paste after injection: rendered and counted.
+        s.injected_at = Some(Instant::now());
+        assert!(on_render_request(&mut s, true, Instant::now()));
+        assert!(s.any_receipt_after_injection());
+    }
+
+    #[test]
+    fn dictation_renders_every_read_but_counts_only_post_injection() {
+        let mut s = state_after_publish(Duration::from_millis(20));
+        assert!(on_render_request(&mut s, false, Instant::now()));
+        assert_eq!(s.receipts.len(), 1);
+        assert!(!s.any_receipt_after_injection());
+        s.injected_at = Some(Instant::now());
+        assert!(on_render_request(&mut s, false, Instant::now()));
+        assert!(s.any_receipt_after_injection());
+    }
+
+    #[test]
+    fn render_adopts_only_own_sequence_bump() {
+        assert_eq!(adopt_render_sequence(7, 7, 8), 8);
+        assert_eq!(adopt_render_sequence(7, 7, 7), 7);
+        // Someone else changed the clipboard before our render: keep the old
+        // value so the guard refuses to restore over their content.
+        assert_eq!(adopt_render_sequence(7, 9, 10), 7);
+    }
+
+    #[test]
+    fn chord_classification_counts() {
+        assert_eq!(classify_chord(4, 4, None), (ChordResult::Sent, false));
+        let (r, release) = classify_chord(0, 4, Some("blocked".into()));
+        assert!(matches!(r, ChordResult::NotSent(ref m) if m.contains("blocked")));
+        assert!(!release);
+        let (r, release) = classify_chord(1, 4, None);
+        assert!(matches!(r, ChordResult::NotSent(_)));
+        assert!(release);
+        for sent in [2, 3] {
+            let (r, release) = classify_chord(sent, 4, None);
+            assert!(matches!(r, ChordResult::Partial(_)), "{sent}");
+            assert!(release);
+        }
+    }
+
+    #[test]
+    fn chord_partial_prefix_releases_v_and_ctrl() {
+        assert!(chord_release_keys(0, 4).is_empty());
+        assert_eq!(chord_release_keys(1, 4), &[0x11]);
+        assert_eq!(chord_release_keys(2, 4), &[0x56, 0x11]);
+        assert_eq!(chord_release_keys(3, 4), &[0x11]);
+        assert!(chord_release_keys(4, 4).is_empty());
+    }
+
+    #[test]
+    fn abort_reader_request_is_serviced_during_clipboard_retry() {
+        let reader_waiting = std::cell::Cell::new(true);
+        let declined = std::cell::Cell::new(false);
+        let state = std::cell::RefCell::new(TxState::new());
+        state.borrow_mut().aborted = true;
+        let result = retry_clipboard_open(
+            3,
+            Duration::ZERO,
+            || {
+                if reader_waiting.get() {
+                    Err("reader awaits WM_RENDERFORMAT".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                let render = on_render_request(&mut state.borrow_mut(), true, Instant::now());
+                declined.set(!render);
+                reader_waiting.set(false);
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert!(declined.get());
+        assert!(!state.borrow().any_receipt_after_injection());
+    }
+
+    #[test]
+    fn aborted_unrendered_promise_is_not_rendered_on_destroy() {
+        let mut state = TxState::new();
+        state.aborted = true;
+        assert!(!on_render_all_request(&state, true));
+        state.aborted = false;
+        assert!(!on_render_all_request(&state, true));
+        state.injected_at = Some(Instant::now());
+        assert!(on_render_all_request(&state, true));
+        assert!(on_render_all_request(&TxState::new(), false));
+    }
+
+    #[test]
+    fn abort_restore_failure_retains_promise_for_later_tick() {
+        let failed = ClipboardSettlement::RestoreFailed("reader still holds clipboard".into());
+        assert!(retry_aborted_restore(true, true, &failed));
+        assert!(!retry_aborted_restore(
+            true,
+            true,
+            &ClipboardSettlement::Restored
+        ));
+        assert!(!retry_aborted_restore(
+            true,
+            true,
+            &ClipboardSettlement::ExternallyChanged
+        ));
+        assert!(!retry_aborted_restore(true, false, &failed));
+        assert!(!retry_aborted_restore(false, true, &failed));
+    }
+
+    #[test]
+    fn preempt_for_strict_suppresses_pending_auto_submit() {
+        let mut s = state_after_publish(Duration::from_millis(300));
+        s.injected_at = Some(Instant::now() - Duration::from_millis(200));
+        s.receipts.push(Instant::now() - Duration::from_millis(100));
+        assert!(!preempt(&mut s, false));
+        assert!(s.cancelled && s.preempted);
+        // The old worker's own settle path checks this flag before Enter.
+        assert!(s.auto_submit_sent);
+    }
+
+    #[test]
+    fn preempt_for_dictation_keeps_auto_submit() {
+        let mut s = state_after_publish(Duration::from_millis(300));
+        s.injected_at = Some(Instant::now() - Duration::from_millis(200));
+        s.receipts.push(Instant::now() - Duration::from_millis(100));
+        assert!(preempt(&mut s, true));
+        assert!(s.cancelled);
+        assert!(!s.auto_submit_sent);
+
+        let mut no_receipt = state_after_publish(Duration::from_millis(300));
+        no_receipt.injected_at = Some(Instant::now());
+        assert!(!preempt(&mut no_receipt, true));
     }
 }

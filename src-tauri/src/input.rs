@@ -263,6 +263,95 @@ pub fn send_paste_shift_insert(enigo: &mut Enigo, hold_ms: u64) -> Result<(), St
     Ok(())
 }
 
+/// Sends Ctrl+V as one `SendInput` batch of four key events (Ctrl down, V down,
+/// V up, Ctrl up). A single batch cannot interleave with physical keystrokes
+/// and reports exactly how many events were inserted.
+///
+/// Returns `(inserted, total, error)`; classify with
+/// `paste_tx::classify_chord`. The strict assistant commit uses this instead of
+/// the enigo chord so that a partial injection is visible.
+#[cfg(target_os = "windows")]
+// TODO(HANDY-005): drop the allowance once the assistant commit is wired.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn send_ctrl_v_atomic() -> (u32, u32, Option<String>) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+        KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY, VK_CONTROL,
+    };
+
+    const VK_V: VIRTUAL_KEY = VIRTUAL_KEY(0x56);
+    let key = |vk: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                // SAFETY: MapVirtualKeyW only reads the active layout.
+                wScan: unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) } as u16,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let inputs = [
+        key(VK_CONTROL, KEYBD_EVENT_FLAGS(0)),
+        key(VK_V, KEYBD_EVENT_FLAGS(0)),
+        key(VK_V, KEYEVENTF_KEYUP),
+        key(VK_CONTROL, KEYEVENTF_KEYUP),
+    ];
+    let total = inputs.len() as u32;
+    // SAFETY: `inputs` is a valid slice of INPUT structures of the given size.
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    let error = if sent < total {
+        Some(windows::core::Error::from_win32().message())
+    } else {
+        None
+    };
+    (sent, total, error)
+}
+
+/// Best-effort Ctrl release after a partially injected chord.
+#[cfg(target_os = "windows")]
+// TODO(HANDY-005): drop the allowance once the assistant commit is wired.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn release_ctrl_best_effort() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL,
+    };
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VK_CONTROL,
+                wScan: 0,
+                dwFlags: KEYEVENTF_KEYUP,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    // SAFETY: one valid INPUT structure.
+    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+    if sent != 1 {
+        log::warn!("Could not release Ctrl after a partial paste chord");
+    }
+}
+
+/// Whether a physical Shift, Ctrl, Alt or Win key is currently held. An
+/// injected Ctrl+V combined with a held Alt would become AltGr+V.
+#[cfg(target_os = "windows")]
+// TODO(HANDY-005): drop the allowance once the assistant commit is wired.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn modifiers_held() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    };
+    [VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
+        .iter()
+        // SAFETY: GetAsyncKeyState has no preconditions.
+        .any(|vk| unsafe { GetAsyncKeyState(vk.0 as i32) } as u16 & 0x8000 != 0)
+}
+
 /// Pastes text directly using the enigo text method.
 /// This tries to use system input methods if possible, otherwise simulates keystrokes one by one.
 pub fn paste_text_direct(enigo: &mut Enigo, text: &str) -> Result<(), String> {

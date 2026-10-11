@@ -638,7 +638,8 @@ pub struct SessionEnd {
 }
 
 enum Message {
-    Record(TimingRecord),
+    // Boxed: a record is several hundred bytes, the end marker is small.
+    Record(Box<TimingRecord>),
     End(SessionEnd, mpsc::SyncSender<()>),
 }
 
@@ -663,7 +664,7 @@ impl Sink {
 
     /// Never blocks. A full or closed channel drops the record and counts it.
     fn enqueue(&self, record: TimingRecord) {
-        if self.tx.try_send(Message::Record(record)).is_err() {
+        if self.tx.try_send(Message::Record(Box::new(record))).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             if !self.drop_logged.swap(true, Ordering::Relaxed) {
                 warn!(
@@ -1248,7 +1249,7 @@ pub(super) mod tests {
         let mut op = inner(Mode::Raw, true);
         let record = finished_record(&mut op, Outcome::Pasted, 10, counters_at(2, 1, 100, 5));
         for _ in 0..3 {
-            tx.send(Message::Record(record.clone())).unwrap();
+            tx.send(Message::Record(Box::new(record.clone()))).unwrap();
         }
         drop(tx);
         let mut reports = Vec::new();
@@ -1262,8 +1263,8 @@ pub(super) mod tests {
         let (tx, rx) = mpsc::sync_channel(8);
         let mut op = inner(Mode::Raw, true);
         let record = finished_record(&mut op, Outcome::Pasted, 10, counters_at(2, 1, 100, 5));
-        tx.send(Message::Record(record.clone())).unwrap();
-        tx.send(Message::Record(record)).unwrap();
+        tx.send(Message::Record(Box::new(record.clone()))).unwrap();
+        tx.send(Message::Record(Box::new(record))).unwrap();
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let end = SessionEnd {
             kind: "session_end",

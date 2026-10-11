@@ -20,6 +20,7 @@ mod overlay;
 mod paste_tx;
 pub mod portable;
 mod secure_input;
+mod selection;
 mod settings;
 mod shortcut;
 mod signal_handle;
@@ -409,21 +410,6 @@ where
             eprintln!("error: headless transcription panicked: {message}");
             1
         }
-    }
-}
-
-#[cfg(test)]
-mod headless_guard_tests {
-    use super::run_headless_guarded;
-
-    #[test]
-    fn preserves_normal_exit_codes() {
-        assert_eq!(run_headless_guarded(|| 2), 2);
-    }
-
-    #[test]
-    fn converts_worker_panics_to_runtime_failures() {
-        assert_eq!(run_headless_guarded(|| panic!("simulated failure")), 1);
     }
 }
 
@@ -1123,12 +1109,31 @@ pub fn run(cli_args: CliArgs) {
             }
             show_main_window(app);
         }
-        // Only the timing log's end marker is written on exit. There is no
+        // On exit, write the timing log's end marker and stop the selection
+        // worker (bounded at 2 s). There is no
         // transcription teardown: transcribe.cpp runs only in the
         // worker process, which exits by itself as soon as this process's end
         // of its stdin closes, even if it is hung. Waiting on an unload here
         // could block quitting behind a hung model load.
-        tauri::RunEvent::Exit => dictation_timing::finish_session(),
+        tauri::RunEvent::Exit => {
+            dictation_timing::finish_session();
+            selection::shutdown();
+        }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod headless_guard_tests {
+    use super::run_headless_guarded;
+
+    #[test]
+    fn preserves_normal_exit_codes() {
+        assert_eq!(run_headless_guarded(|| 2), 2);
+    }
+
+    #[test]
+    fn converts_worker_panics_to_runtime_failures() {
+        assert_eq!(run_headless_guarded(|| panic!("simulated failure")), 1);
+    }
 }
