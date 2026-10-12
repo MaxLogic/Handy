@@ -1,3 +1,4 @@
+use crate::actions::WorkflowMode;
 use crate::TranscriptionCoordinator;
 #[cfg(unix)]
 use log::debug;
@@ -15,9 +16,9 @@ use std::thread;
 
 /// Send a transcription input to the coordinator.
 /// Used by signal handlers, CLI flags, and any other external trigger.
-pub fn send_transcription_input(app: &AppHandle, binding_id: &str, source: &str) {
+pub(crate) fn send_transcription_input(app: &AppHandle, workflow: WorkflowMode, source: &str) {
     if let Some(c) = app.try_state::<TranscriptionCoordinator>() {
-        c.send_external_input(binding_id, source);
+        c.send_external_input(workflow, source);
     } else {
         warn!("TranscriptionCoordinator not initialized");
     }
@@ -45,14 +46,14 @@ pub fn setup_signal_handler(app_handle: AppHandle) {
     debug!("Signal handler registered (SIGUSR2; SIGUSR1 is left to WebKitGTK)");
     thread::spawn(move || {
         for sig in signals.forever() {
-            let (binding_id, signal_name) = match sig {
+            let (workflow, signal_name) = match sig {
                 #[cfg(target_os = "macos")]
-                SIGUSR1 => ("transcribe_with_post_process", "SIGUSR1"),
-                SIGUSR2 => ("transcribe", "SIGUSR2"),
+                SIGUSR1 => (WorkflowMode::Cleanup, "SIGUSR1"),
+                SIGUSR2 => (WorkflowMode::Raw, "SIGUSR2"),
                 _ => continue,
             };
             debug!("Received {signal_name}");
-            send_transcription_input(&app_handle, binding_id, signal_name);
+            send_transcription_input(&app_handle, workflow, signal_name);
         }
     });
 }

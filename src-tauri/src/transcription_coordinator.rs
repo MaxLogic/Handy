@@ -1,6 +1,6 @@
-use crate::actions::ACTION_MAP;
+use crate::actions::{DictationSession, TranscribeAction, WorkflowMode};
 use crate::managers::audio::AudioRecordingManager;
-use crate::settings::ShortcutActivation;
+use crate::settings::{get_settings, ShortcutActivation};
 use log::{debug, error, warn};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
@@ -222,6 +222,7 @@ struct CoordinatorState {
     last_press: Option<Instant>,
     pending_release: Option<PendingRelease>,
     pending_press: Option<PendingPress>,
+    session: Option<DictationSession>,
 }
 
 impl CoordinatorState {
@@ -232,6 +233,7 @@ impl CoordinatorState {
             last_press: None,
             pending_release: None,
             pending_press: None,
+            session: None,
         }
     }
 
@@ -459,6 +461,7 @@ impl CoordinatorState {
     }
 
     fn on_cancel(&mut self, recording_was_active: bool) {
+        self.session = None;
         self.pending_release = None;
         // An explicit cancel abandons any remembered start too — the user
         // asked for silence, not a deferred recording.
@@ -473,6 +476,7 @@ impl CoordinatorState {
     }
 
     fn on_processing_finished(&mut self) -> Option<Effect> {
+        self.session = None;
         self.stage = Stage::Idle;
         self.hold = None;
         let pending = self.pending_press.take()?;
@@ -490,10 +494,13 @@ impl CoordinatorState {
 
     /// Reconcile the optimistic `Stage::Recording` after the executor reports
     /// whether recording actually began (microphone access can be denied).
-    fn on_start_result(&mut self, binding_id: &str, started: bool) {
-        if !started && matches!(&self.stage, Stage::Recording(id) if id == binding_id) {
-            self.stage = Stage::Idle;
-            self.hold = None;
+    fn on_start_result(&mut self, binding_id: &str, session: Option<DictationSession>) {
+        if matches!(&self.stage, Stage::Recording(id) if id == binding_id) {
+            if session.is_none() {
+                self.stage = Stage::Idle;
+                self.hold = None;
+            }
+            self.session = session;
         }
     }
 
@@ -532,10 +539,6 @@ impl CoordinatorState {
 /// returned [`Effect`]s.
 pub struct TranscriptionCoordinator {
     tx: Sender<Command>,
-}
-
-pub fn is_transcribe_binding(id: &str) -> bool {
-    id == "transcribe" || id == "transcribe_with_post_process"
 }
 
 impl TranscriptionCoordinator {
@@ -593,16 +596,16 @@ impl TranscriptionCoordinator {
 
     /// Send a keyboard input event for a transcribe binding. `hold_threshold`
     /// only matters for [`ShortcutActivation::HoldOrToggle`].
-    pub fn send_input(
+    pub(crate) fn send_input(
         &self,
-        binding_id: &str,
+        workflow: WorkflowMode,
         hotkey_string: &str,
         is_pressed: bool,
         mode: ShortcutActivation,
         hold_threshold: Duration,
     ) {
         self.send(
-            binding_id,
+            workflow,
             hotkey_string,
             is_pressed,
             mode,
@@ -613,9 +616,9 @@ impl TranscriptionCoordinator {
 
     /// Send an external trigger (SIGUSR2, CLI flag). Always a toggle press,
     /// always exempt from debounce — see [`InputEvent::external`].
-    pub fn send_external_input(&self, binding_id: &str, source: &str) {
+    pub(crate) fn send_external_input(&self, workflow: WorkflowMode, source: &str) {
         self.send(
-            binding_id,
+            workflow,
             source,
             true,
             ShortcutActivation::Toggle,
@@ -626,7 +629,7 @@ impl TranscriptionCoordinator {
 
     fn send(
         &self,
-        binding_id: &str,
+        workflow: WorkflowMode,
         hotkey_string: &str,
         is_pressed: bool,
         mode: ShortcutActivation,
@@ -636,7 +639,7 @@ impl TranscriptionCoordinator {
         if self
             .tx
             .send(Command::Input(InputEvent {
-                binding_id: binding_id.to_string(),
+                binding_id: workflow.binding_id().to_string(),
                 hotkey_string: hotkey_string.to_string(),
                 is_pressed,
                 mode,
@@ -674,44 +677,230 @@ fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
             binding_id,
             hotkey_string,
         } => {
-            let started = start(app, &binding_id, &hotkey_string);
-            state.on_start_result(&binding_id, started);
+            let session = start(app, &binding_id, &hotkey_string);
+            state.on_start_result(&binding_id, session);
         }
         Effect::Stop {
             binding_id,
             hotkey_string,
-        } => stop(app, &binding_id, &hotkey_string),
+        } => {
+            if let Some(session) = state.session.take() {
+                TranscribeAction::stop(app, &binding_id, session);
+            } else {
+                warn!("No recording snapshot for '{binding_id}' ({hotkey_string})");
+                if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
+                    coordinator.notify_processing_finished();
+                }
+            }
+        }
     }
 }
 
-/// Execute a start effect; returns whether recording actually began, so the
-/// state machine can roll back its optimistic transition on failure.
-fn start(app: &AppHandle, binding_id: &str, hotkey_string: &str) -> bool {
-    let Some(action) = ACTION_MAP.get(binding_id) else {
-        warn!("No action in ACTION_MAP for '{binding_id}'");
-        return false;
+/// Return the recording-start snapshot only when audio actually began. The
+/// state machine rolls back its optimistic transition on failure.
+fn start(app: &AppHandle, binding_id: &str, _hotkey_string: &str) -> Option<DictationSession> {
+    let Some(mode) = WorkflowMode::from_binding_id(binding_id) else {
+        warn!("No dictation workflow for '{binding_id}'");
+        return None;
     };
-    action.start(app, binding_id, hotkey_string);
+    let settings = get_settings(app);
+    let session = DictationSession::snapshot(mode, &settings);
+    TranscribeAction::start(app, binding_id, &settings);
     let recording = app
         .try_state::<Arc<AudioRecordingManager>>()
         .is_some_and(|a| a.is_recording());
     if !recording {
         debug!("Start for '{binding_id}' did not begin recording; staying idle");
     }
-    recording
-}
-
-fn stop(app: &AppHandle, binding_id: &str, hotkey_string: &str) {
-    let Some(action) = ACTION_MAP.get(binding_id) else {
-        warn!("No action in ACTION_MAP for '{binding_id}'");
-        return;
-    };
-    action.stop(app, binding_id, hotkey_string);
+    recording.then_some(session)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actions::process_transcription_output;
+    use crate::llm_client::test_http::{completion, FakeServer, Step};
+
+    fn workflow_input(workflow: WorkflowMode) -> InputEvent {
+        InputEvent {
+            binding_id: workflow.binding_id().into(),
+            hotkey_string: "test".into(),
+            is_pressed: true,
+            mode: ShortcutActivation::Toggle,
+            hold_threshold: Duration::ZERO,
+            external: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_keeps_cleanup_snapshot_until_stop_and_delivers_fallback() {
+        let selected = FakeServer::new(vec![Step::Respond(503, "offline".into())]).await;
+        let other = FakeServer::new(vec![]).await;
+        let mut settings = crate::settings::get_default_settings();
+        settings.post_process_provider_id = "custom".into();
+        settings.post_process_providers =
+            vec![crate::llm_client::test_http::provider(&selected.url)];
+        settings
+            .post_process_models
+            .insert("custom".into(), "start-model".into());
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        assert!(matches!(
+            state.on_input(workflow_input(WorkflowMode::Cleanup), now),
+            Some(Effect::Start { .. })
+        ));
+        state.on_start_result(
+            WorkflowMode::Cleanup.binding_id(),
+            Some(DictationSession::snapshot(WorkflowMode::Cleanup, &settings)),
+        );
+        settings.post_process_providers[0].base_url = other.url.clone();
+        settings
+            .post_process_models
+            .insert("custom".into(), "edited-model".into());
+        settings.post_process_selected_prompt_id = None;
+        assert!(matches!(
+            state.on_input(
+                workflow_input(WorkflowMode::Cleanup),
+                now + Duration::from_secs(1)
+            ),
+            Some(Effect::Stop { .. })
+        ));
+        let session = state
+            .session
+            .take()
+            .expect("stop owns the recording-start snapshot");
+        assert_eq!(session.mode(), WorkflowMode::Cleanup);
+        let output = process_transcription_output(&session, "recoverable raw").await;
+        assert_eq!(output.final_text, "recoverable raw");
+        assert!(output
+            .cleanup_error
+            .as_deref()
+            .unwrap()
+            .starts_with("llm_provider"));
+        assert_eq!(selected.requests.lock().unwrap()[0]["model"], "start-model");
+        assert!(other.requests.lock().unwrap().is_empty());
+        assert!(state.on_processing_finished().is_none());
+        assert_eq!(state.stage, Stage::Idle);
+        assert!(matches!(
+            state.on_input(
+                workflow_input(WorkflowMode::Raw),
+                now + Duration::from_secs(2)
+            ),
+            Some(Effect::Start { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn coordinator_raw_snapshot_never_sends_to_configured_provider() {
+        let server = FakeServer::new(vec![]).await;
+        let mut settings = crate::settings::get_default_settings();
+        settings.post_process_enabled = true;
+        settings.post_process_provider_id = "custom".into();
+        settings.post_process_providers = vec![crate::llm_client::test_http::provider(&server.url)];
+        settings
+            .post_process_models
+            .insert("custom".into(), "model".into());
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        state.on_input(workflow_input(WorkflowMode::Raw), now);
+        state.on_start_result(
+            WorkflowMode::Raw.binding_id(),
+            Some(DictationSession::snapshot(WorkflowMode::Raw, &settings)),
+        );
+        // Another workflow cannot alter the recording already in progress.
+        assert!(state
+            .on_input(
+                workflow_input(WorkflowMode::Cleanup),
+                now + Duration::from_secs(1)
+            )
+            .is_none());
+        assert!(matches!(
+            state.on_input(
+                workflow_input(WorkflowMode::Raw),
+                now + Duration::from_secs(2)
+            ),
+            Some(Effect::Stop { .. })
+        ));
+        let session = state.session.take().unwrap();
+        let output = process_transcription_output(&session, "TFDQuery.").await;
+        assert_eq!(output.final_text, "TFDQuery.");
+        assert_eq!(session.mode(), WorkflowMode::Raw);
+        assert!(server.requests.lock().unwrap().is_empty());
+        assert!(output.post_processed_text.is_none());
+    }
+
+    #[tokio::test]
+    async fn remembered_cleanup_starts_with_new_snapshot_after_raw_drains() {
+        let server = FakeServer::new(vec![Step::Respond(
+            200,
+            completion(Some(r#"{"transcription":"Cleaned."}"#), "stop"),
+        )])
+        .await;
+        let mut settings = crate::settings::get_default_settings();
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        state.on_input(workflow_input(WorkflowMode::Raw), now);
+        state.on_start_result(
+            WorkflowMode::Raw.binding_id(),
+            Some(DictationSession::snapshot(WorkflowMode::Raw, &settings)),
+        );
+        state.on_input(
+            workflow_input(WorkflowMode::Raw),
+            now + Duration::from_secs(1),
+        );
+        state.session.take();
+        assert!(state
+            .on_input(
+                workflow_input(WorkflowMode::Cleanup),
+                now + Duration::from_secs(2)
+            )
+            .is_none());
+        settings.post_process_provider_id = "custom".into();
+        settings.post_process_providers = vec![crate::llm_client::test_http::provider(&server.url)];
+        settings
+            .post_process_models
+            .insert("custom".into(), "next-model".into());
+        let Some(Effect::Start { binding_id, .. }) = state.on_processing_finished() else {
+            panic!("remembered cleanup must start when raw drains")
+        };
+        assert_eq!(binding_id, WorkflowMode::Cleanup.binding_id());
+        state.on_start_result(
+            &binding_id,
+            Some(DictationSession::snapshot(WorkflowMode::Cleanup, &settings)),
+        );
+        state.on_input(
+            workflow_input(WorkflowMode::Cleanup),
+            now + Duration::from_secs(3),
+        );
+        let output = process_transcription_output(&state.session.take().unwrap(), "raw").await;
+        assert_eq!(output.final_text, "Cleaned.");
+        assert_eq!(server.requests.lock().unwrap()[0]["model"], "next-model");
+    }
+
+    #[test]
+    fn cancel_and_failed_start_release_mode_snapshot_and_allow_new_session() {
+        let mut state = CoordinatorState::new();
+        let settings = crate::settings::get_default_settings();
+        let now = Instant::now();
+        for mode in [WorkflowMode::Raw, WorkflowMode::Cleanup] {
+            state.on_input(workflow_input(mode), now);
+            state.on_start_result(
+                mode.binding_id(),
+                Some(DictationSession::snapshot(mode, &settings)),
+            );
+            assert!(state.session.is_some());
+            state.on_cancel(true);
+            assert!(state.session.is_none());
+            assert_eq!(state.stage, Stage::Idle);
+            assert!(matches!(
+                state.on_input(workflow_input(mode), now),
+                Some(Effect::Start { .. })
+            ));
+            state.on_start_result(mode.binding_id(), None);
+            assert!(state.session.is_none());
+            assert_eq!(state.stage, Stage::Idle);
+        }
+    }
 
     #[test]
     fn push_to_talk_release_while_recording_defers_release() {
@@ -1201,7 +1390,7 @@ mod tests {
         let effect = state.on_input(ptt_input(true), Instant::now());
         assert!(matches!(effect, Some(Effect::Start { .. })));
 
-        state.on_start_result(BINDING, false);
+        state.on_start_result(BINDING, None);
         assert_eq!(state.stage, Stage::Idle);
     }
 

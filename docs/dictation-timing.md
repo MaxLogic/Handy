@@ -25,7 +25,7 @@ Key fields (durations are microseconds from `std::time::Instant`):
 | `session`, `seq`        | Process start (unix ms) and per-process record counter starting at 1; the end marker states the final count, so a lost record is detected    |
 | `label`                 | Workload label from `HANDY_DICTATION_TIMING_LABEL` (for example the spoken language)                                                         |
 | `mode`                  | `raw` (no LLM) or `cleanup` (existing post-processing route)                                                                                 |
-| `outcome`               | `pasted`, `empty_output`, `paste_error`, `main_thread_error`, `transcription_error`, `cancelled`, `no_samples`, `empty_audio`, `aborted`     |
+| `outcome`               | `pasted`, `cleanup_fallback`, `empty_output`, `paste_error`, `main_thread_error`, `transcription_error`, `cancelled`, `no_samples`, `empty_audio`, `aborted`     |
 | `cold`                  | Model was not resident when the recording started                                                                                            |
 | `audio_ms`              | Captured audio length after the recorder's VAD (not the spoken length), used to bucket 5/15/60 s workloads                                   |
 | `total_us`              | Accepted stop event until output completed or was refused                                                                                    |
@@ -156,6 +156,8 @@ Options:
 Statistics are nearest-rank (rank = ceil(p/100 x n); the median is the 50th
 percentile, the lower middle value for an even count) over `total_us`, in ms,
 with per-stage median/p95. Failures are counted per workload by outcome.
+Cleanup fallbacks (`cleanup_fallback`) are excluded from latency samples and
+reported separately, so they do not count toward the 30-sample requirement.
 
 Exit code 0 means every workload has its samples, every line parsed, `seq` is
 gapless from 1 with a matching end marker and no dropped records, no invariant was violated, and (with

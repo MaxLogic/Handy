@@ -34,6 +34,7 @@ export const DEFAULT_LANGUAGES = ["en", "pl"];
 
 const OUTCOMES = [
   "pasted",
+  "cleanup_fallback",
   "empty_output",
   "paste_error",
   "main_thread_error",
@@ -472,6 +473,7 @@ export function summarize(
       continue;
     }
     const key = keyOf(workloadLanguage(r), r.mode, bucket);
+    // Cleanup fallback delivered raw text, not a successful cleanup latency sample.
     if (r.outcome !== "pasted") {
       const counts = failuresByKey.get(key) ?? {};
       counts[r.outcome] = (counts[r.outcome] ?? 0) + 1;

@@ -1,4 +1,6 @@
-use crate::actions::process_transcription_output;
+use crate::actions::{
+    process_transcription_output, report_cleanup_failure, DictationSession, WorkflowMode,
+};
 use crate::managers::{
     history::{HistoryManager, PaginatedHistory},
     transcription::TranscriptionManager,
@@ -73,6 +75,15 @@ pub async fn retry_history_entry_transcription(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("History entry {} not found", id))?;
 
+    // The persisted boolean is a compatibility boundary. A retry snapshots
+    // current configuration once, before model loading or STT can suspend.
+    let mode = if entry.post_process_requested {
+        WorkflowMode::Cleanup
+    } else {
+        WorkflowMode::Raw
+    };
+    let session = DictationSession::snapshot(mode, &crate::settings::get_settings(&app));
+
     let audio_path = history_manager.get_audio_file_path(&entry.file_name);
     let samples = crate::audio_toolkit::read_wav_samples(&audio_path)
         .map_err(|e| format!("Failed to load audio: {}", e))?;
@@ -93,8 +104,8 @@ pub async fn retry_history_entry_transcription(
         return Err("Recording contains no speech".to_string());
     }
 
-    let processed =
-        process_transcription_output(&app, &transcription, entry.post_process_requested).await;
+    let processed = process_transcription_output(&session, &transcription).await;
+    report_cleanup_failure(&app, &processed);
     history_manager
         .update_transcription(
             id,

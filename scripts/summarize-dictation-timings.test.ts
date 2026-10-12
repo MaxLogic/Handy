@@ -101,6 +101,25 @@ describe("statistics", () => {
 });
 
 describe("summarizer CLI", () => {
+  test("cleanup fallback is reported separately and cannot satisfy latency samples", () => {
+    const records = baselineText
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const index = records.findIndex((r) => r.mode === "cleanup" && !r.cold);
+    const changed = mutateLine(baselineText, index, (r) => {
+      r.outcome = "cleanup_fallback";
+      r.total_us = 1;
+      r.stages = { llm_us: 1 };
+    });
+    const { code, output } = summarizeText(changed);
+    expect(output).toContain("en cleanup 5s: n=29");
+    expect(output).toContain("cleanup_fallback=1");
+    expect(output).toContain("need 30");
+    expect(output).not.toContain("unknown outcome");
+    expect(code).toBe(1);
+  });
+
   test("committed fixture is exactly the generator output", () => {
     expect(readFileSync(FIXTURE, "utf8")).toBe(baselineText);
   });

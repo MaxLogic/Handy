@@ -186,21 +186,13 @@ pub enum Mode {
     Cleanup,
 }
 
-impl Mode {
-    pub fn from_post_process(post_process: bool) -> Self {
-        if post_process {
-            Mode::Cleanup
-        } else {
-            Mode::Raw
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     /// Text was handed to the paste path and it reported success.
     Pasted,
+    /// Cleanup failed; unchanged raw text was successfully pasted instead.
+    CleanupFallback,
     /// STT and cleanup produced no text to insert.
     EmptyOutput,
     PasteError,
@@ -589,10 +581,6 @@ impl OperationTimer {
     /// Adds the time since `since` to a stage.
     pub fn add_since(&self, stage: Stage, since: Instant) {
         self.add(stage, since.elapsed());
-    }
-
-    pub fn set_language(&self, language: String) {
-        self.inner().language = language;
     }
 
     pub fn set_audio_samples(&self, sample_count: usize) {
@@ -1158,6 +1146,24 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn cleanup_fallback_serializes_as_an_additive_schema_one_outcome() {
+        let mut op = inner(Mode::Cleanup, true);
+        op.paste_calls = 1;
+        let record = finished_record(
+            &mut op,
+            Outcome::CleanupFallback,
+            10,
+            counters_at(2, 1, 100, 6),
+        );
+        assert_eq!(record.outcome, Outcome::CleanupFallback);
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["schema"], 1);
+        assert_eq!(value["mode"], "cleanup");
+        assert_eq!(value["outcome"], "cleanup_fallback");
+        assert_eq!(value["paste_calls"], 1);
+    }
+
+    #[test]
     fn json_line_contains_only_expected_numeric_and_enum_fields() {
         let mut op = inner(Mode::Cleanup, false);
         op.audio_ms = Some(5_000);
@@ -1308,11 +1314,5 @@ pub(super) mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         drop(second);
         assert_eq!(counter.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn mode_follows_the_post_process_flag() {
-        assert_eq!(Mode::from_post_process(false), Mode::Raw);
-        assert_eq!(Mode::from_post_process(true), Mode::Cleanup);
     }
 }
