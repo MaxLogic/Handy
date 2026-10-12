@@ -237,12 +237,70 @@ where
     }
 }
 
-pub(crate) fn report_cleanup_failure(app: &AppHandle, output: &ProcessedTranscription) {
+#[derive(Clone, Copy, Debug, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct CleanupFallbackNotice {
+    pub history_available: bool,
+    pub raw_delivered: bool,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct PasteFailureNotice {
+    pub cleanup_failed: bool,
+    pub raw_history_available: bool,
+}
+
+pub(crate) trait CleanupFailureReporter {
+    fn play_failure_feedback(&self);
+    fn emit_notice(&self, event: &str, notice: CleanupFallbackNotice);
+    fn emit_paste_failure(&self, notice: PasteFailureNotice);
+}
+
+impl CleanupFailureReporter for AppHandle {
+    fn play_failure_feedback(&self) {
+        crate::audio_feedback::play_failure_feedback(self);
+    }
+    fn emit_notice(&self, event: &str, notice: CleanupFallbackNotice) {
+        let _ = self.emit(event, notice);
+    }
+    fn emit_paste_failure(&self, notice: PasteFailureNotice) {
+        let _ = self.emit("paste-error", notice);
+    }
+}
+
+pub(crate) fn report_transcription_delivery(
+    app: &impl CleanupFailureReporter,
+    output: &ProcessedTranscription,
+    history_saved: bool,
+    result: &Result<bool, String>,
+) {
+    match result {
+        Ok(raw_delivered) => report_cleanup_failure(
+            app,
+            output,
+            CleanupFallbackNotice {
+                history_available: history_saved,
+                raw_delivered: *raw_delivered,
+            },
+        ),
+        Err(_) => {
+            app.play_failure_feedback();
+            app.emit_paste_failure(PasteFailureNotice {
+                cleanup_failed: output.cleanup_error.is_some(),
+                raw_history_available: history_saved && output.cleanup_error.is_some(),
+            });
+        }
+    }
+}
+
+pub(crate) fn report_cleanup_failure(
+    app: &impl CleanupFailureReporter,
+    output: &ProcessedTranscription,
+    notice: CleanupFallbackNotice,
+) {
     if let Some(error) = &output.cleanup_error {
+        app.play_failure_feedback();
         warn!("LLM cleanup skipped/failed: {error}");
-        // Reuse the existing translated error toast; raw remains in history
-        // under the ordinary retention policy.
-        let _ = app.emit("transcription-error", error);
+        app.emit_notice("cleanup-fallback", notice);
     }
 }
 
@@ -641,7 +699,7 @@ impl TranscribeAction {
                             {
                                 timer.add_since(Stage::Llm, cleanup_started);
                             }
-                            let Some(processed) = processed else {
+                            let Some(mut processed) = processed else {
                                 debug!("Transcription operation cancelled during output handling");
                                 timer.finish(Outcome::Cancelled);
                                 utils::hide_recording_overlay(&ah);
@@ -657,18 +715,19 @@ impl TranscribeAction {
                                 return;
                             }
 
-                            report_cleanup_failure(&ah, &processed);
                             // Save to history if WAV was saved
+                            let mut history_saved = false;
                             if wav_saved {
                                 let history_started = Instant::now();
-                                if let Err(err) = hm.save_entry(
+                                match hm.save_entry(
                                     file_name,
                                     transcription,
                                     session.mode() == WorkflowMode::Cleanup,
                                     processed.post_processed_text.clone(),
                                     processed.post_process_prompt.clone(),
                                 ) {
-                                    error!("Failed to save history entry: {}", err);
+                                    Ok(_) => history_saved = true,
+                                    Err(err) => error!("Failed to save history entry: {}", err),
                                 }
                                 timer.add_since(Stage::History, history_started);
                             }
@@ -681,7 +740,7 @@ impl TranscribeAction {
                                 let ah_clone = ah.clone();
                                 let paste_time = Instant::now();
                                 let paste_outcome = processed.paste_outcome();
-                                let final_text = processed.final_text;
+                                let final_text = std::mem::take(&mut processed.final_text);
                                 let rm_for_paste = Arc::clone(&rm);
                                 let timer_for_paste = timer.clone();
                                 let main_sched_started = Instant::now();
@@ -699,8 +758,14 @@ impl TranscribeAction {
                                     let paste_started = Instant::now();
                                     let paste_result = utils::paste(final_text, ah_clone.clone());
                                     timer_for_paste.add_since(Stage::Paste, paste_started);
+                                    report_transcription_delivery(
+                                        &ah_clone,
+                                        &processed,
+                                        history_saved,
+                                        &paste_result,
+                                    );
                                     match paste_result {
-                                        Ok(()) => {
+                                        Ok(_) => {
                                             timer_for_paste.finish(paste_outcome);
                                             debug!(
                                                 "Text pasted successfully in {:?}",
@@ -710,7 +775,6 @@ impl TranscribeAction {
                                         Err(e) => {
                                             timer_for_paste.finish(Outcome::PasteError);
                                             error!("Failed to paste transcription: {}", e);
-                                            let _ = ah_clone.emit("paste-error", ());
                                         }
                                     }
                                     utils::hide_recording_overlay(&ah_clone);
@@ -826,6 +890,129 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 
 #[cfg(test)]
 mod tests {
+    #[derive(Default)]
+    struct FakeCleanupReporter {
+        events: std::cell::RefCell<Vec<(String, super::CleanupFallbackNotice)>>,
+        cues: std::cell::Cell<usize>,
+        paste_events: std::cell::RefCell<Vec<super::PasteFailureNotice>>,
+    }
+    impl super::CleanupFailureReporter for FakeCleanupReporter {
+        fn play_failure_feedback(&self) {
+            self.cues.set(self.cues.get() + 1);
+        }
+        fn emit_notice(&self, event: &str, notice: super::CleanupFallbackNotice) {
+            self.events.borrow_mut().push((event.into(), notice));
+        }
+        fn emit_paste_failure(&self, notice: super::PasteFailureNotice) {
+            self.paste_events.borrow_mut().push(notice);
+        }
+    }
+    #[test]
+    fn cleanup_and_paste_failure_reports_one_notice_with_saved_raw_history() {
+        for history_saved in [true, false] {
+            for cleanup_failed in [true, false] {
+                let reporter = FakeCleanupReporter::default();
+                let output = super::ProcessedTranscription {
+                    final_text: "raw transcription".into(),
+                    post_processed_text: None,
+                    post_process_prompt: None,
+                    cleanup_error: cleanup_failed.then(|| "llm_timeout".into()),
+                };
+                super::report_transcription_delivery(
+                    &reporter,
+                    &output,
+                    history_saved,
+                    &Err("paste refused".into()),
+                );
+                assert!(reporter.events.borrow().is_empty());
+                assert_eq!(
+                    &*reporter.paste_events.borrow(),
+                    &[super::PasteFailureNotice {
+                        cleanup_failed,
+                        raw_history_available: history_saved && cleanup_failed
+                    }]
+                );
+                assert_eq!(reporter.cues.get(), 1);
+                assert_eq!(
+                    serde_json::to_value(reporter.paste_events.borrow()[0]).unwrap()
+                        ["cleanup_failed"],
+                    serde_json::json!(cleanup_failed)
+                );
+            }
+        }
+    }
+    #[test]
+    fn cleanup_with_no_paste_reports_no_delivery_and_actual_history_availability() {
+        for history_saved in [true, false] {
+            let reporter = FakeCleanupReporter::default();
+            let output = super::ProcessedTranscription {
+                final_text: "raw transcription".into(),
+                post_processed_text: None,
+                post_process_prompt: None,
+                cleanup_error: Some("llm_timeout".into()),
+            };
+            super::report_transcription_delivery(&reporter, &output, history_saved, &Ok(false));
+            assert_eq!(
+                &*reporter.events.borrow(),
+                &[(
+                    "cleanup-fallback".into(),
+                    super::CleanupFallbackNotice {
+                        history_available: history_saved,
+                        raw_delivered: false
+                    }
+                )]
+            );
+            assert!(reporter.paste_events.borrow().is_empty());
+            assert_eq!(reporter.cues.get(), 1);
+        }
+    }
+    #[test]
+    fn cleanup_fallback_notice_is_not_transcription_failure() {
+        let output = super::ProcessedTranscription {
+            final_text: "raw transcription".into(),
+            post_processed_text: None,
+            post_process_prompt: None,
+            cleanup_error: Some("llm_timeout".into()),
+        };
+        let reporter = FakeCleanupReporter::default();
+        let notice = super::CleanupFallbackNotice {
+            history_available: false,
+            raw_delivered: true,
+        };
+        super::report_cleanup_failure(&reporter, &output, notice);
+        assert_eq!(
+            &*reporter.events.borrow(),
+            &[("cleanup-fallback".into(), notice)]
+        );
+        assert_eq!(reporter.cues.get(), 1);
+        assert_eq!(output.final_text, "raw transcription");
+        let success = super::ProcessedTranscription {
+            cleanup_error: None,
+            ..output
+        };
+        super::report_cleanup_failure(&reporter, &success, notice);
+        assert_eq!(reporter.events.borrow().len(), 1);
+        assert_eq!(reporter.cues.get(), 1);
+    }
+    #[test]
+    fn cleanup_fallback_notice_reports_saved_history_without_claiming_paste() {
+        let reporter = FakeCleanupReporter::default();
+        let output = super::ProcessedTranscription {
+            final_text: "raw transcription".into(),
+            post_processed_text: None,
+            post_process_prompt: None,
+            cleanup_error: Some("llm_timeout".into()),
+        };
+        let notice = super::CleanupFallbackNotice {
+            history_available: true,
+            raw_delivered: false,
+        };
+        super::report_cleanup_failure(&reporter, &output, notice);
+        assert_eq!(
+            &*reporter.events.borrow(),
+            &[("cleanup-fallback".into(), notice)]
+        );
+    }
     use super::*;
     use crate::llm_client::test_http::{completion, FakeServer, Step};
     use crate::llm_client::{ConfigError, LlmError, OutputError};

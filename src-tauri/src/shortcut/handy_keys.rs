@@ -383,19 +383,19 @@ impl Drop for HandyKeysState {
 fn modifiers_to_strings(modifiers: handy_keys::Modifiers) -> Vec<String> {
     let mut result = Vec::new();
 
-    if modifiers.contains(handy_keys::Modifiers::CTRL) {
+    if modifiers.intersects(handy_keys::Modifiers::CTRL) {
         result.push("ctrl".to_string());
     }
-    if modifiers.contains(handy_keys::Modifiers::OPT) {
+    if modifiers.intersects(handy_keys::Modifiers::OPT) {
         #[cfg(target_os = "macos")]
         result.push("option".to_string());
         #[cfg(not(target_os = "macos"))]
         result.push("alt".to_string());
     }
-    if modifiers.contains(handy_keys::Modifiers::SHIFT) {
+    if modifiers.intersects(handy_keys::Modifiers::SHIFT) {
         result.push("shift".to_string());
     }
-    if modifiers.contains(handy_keys::Modifiers::CMD) {
+    if modifiers.intersects(handy_keys::Modifiers::CMD) {
         #[cfg(target_os = "macos")]
         result.push("command".to_string());
         #[cfg(not(target_os = "macos"))]
@@ -626,5 +626,31 @@ mod assistant_registration_tests {
                 .collect::<Vec<_>>(),
             ["transcribe"]
         );
+    }
+    #[test]
+    fn capture_events_report_each_pressed_modifier_side() {
+        use handy_keys::Modifiers;
+        #[cfg(target_os = "macos")]
+        let (alt, meta) = ("option", "command");
+        #[cfg(not(target_os = "macos"))]
+        let (alt, meta) = ("alt", "super");
+        for (flag, name) in [
+            (Modifiers::CTRL_LEFT, "ctrl"),
+            (Modifiers::CTRL_RIGHT, "ctrl"),
+            (Modifiers::SHIFT_LEFT, "shift"),
+            (Modifiers::SHIFT_RIGHT, "shift"),
+            (Modifiers::OPT_LEFT, alt),
+            (Modifiers::OPT_RIGHT, alt),
+            (Modifiers::CMD_LEFT, meta),
+            (Modifiers::CMD_RIGHT, meta),
+            (Modifiers::FN, "fn"),
+        ] {
+            assert_eq!(super::modifiers_to_strings(flag), [name], "lost {flag:?}");
+        }
+        assert_eq!(
+            super::modifiers_to_strings(Modifiers::CTRL_LEFT | Modifiers::SHIFT_RIGHT),
+            ["ctrl", "shift"]
+        );
+        assert!(super::modifiers_to_strings(Modifiers::empty()).is_empty());
     }
 }

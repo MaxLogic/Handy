@@ -1,5 +1,6 @@
 use crate::actions::{
-    process_transcription_output, report_cleanup_failure, DictationSession, WorkflowMode,
+    process_transcription_output, report_cleanup_failure, CleanupFallbackNotice, DictationSession,
+    WorkflowMode,
 };
 use crate::managers::{
     history::{HistoryManager, PaginatedHistory},
@@ -106,16 +107,24 @@ pub async fn retry_history_entry_transcription(
     }
 
     let processed = process_transcription_output(&session, &transcription).await;
-    report_cleanup_failure(&app, &processed);
     history_manager
         .update_transcription(
             id,
             transcription,
-            processed.post_processed_text,
-            processed.post_process_prompt,
+            processed.post_processed_text.clone(),
+            processed.post_process_prompt.clone(),
         )
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    report_cleanup_failure(
+        &app,
+        &processed,
+        CleanupFallbackNotice {
+            history_available: true,
+            raw_delivered: false,
+        },
+    );
+    Ok(())
 }
 
 #[tauri::command]

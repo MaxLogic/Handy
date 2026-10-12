@@ -199,6 +199,7 @@ pub(crate) fn classify_capture(f: &CaptureFacts) -> Result<CapturedText, Capture
 pub(crate) const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
 pub(crate) const EVENT_OBJECT_FOCUS: u32 = 0x8005;
 pub(crate) const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
+#[cfg(test)]
 pub(crate) const EVENT_OBJECT_VALUECHANGE: u32 = 0x800E;
 pub(crate) const EVENT_OBJECT_TEXTSELECTIONCHANGED: u32 = 0x8014;
 pub(crate) const OBJID_CARET: i32 = -8;

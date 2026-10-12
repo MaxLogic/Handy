@@ -47,6 +47,7 @@ pub enum LlmError {
     Input(InputError),
     Timeout,
     Transport(String),
+    ContextExceeded,
     Provider { status: u16, detail: String },
     ResponseTooLarge,
     InvalidOutput(OutputError),
@@ -79,6 +80,7 @@ impl std::fmt::Debug for LlmError {
             Self::Input(error) => f.debug_tuple("Input").field(error).finish(),
             Self::Timeout => f.write_str("Timeout"),
             Self::Transport(reason) => f.debug_tuple("Transport").field(reason).finish(),
+            Self::ContextExceeded => f.write_str("ContextExceeded"),
             Self::Provider { status, .. } => f
                 .debug_struct("Provider")
                 .field("status", status)
@@ -109,6 +111,7 @@ impl LlmError {
             Self::Input(InputError::TooLong { .. }) => "too_long",
             Self::Timeout => "timeout",
             Self::Transport(_) => "transport",
+            Self::ContextExceeded => "context_exceeded",
             Self::Provider { .. } => "provider",
             Self::ResponseTooLarge => "response_too_large",
             Self::InvalidOutput(error) => match error {
@@ -129,6 +132,7 @@ impl LlmError {
             Self::Input(_) => "llm_input",
             Self::Timeout => "llm_timeout",
             Self::Transport(_) => "llm_transport",
+            Self::ContextExceeded => "llm_context_exceeded",
             Self::Provider { .. } => "llm_provider",
             Self::ResponseTooLarge => "llm_response_too_large",
             Self::InvalidOutput(_) => "llm_invalid_output",
@@ -570,7 +574,12 @@ async fn bounded_body(
 async fn provider_error(response: reqwest::Response, options_sent: bool) -> LlmError {
     let status = response.status().as_u16();
     let detail = match bounded_body(response, MAX_ERROR_BODY, true).await {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).chars().take(1024).collect(),
+        Ok(bytes) => {
+            if context_exceeded(status, &bytes) {
+                return LlmError::ContextExceeded;
+            }
+            String::from_utf8_lossy(&bytes).chars().take(1024).collect()
+        }
         // The HTTP status is already known; detail is best-effort UI context.
         Err(_) => String::new(),
     };
@@ -579,6 +588,27 @@ async fn provider_error(response: reqwest::Response, options_sent: bool) -> LlmE
     } else {
         LlmError::Provider { status, detail }
     }
+}
+
+fn context_exceeded(status: u16, body: &[u8]) -> bool {
+    if !matches!(status, 400 | 422) {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let error = &value["error"];
+    let kind = error["type"].as_str().unwrap_or_default();
+    let code = error["code"].as_str().unwrap_or_default();
+    let message = error["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        kind,
+        "exceed_context_size_error" | "context_length_exceeded"
+    ) || code == "context_length_exceeded"
+        || (message.contains("context") && message.contains("exceed"))
 }
 
 /// One generation, with at most one reasoning compatibility retry in the same deadline.
@@ -655,16 +685,20 @@ pub(crate) async fn chat_completion_with_limits(
             .await
             .map_err(|e| LlmError::Transport(report_reqwest_error("HTTP request failed", &e)))?;
         if matches!(response.status().as_u16(), 400 | 422) && !body.reasoning.is_empty() {
+            // Context overflow is not a reasoning compatibility rejection.
+            // Never repeat an oversized request or weaken its input.
+            let rejection = provider_error(response, false).await;
+            if matches!(rejection, LlmError::ContextExceeded) {
+                return Err(rejection);
+            }
             info!(
                 concat!(
                     "Endpoint rejected reasoning options (status {}, url: {}); ",
                     "retrying without reasoning fields"
                 ),
-                response.status(),
-                sanitized_url(response.url())
+                rejection,
+                sanitized_url_for_log(&url)
             );
-            // Drain only a bounded error body. The retry shares the outer deadline.
-            bounded_body(response, MAX_ERROR_BODY, true).await?;
             body.reasoning = ReasoningParams::default();
             response = client
                 .post(&url)
@@ -907,6 +941,33 @@ pub(crate) mod test_http {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn context_exceeded_http_maps_to_too_long_without_retry() {
+        // Captured from the running llama.cpp qwen3.5:9b server, ctx 16384.
+        let body = r#"{"error":{"code":400,"message":"request (18012 tokens) exceeds the available context size (16384 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":18012,"n_ctx":16384}}"#;
+        for temperature in [None, Some(0.0)] {
+            let server = FakeServer::new(vec![Step::Respond(400, body.into())]).await;
+            let options = LlmRequestOptions {
+                temperature,
+                ..Default::default()
+            };
+            let error = call(
+                &server,
+                &options,
+                true,
+                MAX_BODY,
+                Duration::from_secs(2),
+                &ClientCache::default(),
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(error.code(), "llm_context_exceeded");
+            assert_eq!(error.reason(), "context_exceeded");
+            assert_eq!(server.accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(!format!("{error:?}").contains("18012"));
+        }
+    }
     use super::*;
     use std::fmt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

@@ -55,6 +55,24 @@ pub fn play_feedback_sound(app: &AppHandle, sound_type: SoundType) {
     }
 }
 
+/// Error-only cue for a hidden settings window. No focus or speech changes.
+pub(crate) fn play_failure_feedback(app: &AppHandle) {
+    #[cfg(target_os = "windows")]
+    if settings::get_settings(app).audio_feedback {
+        // MessageBeep queues the configured Windows error sound asynchronously.
+        // SAFETY: no pointer parameters or application/window mutation.
+        if let Err(error) = unsafe {
+            windows::Win32::System::Diagnostics::Debug::MessageBeep(
+                windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
+            )
+        } {
+            warn!("Could not play failure cue: {error}");
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = app;
+}
+
 pub fn play_feedback_sound_blocking(app: &AppHandle, sound_type: SoundType) {
     let settings = settings::get_settings(app);
     if !settings.audio_feedback {

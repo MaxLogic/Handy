@@ -32,12 +32,18 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
   disabled = false,
 }) => {
   const { t } = useTranslation();
+  const translateRef = useRef(t);
+  translateRef.current = t;
   const { getSetting, updateBinding, resetBinding, isUpdating, isLoading } =
     useSettings();
   const [isRecording, setIsRecording] = useState(false);
   const [currentKeys, setCurrentKeys] = useState<string>("");
   const [originalBinding, setOriginalBinding] = useState<string>("");
-  const shortcutRef = useRef<HTMLDivElement | null>(null);
+  const shortcutRef = useRef<HTMLButtonElement | null>(null);
+  const captureRef = useRef<HTMLDivElement>(null);
+  const stoppingRef = useRef(false);
+  const navigationRef = useRef(false);
+  const recordedKeysRef = useRef(new Set<string>());
   const unlistenRef = useRef<(() => void) | null>(null);
   // Use a ref to track currentKeys for the event handler (avoids stale closure)
   const currentKeysRef = useRef<string>("");
@@ -49,41 +55,85 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
   const keyedShortcutRef = useRef<string>("");
   const modifierOnlyShortcutRef = useRef<string>("");
   const osType = useOsType();
+  const [shortcutError, setShortcutError] = useState("");
 
   const bindings = getSetting("bindings") || {};
 
+  // The session owns its one matching release, including a start still in flight.
+  const captureSessionRef = useRef<{
+    start: Promise<boolean>;
+    released: boolean;
+  } | null>(null);
+  const mountedRef = useRef(true);
+  const releaseCapture = useCallback(async () => {
+    const session = captureSessionRef.current;
+    if (!session || session.released) return;
+    session.released = true;
+    unlistenRef.current?.();
+    unlistenRef.current = null;
+    try {
+      const started = await session.start;
+      if (!started) return;
+      const result = await commands.stopHandyKeysRecording();
+      if (result.status === "error") throw new Error(result.error);
+    } catch (error) {
+      console.error("Failed to restore shortcut bindings:", error);
+      const message = translateRef.current(
+        "settings.general.shortcut.errors.set",
+        {
+          error: String(error),
+        },
+      );
+      if (mountedRef.current) setShortcutError(message);
+      else toast.error(message);
+    } finally {
+      if (captureSessionRef.current === session)
+        captureSessionRef.current = null;
+    }
+  }, []);
+
   // Handle cancellation
-  const cancelRecording = useCallback(async () => {
-    if (!isRecording) return;
+  const cancelRecording = useCallback(
+    async (restoreFocus = true) => {
+      if (!captureSessionRef.current) return;
+      stoppingRef.current = true;
+      setIsRecording(false);
+      if (restoreFocus) shortcutRef.current?.focus();
 
-    // Stop listening for backend events
-    if (unlistenRef.current) {
-      unlistenRef.current();
-      unlistenRef.current = null;
-    }
-
-    // Stop backend recording
-    await commands.stopHandyKeysRecording().catch(console.error);
-
-    // Restore original binding
-    if (originalBinding) {
-      try {
-        await updateBinding(shortcutId, originalBinding);
-      } catch (error) {
-        console.error("Failed to restore original binding:", error);
-        toast.error(t("settings.general.shortcut.errors.restore"));
+      // Stop listening for backend events
+      if (unlistenRef.current) {
+        unlistenRef.current();
+        unlistenRef.current = null;
       }
-    }
 
-    setIsRecording(false);
-    setCurrentKeys("");
-    currentKeysRef.current = "";
-    keyedShortcutRef.current = "";
-    modifierOnlyShortcutRef.current = "";
-    setOriginalBinding("");
-  }, [isRecording, originalBinding, shortcutId, updateBinding, t]);
+      // Stop backend recording
+      await releaseCapture();
+
+      setIsRecording(false);
+      setCurrentKeys("");
+      currentKeysRef.current = "";
+      keyedShortcutRef.current = "";
+      modifierOnlyShortcutRef.current = "";
+      recordedKeysRef.current.clear();
+      setOriginalBinding("");
+    },
+    [releaseCapture],
+  );
 
   // Set up event listener for handy-keys events
+  useEffect(() => {
+    mountedRef.current = true;
+    const handleWindowBlur = () => {
+      void cancelRecording(false);
+    };
+    window.addEventListener("blur", handleWindowBlur);
+    return () => {
+      mountedRef.current = false;
+      window.removeEventListener("blur", handleWindowBlur);
+      void releaseCapture();
+    };
+  }, [releaseCapture, cancelRecording]);
+
   useEffect(() => {
     if (!isRecording) return;
 
@@ -92,10 +142,25 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
     const setupListener = async () => {
       // Listen for key events from backend
       const commitAndStop = async (keysToCommit: string) => {
+        if (stoppingRef.current) return;
+        stoppingRef.current = true;
         try {
-          await updateBinding(shortcutId, keysToCommit);
+          if (
+            ["enter", "return", "escape", "esc", "tab"].includes(
+              keysToCommit.toLowerCase(),
+            )
+          ) {
+            setShortcutError(
+              t("settings.general.shortcut.errors.navigationKey"),
+            );
+          } else {
+            await updateBinding(shortcutId, keysToCommit);
+          }
         } catch (error) {
           console.error("Failed to change binding:", error);
+          setShortcutError(
+            t("settings.general.shortcut.errors.set", { error: String(error) }),
+          );
           toast.error(
             t("settings.general.shortcut.errors.set", {
               error: String(error),
@@ -118,21 +183,65 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
           unlistenRef.current();
           unlistenRef.current = null;
         }
-        await commands.stopHandyKeysRecording().catch(console.error);
+        await releaseCapture();
         setIsRecording(false);
         setCurrentKeys("");
         currentKeysRef.current = "";
         keyedShortcutRef.current = "";
         modifierOnlyShortcutRef.current = "";
+        recordedKeysRef.current.clear();
         setOriginalBinding("");
+        requestAnimationFrame(() => {
+          if (
+            mountedRef.current &&
+            captureRef.current?.contains(document.activeElement)
+          )
+            shortcutRef.current?.focus();
+        });
       };
 
       const unlisten = await listen<HandyKeysEvent>(
         "handy-keys-event",
         async (event) => {
-          if (cleanup) return;
+          if (cleanup || stoppingRef.current) return;
 
           const { hotkey_string, is_key_down, key, modifiers } = event.payload;
+
+          if (
+            is_key_down &&
+            ["escape", "esc"].includes(key?.toLowerCase() ?? "") &&
+            modifiers.length === 0
+          ) {
+            await cancelRecording();
+            return;
+          }
+          if (
+            is_key_down &&
+            key?.toLowerCase() === "tab" &&
+            modifiers.every((modifier) =>
+              ["shift", "shift_left", "shift_right"].includes(
+                modifier.toLowerCase(),
+              ),
+            )
+          ) {
+            navigationRef.current = true;
+            keyedShortcutRef.current = "";
+            modifierOnlyShortcutRef.current = "";
+            currentKeysRef.current = "";
+            setCurrentKeys("");
+            return;
+          }
+          if (document.activeElement !== shortcutRef.current) return;
+          if (navigationRef.current && !is_key_down) return;
+          if (is_key_down) navigationRef.current = false;
+
+          // The native hook can deliver the Change activation's release even
+          // though its press preceded this session. Only accept matching presses.
+          if (key) {
+            const recordedKey = key.toLowerCase();
+            if (is_key_down) recordedKeysRef.current.add(recordedKey);
+            else if (!recordedKeysRef.current.delete(recordedKey)) return;
+          }
 
           if (is_key_down && hotkey_string) {
             // Update both state (for display) and refs (for release handler)
@@ -144,9 +253,8 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
             currentKeysRef.current = hotkey_string;
             setCurrentKeys(hotkey_string);
           } else if (!is_key_down && key) {
-            // The main key was released — commit the keyed combo. The release
-            // event's hotkey_string still contains the key, so it works even
-            // if the key-down was somehow missed. Never fall back to a
+            // The recorded main key was released — commit the keyed combo.
+            // Never fall back to a
             // modifier-only capture here: that's how bindings used to get
             // silently overwritten with just the modifier (issue #1578).
             const keysToCommit = keyedShortcutRef.current || hotkey_string;
@@ -167,7 +275,8 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
         },
       );
 
-      unlistenRef.current = unlisten;
+      if (cleanup || stoppingRef.current) unlisten();
+      else unlistenRef.current = unlisten;
     };
 
     setupListener();
@@ -178,8 +287,7 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
         unlistenRef.current();
         unlistenRef.current = null;
       }
-      // Stop backend recording on unmount to prevent orphaned recording loops
-      commands.stopHandyKeysRecording().catch(console.error);
+      // The session lifetime cleanup owns the matching backend stop.
     };
   }, [
     isRecording,
@@ -188,28 +296,64 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
     updateBinding,
     cancelRecording,
     t,
+    releaseCapture,
   ]);
 
   // Handle click outside
   useEffect(() => {
     if (!isRecording) return;
 
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.key === "Escape" &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        !event.metaKey &&
+        !event.shiftKey
+      ) {
+        event.preventDefault();
+        void cancelRecording();
+      } else if (
+        event.key === "Tab" &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        !event.metaKey
+      ) {
+        navigationRef.current = true;
+        keyedShortcutRef.current = "";
+        modifierOnlyShortcutRef.current = "";
+        currentKeysRef.current = "";
+        setCurrentKeys("");
+      }
+    };
+
     const handleClickOutside = (e: MouseEvent) => {
       if (
-        shortcutRef.current &&
-        !shortcutRef.current.contains(e.target as Node)
+        captureRef.current &&
+        !captureRef.current.contains(e.target as Node)
       ) {
-        cancelRecording();
+        void cancelRecording(false);
       }
     };
 
     window.addEventListener("click", handleClickOutside);
-    return () => window.removeEventListener("click", handleClickOutside);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("click", handleClickOutside);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
   }, [isRecording, cancelRecording]);
 
   // Start recording a new shortcut
   const startRecording = async () => {
-    if (isRecording) return;
+    setShortcutError("");
+    if (
+      captureSessionRef.current ||
+      isRecording ||
+      disabled ||
+      isUpdating(`binding_${shortcutId}`)
+    )
+      return;
 
     // Store the original binding to restore if canceled
     setOriginalBinding(bindings[shortcutId]?.current_binding || "");
@@ -218,9 +362,19 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
     // is active (the recorder's listener would receive no key events and
     // capture just the modifier) — it also flips the warning banner on, so
     // the toast points at a visible explanation.
+    const start = commands.startHandyKeysRecording(shortcutId);
+    const session = {
+      start: start.then(
+        (result) => result.status === "ok",
+        () => false,
+      ),
+      released: false,
+    };
+    captureSessionRef.current = session;
     try {
-      const result = await commands.startHandyKeysRecording(shortcutId);
+      const result = await start;
       if (result.status === "error") {
+        await releaseCapture();
         if (String(result.error).includes("secure-input-active")) {
           toast.error(t("secureInput.recorderBlocked"), {
             action: {
@@ -237,12 +391,24 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
         }
         return;
       }
+      if (
+        !mountedRef.current ||
+        session.released ||
+        !captureRef.current?.contains(document.activeElement)
+      ) {
+        await releaseCapture();
+        return;
+      }
       setIsRecording(true);
+      stoppingRef.current = false;
+      navigationRef.current = false;
       setCurrentKeys("");
       currentKeysRef.current = "";
       keyedShortcutRef.current = "";
       modifierOnlyShortcutRef.current = "";
+      recordedKeysRef.current.clear();
     } catch (error) {
+      await releaseCapture();
       console.error("Failed to start recording:", error);
       toast.error(
         t("settings.general.shortcut.errors.set", { error: String(error) }),
@@ -323,27 +489,60 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
       disabled={disabled}
       layout="horizontal"
     >
-      <div className="flex items-center space-x-1">
-        {isRecording ? (
-          <div
-            ref={shortcutRef}
-            className="px-2 py-1 text-sm font-semibold border border-logo-primary bg-logo-primary/30 rounded-md"
+      <div
+        ref={captureRef}
+        className="flex items-center space-x-1"
+        onBlur={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node | null))
+            void cancelRecording(false);
+        }}
+      >
+        <button
+          type="button"
+          ref={shortcutRef}
+          aria-label={t("settings.general.shortcut.change", {
+            name: translatedName,
+          })}
+          aria-pressed={isRecording}
+          aria-describedby={`shortcut-${shortcutId}-value`}
+          className="px-2 py-1 text-sm font-semibold bg-mid-gray/10 border border-mid-gray/80 rounded-md cursor-pointer hover:border-logo-primary focus-visible:ring-2 focus-visible:ring-logo-primary"
+          disabled={disabled}
+          aria-disabled={isUpdating(`binding_${shortcutId}`)}
+          onClick={startRecording}
+        >
+          <span
+            id={`shortcut-${shortcutId}-value`}
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
           >
-            {formatCurrentKeys()}
-          </div>
-        ) : (
-          <div
-            className="px-2 py-1 text-sm font-semibold bg-mid-gray/10 border border-mid-gray/80 hover:bg-logo-primary/10 rounded-md cursor-pointer hover:border-logo-primary"
-            onClick={startRecording}
+            {isRecording
+              ? formatCurrentKeys()
+              : formatKeyCombination(binding.current_binding, osType)}
+          </span>
+        </button>
+        {isRecording && (
+          <button
+            type="button"
+            className="rounded px-2 py-1 focus-visible:ring-2 focus-visible:ring-logo-primary"
+            onClick={() => cancelRecording()}
           >
-            {formatKeyCombination(binding.current_binding, osType)}
-          </div>
+            {t("settings.postProcessing.prompts.cancel")}
+          </button>
         )}
         <ResetButton
           onClick={() => resetBinding(shortcutId)}
-          disabled={isUpdating(`binding_${shortcutId}`)}
+          disabled={disabled || isUpdating(`binding_${shortcutId}`)}
+          ariaLabel={t("settings.general.shortcut.reset", {
+            name: translatedName,
+          })}
         />
       </div>
+      {shortcutError && (
+        <p role="alert" className="text-sm text-red-500">
+          {shortcutError}
+        </p>
+      )}
     </SettingContainer>
   );
 };

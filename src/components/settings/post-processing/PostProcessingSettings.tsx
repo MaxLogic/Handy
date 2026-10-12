@@ -21,6 +21,7 @@ import { ModelSelect } from "../PostProcessingSettingsApi/ModelSelect";
 import { usePostProcessProviderState } from "../PostProcessingSettingsApi/usePostProcessProviderState";
 import { ShortcutInput } from "../ShortcutInput";
 import { useSettings } from "../../../hooks/useSettings";
+import { AssistantSettings, LlmRequestSettings } from "./AssistantSettings";
 
 const PostProcessingSettingsApiComponent: React.FC = () => {
   const { t } = useTranslation();
@@ -28,6 +29,11 @@ const PostProcessingSettingsApiComponent: React.FC = () => {
 
   return (
     <>
+      {state.error && (
+        <p role="alert" className="px-4 text-sm text-red-500">
+          {state.error}
+        </p>
+      )}
       <SettingContainer
         title={t("settings.postProcessing.api.provider.title")}
         description={t("settings.postProcessing.api.provider.description")}
@@ -37,6 +43,7 @@ const PostProcessingSettingsApiComponent: React.FC = () => {
       >
         <div className="flex items-center gap-2">
           <ProviderSelect
+            ariaLabel={t("settings.postProcessing.api.provider.title")}
             options={state.providerOptions}
             value={state.selectedProviderId}
             onChange={state.handleProviderSelect}
@@ -62,12 +69,16 @@ const PostProcessingSettingsApiComponent: React.FC = () => {
             >
               <div className="flex items-center gap-2">
                 <BaseUrlField
+                  ariaLabel={t("settings.postProcessing.api.baseUrl.title")}
                   value={state.baseUrl}
                   onBlur={state.handleBaseUrlChange}
                   placeholder={t(
                     "settings.postProcessing.api.baseUrl.placeholder",
                   )}
                   disabled={state.isBaseUrlUpdating}
+                  disabledReason={t(
+                    "settings.postProcessing.api.baseUrl.saving",
+                  )}
                   className="min-w-[380px]"
                 />
               </div>
@@ -83,6 +94,7 @@ const PostProcessingSettingsApiComponent: React.FC = () => {
           >
             <div className="flex items-center gap-2">
               <ApiKeyField
+                ariaLabel={t("settings.postProcessing.api.apiKey.title")}
                 value={state.apiKey}
                 onBlur={state.handleApiKeyChange}
                 placeholder={t(
@@ -110,6 +122,7 @@ const PostProcessingSettingsApiComponent: React.FC = () => {
         >
           <div className="flex items-center gap-2">
             <ModelSelect
+              ariaLabel={t("settings.postProcessing.api.model.title")}
               value={state.model}
               options={state.modelOptions}
               disabled={state.isModelUpdating}
@@ -150,6 +163,7 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
   const [isCreating, setIsCreating] = useState(false);
   const [draftName, setDraftName] = useState("");
   const [draftText, setDraftText] = useState("");
+  const [promptError, setPromptError] = useState("");
 
   const prompts = getSetting("post_process_prompts") || [];
   const selectedPromptId = getSetting("post_process_selected_prompt_id") || "";
@@ -183,10 +197,12 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
     if (!draftName.trim() || !draftText.trim()) return;
 
     try {
+      setPromptError("");
       const result = await commands.addPostProcessPrompt(
         draftName.trim(),
         draftText.trim(),
       );
+      if (result.status === "error") throw new Error(result.error);
       if (result.status === "ok") {
         await refreshSettings();
         updateSetting("post_process_selected_prompt_id", result.data.id);
@@ -194,6 +210,7 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
       }
     } catch (error) {
       console.error("Failed to create prompt:", error);
+      setPromptError(t("settings.postProcessing.assistant.saveError"));
     }
   };
 
@@ -201,14 +218,17 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
     if (!selectedPromptId || !draftName.trim() || !draftText.trim()) return;
 
     try {
-      await commands.updatePostProcessPrompt(
+      setPromptError("");
+      const result = await commands.updatePostProcessPrompt(
         selectedPromptId,
         draftName.trim(),
         draftText.trim(),
       );
+      if (result.status === "error") throw new Error(result.error);
       await refreshSettings();
     } catch (error) {
       console.error("Failed to update prompt:", error);
+      setPromptError(t("settings.postProcessing.assistant.saveError"));
     }
   };
 
@@ -216,11 +236,14 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
     if (!promptId) return;
 
     try {
-      await commands.deletePostProcessPrompt(promptId);
+      setPromptError("");
+      const result = await commands.deletePostProcessPrompt(promptId);
+      if (result.status === "error") throw new Error(result.error);
       await refreshSettings();
       setIsCreating(false);
     } catch (error) {
       console.error("Failed to delete prompt:", error);
+      setPromptError(t("settings.postProcessing.assistant.saveError"));
     }
   };
 
@@ -258,8 +281,16 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
       grouped={true}
     >
       <div className="space-y-3">
+        {promptError && (
+          <p role="alert" className="text-sm text-red-500">
+            {promptError}
+          </p>
+        )}
         <div className="flex gap-2 min-w-0">
           <Dropdown
+            ariaLabel={t(
+              "settings.postProcessing.prompts.selectedPrompt.title",
+            )}
             selectedValue={selectedPromptId || null}
             options={prompts.map((p) => ({
               value: p.id,
@@ -290,10 +321,14 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
         {!isCreating && hasPrompts && selectedPrompt && (
           <div className="space-y-3">
             <div className="space-y-2 flex flex-col">
-              <label className="text-sm font-semibold">
+              <label
+                htmlFor="cleanup-prompt-name"
+                className="text-sm font-semibold"
+              >
                 {t("settings.postProcessing.prompts.promptLabel")}
               </label>
               <Input
+                id="cleanup-prompt-name"
                 type="text"
                 value={draftName}
                 onChange={(e) => setDraftName(e.target.value)}
@@ -305,10 +340,14 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
             </div>
 
             <div className="space-y-2 flex flex-col">
-              <label className="text-sm font-semibold">
+              <label
+                htmlFor="cleanup-prompt-text"
+                className="text-sm font-semibold"
+              >
                 {t("settings.postProcessing.prompts.promptInstructions")}
               </label>
               <Textarea
+                id="cleanup-prompt-text"
                 value={draftText}
                 onChange={(e) => setDraftText(e.target.value)}
                 placeholder={t(
@@ -357,10 +396,14 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
         {isCreating && (
           <div className="space-y-3">
             <div className="space-y-2 block flex flex-col">
-              <label className="text-sm font-semibold text-text">
+              <label
+                htmlFor="cleanup-prompt-name"
+                className="text-sm font-semibold text-text"
+              >
                 {t("settings.postProcessing.prompts.promptLabel")}
               </label>
               <Input
+                id="cleanup-prompt-name"
                 type="text"
                 value={draftName}
                 onChange={(e) => setDraftName(e.target.value)}
@@ -372,10 +415,14 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
             </div>
 
             <div className="space-y-2 flex flex-col">
-              <label className="text-sm font-semibold">
+              <label
+                htmlFor="cleanup-prompt-text"
+                className="text-sm font-semibold"
+              >
                 {t("settings.postProcessing.prompts.promptInstructions")}
               </label>
               <Textarea
+                id="cleanup-prompt-text"
                 value={draftText}
                 onChange={(e) => setDraftText(e.target.value)}
                 placeholder={t(
@@ -444,6 +491,8 @@ export const PostProcessingSettings: React.FC = () => {
       <SettingsGroup title={t("settings.postProcessing.prompts.title")}>
         <PostProcessingSettingsPrompts />
       </SettingsGroup>
+      <AssistantSettings />
+      <LlmRequestSettings />
     </div>
   );
 };

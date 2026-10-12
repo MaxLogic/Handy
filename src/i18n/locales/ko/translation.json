@@ -179,13 +179,20 @@
           "transcribe_with_post_process": {
             "name": "후처리 단축키",
             "description": "선택 사항: 항상 AI 후처리를 적용하는 전용 단축키입니다."
+          },
+          "assistant": {
+            "name": "Selected-text assistant",
+            "description": "Apply a spoken instruction to the original selected text, or generate text at a verified empty cursor."
           }
         },
         "errors": {
           "restore": "원래 단축키 복원에 실패했습니다",
           "set": "단축키 설정 실패: {{error}}",
-          "reset": "단축키를 원래 값으로 재설정하는데 실패했습니다"
-        }
+          "reset": "단축키를 원래 값으로 재설정하는데 실패했습니다",
+          "navigationKey": "Enter, Escape and Tab cannot be used alone as a shortcut. Choose another key or a key combination."
+        },
+        "change": "Change {{name}} shortcut",
+        "reset": "Reset {{name}} shortcut"
       },
       "language": {
         "title": "언어",
@@ -425,7 +432,9 @@
         "baseUrl": {
           "title": "기본 URL",
           "description": "선택한 제공자의 API 기본 URL입니다. 사용자 정의 제공자만 편집할 수 있습니다.",
-          "placeholder": "https://api.openai.com/v1"
+          "placeholder": "https://api.openai.com/v1",
+          "disabledReason": "Base URL is managed by the selected provider.",
+          "saving": "Saving the base URL. Wait for the save to finish before editing it again."
         },
         "apiKey": {
           "title": "API 키",
@@ -438,7 +447,9 @@
           "descriptionDefault": "선택한 제공자가 제공하는 모델을 선택하세요.",
           "placeholderWithOptions": "모델 검색 또는 선택",
           "placeholderNoOptions": "모델 이름 입력",
-          "refreshModels": "모델 새로고침"
+          "refreshModels": "모델 새로고침",
+          "useModel": "Use \"{{model}}\"",
+          "fetchError": "Could not fetch models. Check the provider and connection settings, then try again."
         }
       },
       "prompts": {
@@ -461,6 +472,34 @@
         "cancel": "취소",
         "selectToEdit": "세부 정보를 보고 편집하려면 위에서 프롬프트를 선택하세요.",
         "createFirst": "첫 번째 후처리 프롬프트를 만들려면 위의 '새 프롬프트 만들기'를 클릭하세요."
+      },
+      "assistant": {
+        "title": "Selected-text assistant",
+        "description": "Uses the provider, model and request options above. Cleanup can be disabled without disabling the assistant.",
+        "prompt": "Assistant prompt",
+        "noPrompt": "No assistant prompt selected",
+        "editPrompt": "Edit assistant prompt",
+        "promptRequired": "Enter a prompt name and instructions.",
+        "saveError": "Could not save these settings. Check your settings and try again.",
+        "save": "Save assistant prompt",
+        "sharedPrompt": "Prompts are shared with cleanup. Editing this prompt also changes cleanup if it uses the same prompt."
+      },
+      "requestOptions": {
+        "title": "LLM request options",
+        "description": "Shared by cleanup and the assistant. Changes apply to the next recording.",
+        "temperature": "Temperature (optional)",
+        "max_output_tokens": "Maximum output tokens (optional)",
+        "timeout_secs": "Overall timeout (seconds)",
+        "connect_timeout_secs": "Connection timeout (seconds)",
+        "help": "Leave temperature or maximum output tokens blank to use the server default. Temperature: 0 to 2. Output tokens: 1 to 131072. Overall timeout: 1 to 300 seconds. Connection timeout: 1 to 30 seconds, no longer than the overall timeout.",
+        "invalid": "Check the highlighted request option fields.",
+        "save": "Save request options",
+        "invalidTemperature": "Temperature must be a number from 0 to 2, or blank for the server default.",
+        "invalidMaxOutputTokens": "Maximum output tokens must be a whole number from 1 to 131072, or blank for the server default.",
+        "invalidTimeout": "Overall timeout must be a whole number from 1 to 300 seconds.",
+        "invalidConnectTimeout": "Connection timeout must be a whole number from 1 to 30 seconds.",
+        "connectExceedsOverall": "Connection timeout must not exceed the overall timeout.",
+        "saved": "Saved"
       }
     },
     "history": {
@@ -477,7 +516,20 @@
       "retranscribe": "다시 전사",
       "retranscribeError": "다시 전사에 실패했습니다. 다시 시도해주세요.",
       "transcribing": "전사 중...",
-      "transcriptionFailed": "전사에 실패했습니다. 재시도 아이콘을 사용하여 다시 전사할 수 있습니다."
+      "transcriptionFailed": "전사에 실패했습니다. 재시도 아이콘을 사용하여 다시 전사할 수 있습니다.",
+      "assistant": {
+        "title": "Assistant results awaiting recovery",
+        "description": "Results are kept until dismissed or Handy exits. Copy does not insert into another app or dismiss the result.",
+        "generated": "Generated text",
+        "instruction": "Spoken instruction",
+        "copyGenerated": "Copy generated text",
+        "copyInstruction": "Copy instruction",
+        "actionError": "Could not complete this recovery action. Try again.",
+        "uncertain": "Delivery could not be confirmed. Check the target before copying or inserting again.",
+        "refused": "Automatic insertion failed or was refused. The generated text is available here.",
+        "generatedCopied": "Generated text copied.",
+        "instructionCopied": "Instruction copied."
+      }
     },
     "debug": {
       "title": "디버그",
@@ -669,7 +721,8 @@
     "open": "열기",
     "copy": "복사",
     "clear": "지우기",
-    "noOptionsFound": "옵션을 찾을 수 없습니다"
+    "noOptionsFound": "옵션을 찾을 수 없습니다",
+    "dismiss": "Dismiss"
   },
   "accessibility": {
     "permissionsDescription": "Handy는 녹음된 텍스트를 입력하기 위해 접근성 권한이 필요합니다.",
@@ -691,7 +744,22 @@
     "modelLoadFailedUnknown": "알 수 없는 모델",
     "pasteFailedTitle": "텍스트 붙여넣기 실패",
     "pasteFailed": "활성 애플리케이션에 텍스트를 붙여넣을 수 없습니다.",
-    "transcriptionFailedTitle": "음성 인식 실패"
+    "transcriptionFailedTitle": "음성 인식 실패",
+    "cleanupFallback": "Cleanup failed. Raw text was used. You can find the raw transcription in History.",
+    "assistantTextTooLong": "Text too long for this model. The original selection was left untouched. Use a shorter selection or a model with a larger context.",
+    "assistantFailed": "Assistant failed. No replacement was inserted. Check the model and connection settings, then try again.",
+    "assistantConfiguration": "Assistant is not configured. Check its prompt, provider, model and request options.",
+    "assistantRecovery": "Assistant delivery failed or could not be confirmed. Open History to recover the generated text.",
+    "assistantRecoveryFull": "Assistant recovery is full. Dismiss assistant recovery items in History before starting again.",
+    "assistantSelectionTooLarge": "The selection is too large. Select less text and try again.",
+    "assistantPasswordField": "Password fields cannot be used with the assistant. Choose another editable field.",
+    "assistantReadOnly": "This field is read-only. Choose an editable field and try again.",
+    "assistantBusy": "An operation is already running. Wait for it to finish or cancel it before starting again.",
+    "cleanupFallbackHistory": "Cleanup failed. Raw text is available in History.",
+    "cleanupFallbackNoHistory": "Cleanup failed. Raw text was used. This transcription could not be saved to History.",
+    "cleanupPasteFailedHistory": "Cleanup and paste failed. Raw text is available in History.",
+    "cleanupPasteFailedNoHistory": "Cleanup and paste failed. This transcription could not be saved to History. Dictate it again.",
+    "cleanupFallbackNotDelivered": "Cleanup failed. No text was delivered, and this transcription could not be saved to History."
   },
   "appLanguage": {
     "title": "애플리케이션 언어",

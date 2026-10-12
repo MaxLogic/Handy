@@ -325,6 +325,8 @@ pub fn change_binding(
 
     let mut settings = settings::get_settings(&app);
 
+    validate_binding_input(&id, &binding, settings.keyboard_implementation)?;
+
     if let Some(other) = binding_conflict(
         &effective_bindings(&settings),
         &id,
@@ -633,6 +635,22 @@ pub fn get_keyboard_implementation(app: AppHandle) -> String {
 // Validation Helpers
 // ============================================================================
 
+/// Navigation keys are unsafe user shortcuts. Escape remains valid for the
+/// separately managed built-in cancel action.
+fn validate_binding_input(
+    id: &str,
+    raw: &str,
+    implementation: KeyboardImplementation,
+) -> Result<(), String> {
+    let key = raw.trim().to_ascii_lowercase();
+    if matches!(key.as_str(), "enter" | "return" | "escape" | "esc" | "tab")
+        && !(id == "cancel" && matches!(key.as_str(), "escape" | "esc"))
+    {
+        return Err("Enter, Escape and Tab cannot be used alone as a shortcut".into());
+    }
+    validate_shortcut_for_implementation(raw, implementation)
+}
+
 /// Validate a shortcut for a specific implementation
 fn validate_shortcut_for_implementation(
     raw: &str,
@@ -724,6 +742,8 @@ fn bindings_for_implementation(
             continue;
         }
         let mut binding = settings.bindings.get(&id).unwrap_or(&defaults[&id]).clone();
+        // Stored legacy navigation bindings remain valid; only change_binding
+        // enforces the new-input navigation restriction. Backend syntax still applies.
         if let Err(e) =
             validate_shortcut_for_implementation(&binding.current_binding, implementation)
         {
@@ -1678,6 +1698,32 @@ pub async fn get_available_accelerators(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn navigation_keys_are_rejected_for_user_bindings_but_cancel_escape_and_fkeys_work() {
+        for implementation in [
+            super::KeyboardImplementation::Tauri,
+            super::KeyboardImplementation::HandyKeys,
+        ] {
+            for key in ["enter", "return", "escape", "esc", "tab", " ENTER "] {
+                let error =
+                    super::validate_binding_input("assistant", key, implementation).unwrap_err();
+                assert!(
+                    error.contains("cannot be used alone"),
+                    "{implementation:?}: {key}: {error}"
+                );
+            }
+            for key in ["esc", "escape"] {
+                assert!(super::validate_binding_input("cancel", key, implementation).is_ok());
+            }
+            for key in ["f10", "ctrl+enter", "ctrl+alt+space"] {
+                assert!(
+                    super::validate_binding_input("assistant", key, implementation).is_ok(),
+                    "{implementation:?}: {key}"
+                );
+            }
+            assert!(super::validate_binding_input("cancel", "enter", implementation).is_err());
+        }
+    }
     #[cfg(target_os = "windows")]
     #[test]
     fn failed_change_does_not_restore_startup_skipped_assistant() {
@@ -1909,6 +1955,41 @@ mod tests {
         )
         .unwrap();
         assert!(called);
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn implementation_switch_preserves_stored_legacy_navigation_bindings() {
+        for implementation in [
+            KeyboardImplementation::Tauri,
+            KeyboardImplementation::HandyKeys,
+        ] {
+            for key in ["enter", "escape", "tab"] {
+                let mut settings = settings::get_default_settings();
+                settings
+                    .bindings
+                    .get_mut("transcribe")
+                    .unwrap()
+                    .current_binding = key.into();
+                let (bindings, reset) = bindings_for_implementation(&mut settings, implementation);
+                assert!(
+                    reset.is_empty(),
+                    "stored {key} was reset for {implementation:?}"
+                );
+                assert_eq!(settings.bindings["transcribe"].current_binding, key);
+                assert_eq!(
+                    bindings
+                        .iter()
+                        .find(|b| b.id == "transcribe")
+                        .unwrap()
+                        .current_binding,
+                    key
+                );
+                assert!(
+                    super::validate_binding_input("transcribe", key, implementation).is_err(),
+                    "new input must still reject {key}"
+                );
+            }
+        }
     }
     #[cfg(target_os = "windows")]
     #[test]

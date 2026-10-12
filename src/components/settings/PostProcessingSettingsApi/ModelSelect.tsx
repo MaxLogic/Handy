@@ -1,8 +1,10 @@
 import React from "react";
 import type { ModelOption } from "./types";
 import { Select } from "../../ui/Select";
+import { useTranslation } from "react-i18next";
 
 type ModelSelectProps = {
+  ariaLabel?: string;
   value: string;
   options: ModelOption[];
   disabled?: boolean;
@@ -17,6 +19,7 @@ type ModelSelectProps = {
 export const ModelSelect: React.FC<ModelSelectProps> = React.memo(
   ({
     value,
+    ariaLabel,
     options,
     disabled,
     placeholder,
@@ -26,6 +29,7 @@ export const ModelSelect: React.FC<ModelSelectProps> = React.memo(
     onBlur,
     className = "flex-1 min-w-[360px]",
   }) => {
+    const { t } = useTranslation();
     const handleCreate = (inputValue: string) => {
       const trimmed = inputValue.trim();
       if (!trimmed) return;
@@ -36,6 +40,7 @@ export const ModelSelect: React.FC<ModelSelectProps> = React.memo(
 
     return (
       <Select
+        ariaLabel={ariaLabel}
         className={computedClassName}
         value={value || null}
         options={options}
@@ -46,7 +51,9 @@ export const ModelSelect: React.FC<ModelSelectProps> = React.memo(
         disabled={disabled}
         isLoading={isLoading}
         isCreatable
-        formatCreateLabel={(input) => `Use "${input}"`}
+        formatCreateLabel={(input) =>
+          t("settings.postProcessing.api.model.useModel", { model: input })
+        }
       />
     );
   },

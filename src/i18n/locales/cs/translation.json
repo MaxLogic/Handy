@@ -199,13 +199,20 @@
           "transcribe_with_post_process": {
             "name": "Klávesa pro následné zpracování",
             "description": "Volitelné: Vyhrazená klávesová zkratka, která vždy použije AI následné zpracování na váš přepis."
+          },
+          "assistant": {
+            "name": "Selected-text assistant",
+            "description": "Apply a spoken instruction to the original selected text, or generate text at a verified empty cursor."
           }
         },
         "errors": {
           "restore": "Nepodařilo se obnovit původní zkratku",
           "set": "Nepodařilo se nastavit zkratku: {{error}}",
-          "reset": "Nepodařilo se vrátit zkratku na původní hodnotu"
-        }
+          "reset": "Nepodařilo se vrátit zkratku na původní hodnotu",
+          "navigationKey": "Enter, Escape and Tab cannot be used alone as a shortcut. Choose another key or a key combination."
+        },
+        "change": "Change {{name}} shortcut",
+        "reset": "Reset {{name}} shortcut"
       },
       "language": {
         "title": "Jazyk",
@@ -425,7 +432,9 @@
         "baseUrl": {
           "title": "Základní URL",
           "description": "Základní URL API pro vybraného poskytovatele. Upravitelné je pouze u vlastního poskytovatele.",
-          "placeholder": "https://api.openai.com/v1"
+          "placeholder": "https://api.openai.com/v1",
+          "disabledReason": "Base URL is managed by the selected provider.",
+          "saving": "Saving the base URL. Wait for the save to finish before editing it again."
         },
         "apiKey": {
           "title": "API klíč",
@@ -438,7 +447,9 @@
           "descriptionDefault": "Vyberte model dostupný u vybraného poskytovatele.",
           "placeholderWithOptions": "Vyhledejte nebo vyberte model",
           "placeholderNoOptions": "Zadejte název modelu",
-          "refreshModels": "Obnovit modely"
+          "refreshModels": "Obnovit modely",
+          "useModel": "Use \"{{model}}\"",
+          "fetchError": "Could not fetch models. Check the provider and connection settings, then try again."
         }
       },
       "prompts": {
@@ -461,6 +472,34 @@
         "cancel": "Zrušit",
         "selectToEdit": "Vyberte výše prompt, abyste zobrazili a upravili jeho podrobnosti.",
         "createFirst": "Klikněte nahoře na 'Vytvořit nový prompt' a vytvořte svůj první prompt pro následné zpracování."
+      },
+      "assistant": {
+        "title": "Selected-text assistant",
+        "description": "Uses the provider, model and request options above. Cleanup can be disabled without disabling the assistant.",
+        "prompt": "Assistant prompt",
+        "noPrompt": "No assistant prompt selected",
+        "editPrompt": "Edit assistant prompt",
+        "promptRequired": "Enter a prompt name and instructions.",
+        "saveError": "Could not save these settings. Check your settings and try again.",
+        "save": "Save assistant prompt",
+        "sharedPrompt": "Prompts are shared with cleanup. Editing this prompt also changes cleanup if it uses the same prompt."
+      },
+      "requestOptions": {
+        "title": "LLM request options",
+        "description": "Shared by cleanup and the assistant. Changes apply to the next recording.",
+        "temperature": "Temperature (optional)",
+        "max_output_tokens": "Maximum output tokens (optional)",
+        "timeout_secs": "Overall timeout (seconds)",
+        "connect_timeout_secs": "Connection timeout (seconds)",
+        "help": "Leave temperature or maximum output tokens blank to use the server default. Temperature: 0 to 2. Output tokens: 1 to 131072. Overall timeout: 1 to 300 seconds. Connection timeout: 1 to 30 seconds, no longer than the overall timeout.",
+        "invalid": "Check the highlighted request option fields.",
+        "save": "Save request options",
+        "invalidTemperature": "Temperature must be a number from 0 to 2, or blank for the server default.",
+        "invalidMaxOutputTokens": "Maximum output tokens must be a whole number from 1 to 131072, or blank for the server default.",
+        "invalidTimeout": "Overall timeout must be a whole number from 1 to 300 seconds.",
+        "invalidConnectTimeout": "Connection timeout must be a whole number from 1 to 30 seconds.",
+        "connectExceedsOverall": "Connection timeout must not exceed the overall timeout.",
+        "saved": "Saved"
       }
     },
     "history": {
@@ -477,7 +516,20 @@
       "retranscribe": "Přepsat znovu",
       "retranscribeError": "Opětovný přepis se nezdařil. Zkuste to prosím znovu.",
       "transcribing": "Přepisuji...",
-      "transcriptionFailed": "Přepis selhal. Můžete zkusit přepis znovu pomocí ikony opakování."
+      "transcriptionFailed": "Přepis selhal. Můžete zkusit přepis znovu pomocí ikony opakování.",
+      "assistant": {
+        "title": "Assistant results awaiting recovery",
+        "description": "Results are kept until dismissed or Handy exits. Copy does not insert into another app or dismiss the result.",
+        "generated": "Generated text",
+        "instruction": "Spoken instruction",
+        "copyGenerated": "Copy generated text",
+        "copyInstruction": "Copy instruction",
+        "actionError": "Could not complete this recovery action. Try again.",
+        "uncertain": "Delivery could not be confirmed. Check the target before copying or inserting again.",
+        "refused": "Automatic insertion failed or was refused. The generated text is available here.",
+        "generatedCopied": "Generated text copied.",
+        "instructionCopied": "Instruction copied."
+      }
     },
     "debug": {
       "title": "Ladění",
@@ -669,7 +721,8 @@
     "open": "Otevřít",
     "copy": "Kopírovat",
     "clear": "Vymazat",
-    "noOptionsFound": "Nenalezeny žádné možnosti"
+    "noOptionsFound": "Nenalezeny žádné možnosti",
+    "dismiss": "Dismiss"
   },
   "accessibility": {
     "permissionsDescription": "Handy potřebuje oprávnění usnadnění přístupu, aby mohlo psát přepsaný text.",
@@ -691,7 +744,22 @@
     "modelLoadFailedUnknown": "neznámý model",
     "pasteFailedTitle": "Vložení textu se nezdařilo",
     "pasteFailed": "Text nebylo možné vložit do aktivní aplikace.",
-    "transcriptionFailedTitle": "Přepis selhal"
+    "transcriptionFailedTitle": "Přepis selhal",
+    "cleanupFallback": "Cleanup failed. Raw text was used. You can find the raw transcription in History.",
+    "assistantTextTooLong": "Text too long for this model. The original selection was left untouched. Use a shorter selection or a model with a larger context.",
+    "assistantFailed": "Assistant failed. No replacement was inserted. Check the model and connection settings, then try again.",
+    "assistantConfiguration": "Assistant is not configured. Check its prompt, provider, model and request options.",
+    "assistantRecovery": "Assistant delivery failed or could not be confirmed. Open History to recover the generated text.",
+    "assistantRecoveryFull": "Assistant recovery is full. Dismiss assistant recovery items in History before starting again.",
+    "assistantSelectionTooLarge": "The selection is too large. Select less text and try again.",
+    "assistantPasswordField": "Password fields cannot be used with the assistant. Choose another editable field.",
+    "assistantReadOnly": "This field is read-only. Choose an editable field and try again.",
+    "assistantBusy": "An operation is already running. Wait for it to finish or cancel it before starting again.",
+    "cleanupFallbackHistory": "Cleanup failed. Raw text is available in History.",
+    "cleanupFallbackNoHistory": "Cleanup failed. Raw text was used. This transcription could not be saved to History.",
+    "cleanupPasteFailedHistory": "Cleanup and paste failed. Raw text is available in History.",
+    "cleanupPasteFailedNoHistory": "Cleanup and paste failed. This transcription could not be saved to History. Dictate it again.",
+    "cleanupFallbackNotDelivered": "Cleanup failed. No text was delivered, and this transcription could not be saved to History."
   },
   "appLanguage": {
     "title": "Jazyk aplikace",

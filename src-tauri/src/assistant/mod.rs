@@ -243,6 +243,7 @@ impl AssistantError {
         }
     }
     pub(crate) fn emit(self, app: &AppHandle) {
+        crate::audio_feedback::play_failure_feedback(app);
         log::warn!(
             "[assistant] stage={:?} code={} reason={}",
             self.stage,
@@ -430,6 +431,7 @@ pub(crate) async fn finish(
             outcome
         }
         SessionOutcome::Recoverable(item) => {
+            crate::audio_feedback::play_failure_feedback(app);
             let outcome = match item.outcome {
                 RecoveryOutcome::Refused => Outcome::CommitRefused,
                 RecoveryOutcome::Failed => Outcome::CommitFailed,

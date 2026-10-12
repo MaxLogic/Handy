@@ -199,13 +199,20 @@
           "transcribe_with_post_process": {
             "name": "后处理快捷键",
             "description": "可选：一个专用快捷键，始终对您的转录应用 AI 后处理。"
+          },
+          "assistant": {
+            "name": "Selected-text assistant",
+            "description": "Apply a spoken instruction to the original selected text, or generate text at a verified empty cursor."
           }
         },
         "errors": {
           "restore": "无法恢复原始快捷键",
           "set": "无法设置快捷键: {{error}}",
-          "reset": "无法将快捷键重置为原始值"
-        }
+          "reset": "无法将快捷键重置为原始值",
+          "navigationKey": "Enter, Escape and Tab cannot be used alone as a shortcut. Choose another key or a key combination."
+        },
+        "change": "Change {{name}} shortcut",
+        "reset": "Reset {{name}} shortcut"
       },
       "language": {
         "title": "语言",
@@ -425,7 +432,9 @@
         "baseUrl": {
           "title": "基础 URL",
           "description": "所选提供商的 API 基础 URL。仅自定义提供商可编辑。",
-          "placeholder": "https://api.openai.com/v1"
+          "placeholder": "https://api.openai.com/v1",
+          "disabledReason": "Base URL is managed by the selected provider.",
+          "saving": "Saving the base URL. Wait for the save to finish before editing it again."
         },
         "apiKey": {
           "title": "API 密钥",
@@ -438,7 +447,9 @@
           "descriptionDefault": "选择所选提供商提供的模型。",
           "placeholderWithOptions": "搜索或选择模型",
           "placeholderNoOptions": "输入模型名称",
-          "refreshModels": "刷新模型"
+          "refreshModels": "刷新模型",
+          "useModel": "Use \"{{model}}\"",
+          "fetchError": "Could not fetch models. Check the provider and connection settings, then try again."
         }
       },
       "prompts": {
@@ -461,6 +472,34 @@
         "cancel": "取消",
         "selectToEdit": "选择上方的提示词以查看和编辑其详细信息。",
         "createFirst": "点击上方的「创建新提示词」来创建您的第一个后处理提示词。"
+      },
+      "assistant": {
+        "title": "Selected-text assistant",
+        "description": "Uses the provider, model and request options above. Cleanup can be disabled without disabling the assistant.",
+        "prompt": "Assistant prompt",
+        "noPrompt": "No assistant prompt selected",
+        "editPrompt": "Edit assistant prompt",
+        "promptRequired": "Enter a prompt name and instructions.",
+        "saveError": "Could not save these settings. Check your settings and try again.",
+        "save": "Save assistant prompt",
+        "sharedPrompt": "Prompts are shared with cleanup. Editing this prompt also changes cleanup if it uses the same prompt."
+      },
+      "requestOptions": {
+        "title": "LLM request options",
+        "description": "Shared by cleanup and the assistant. Changes apply to the next recording.",
+        "temperature": "Temperature (optional)",
+        "max_output_tokens": "Maximum output tokens (optional)",
+        "timeout_secs": "Overall timeout (seconds)",
+        "connect_timeout_secs": "Connection timeout (seconds)",
+        "help": "Leave temperature or maximum output tokens blank to use the server default. Temperature: 0 to 2. Output tokens: 1 to 131072. Overall timeout: 1 to 300 seconds. Connection timeout: 1 to 30 seconds, no longer than the overall timeout.",
+        "invalid": "Check the highlighted request option fields.",
+        "save": "Save request options",
+        "invalidTemperature": "Temperature must be a number from 0 to 2, or blank for the server default.",
+        "invalidMaxOutputTokens": "Maximum output tokens must be a whole number from 1 to 131072, or blank for the server default.",
+        "invalidTimeout": "Overall timeout must be a whole number from 1 to 300 seconds.",
+        "invalidConnectTimeout": "Connection timeout must be a whole number from 1 to 30 seconds.",
+        "connectExceedsOverall": "Connection timeout must not exceed the overall timeout.",
+        "saved": "Saved"
       }
     },
     "history": {
@@ -477,7 +516,20 @@
       "retranscribe": "重新转录",
       "retranscribeError": "重新转录失败。请重试。",
       "transcribing": "转录中...",
-      "transcriptionFailed": "转录失败。您可以使用重试图标重新转录。"
+      "transcriptionFailed": "转录失败。您可以使用重试图标重新转录。",
+      "assistant": {
+        "title": "Assistant results awaiting recovery",
+        "description": "Results are kept until dismissed or Handy exits. Copy does not insert into another app or dismiss the result.",
+        "generated": "Generated text",
+        "instruction": "Spoken instruction",
+        "copyGenerated": "Copy generated text",
+        "copyInstruction": "Copy instruction",
+        "actionError": "Could not complete this recovery action. Try again.",
+        "uncertain": "Delivery could not be confirmed. Check the target before copying or inserting again.",
+        "refused": "Automatic insertion failed or was refused. The generated text is available here.",
+        "generatedCopied": "Generated text copied.",
+        "instructionCopied": "Instruction copied."
+      }
     },
     "debug": {
       "title": "调试",
@@ -669,7 +721,8 @@
     "open": "打开",
     "copy": "复制",
     "clear": "清除",
-    "noOptionsFound": "未找到选项"
+    "noOptionsFound": "未找到选项",
+    "dismiss": "Dismiss"
   },
   "accessibility": {
     "permissionsDescription": "Handy 需要辅助功能权限才能输入转录的文字。",
@@ -691,7 +744,22 @@
     "modelLoadFailedUnknown": "未知模型",
     "pasteFailedTitle": "粘贴文本失败",
     "pasteFailed": "无法将文本粘贴到当前活动的应用程序中。",
-    "transcriptionFailedTitle": "转录失败"
+    "transcriptionFailedTitle": "转录失败",
+    "cleanupFallback": "Cleanup failed. Raw text was used. You can find the raw transcription in History.",
+    "assistantTextTooLong": "Text too long for this model. The original selection was left untouched. Use a shorter selection or a model with a larger context.",
+    "assistantFailed": "Assistant failed. No replacement was inserted. Check the model and connection settings, then try again.",
+    "assistantConfiguration": "Assistant is not configured. Check its prompt, provider, model and request options.",
+    "assistantRecovery": "Assistant delivery failed or could not be confirmed. Open History to recover the generated text.",
+    "assistantRecoveryFull": "Assistant recovery is full. Dismiss assistant recovery items in History before starting again.",
+    "assistantSelectionTooLarge": "The selection is too large. Select less text and try again.",
+    "assistantPasswordField": "Password fields cannot be used with the assistant. Choose another editable field.",
+    "assistantReadOnly": "This field is read-only. Choose an editable field and try again.",
+    "assistantBusy": "An operation is already running. Wait for it to finish or cancel it before starting again.",
+    "cleanupFallbackHistory": "Cleanup failed. Raw text is available in History.",
+    "cleanupFallbackNoHistory": "Cleanup failed. Raw text was used. This transcription could not be saved to History.",
+    "cleanupPasteFailedHistory": "Cleanup and paste failed. Raw text is available in History.",
+    "cleanupPasteFailedNoHistory": "Cleanup and paste failed. This transcription could not be saved to History. Dictate it again.",
+    "cleanupFallbackNotDelivered": "Cleanup failed. No text was delivered, and this transcription could not be saved to History."
   },
   "appLanguage": {
     "title": "应用语言",

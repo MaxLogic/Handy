@@ -30,6 +30,7 @@ import { useSettings } from "./hooks/useSettings";
 import { useSettingsStore } from "./stores/settingsStore";
 import { commands } from "@/bindings";
 import { getLanguageDirection, initializeRTL } from "@/lib/utils/rtl";
+import { WorkflowNotice } from "./components/settings/WorkflowNotice";
 
 type OnboardingStep = "accessibility" | "model" | "done";
 
@@ -171,7 +172,12 @@ function App() {
   // (see actions.rs `error!("Failed to paste transcription: ...")`),
   // so we show a localized, user-friendly message here instead of the raw error.
   useEffect(() => {
-    const unlisten = listen("paste-error", () => {
+    const unlisten = listen<{
+      cleanup_failed: boolean;
+      raw_history_available: boolean;
+    }>("paste-error", ({ payload }) => {
+      // The retained workflow notice owns the combined cleanup/paste failure.
+      if (payload?.cleanup_failed || payload?.raw_history_available) return;
       toast.error(t("errors.pasteFailedTitle"), {
         description: t("errors.pasteFailed"),
       });
@@ -358,6 +364,14 @@ function App() {
         <ErrorBoundary context="What's New">
           <WhatsNewGate />
         </ErrorBoundary>
+        <WorkflowNotice
+          onHistory={() => setCurrentSection("history")}
+          onDismiss={() =>
+            document
+              .getElementById(`settings-section-${currentSection}`)
+              ?.focus()
+          }
+        />
         {/* Main content area that takes remaining space */}
         <div className="flex-1 flex overflow-hidden">
           <Sidebar

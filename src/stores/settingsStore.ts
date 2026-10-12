@@ -159,6 +159,15 @@ const settingUpdaters: {
     commands.changePostProcessEnabledSetting(value as boolean),
   post_process_selected_prompt_id: (value) =>
     commands.setPostProcessSelectedPrompt(value as string),
+  assistant_selected_prompt_id: async (value) => {
+    const result = await commands.setAssistantSelectedPrompt(value ?? null);
+    if (result.status === "error") throw new Error(result.error);
+  },
+  post_process_request_options: async (value) => {
+    if (!value) throw new Error("Request options are required");
+    const result = await commands.changePostProcessRequestOptions(value);
+    if (result.status === "error") throw new Error(result.error);
+  },
   mute_while_recording: (value) =>
     commands.changeMuteWhileRecordingSetting(value as boolean),
   append_trailing_space: (value) =>
@@ -339,6 +348,12 @@ export const useSettingsStore = create<SettingsStore>()(
         if (settings) {
           set({ settings: { ...settings, [key]: originalValue } });
         }
+        if (
+          key === "assistant_selected_prompt_id" ||
+          key === "post_process_request_options"
+        ) {
+          throw error;
+        }
       } finally {
         setUpdating(updateKey, false);
       }
@@ -461,7 +476,8 @@ export const useSettingsStore = create<SettingsStore>()(
       setPostProcessModelOptions(providerId, []);
 
       try {
-        await commands.setPostProcessProvider(providerId);
+        const result = await commands.setPostProcessProvider(providerId);
+        if (result.status === "error") throw new Error(result.error);
         await refreshSettings();
       } catch (error) {
         console.error("Failed to set post-process provider:", error);
@@ -472,6 +488,7 @@ export const useSettingsStore = create<SettingsStore>()(
               : null,
           }));
         }
+        throw error;
       } finally {
         setUpdating(updateKey, false);
       }
@@ -490,11 +507,23 @@ export const useSettingsStore = create<SettingsStore>()(
 
       try {
         if (settingType === "base_url") {
-          await commands.changePostProcessBaseUrlSetting(providerId, value);
+          const result = await commands.changePostProcessBaseUrlSetting(
+            providerId,
+            value,
+          );
+          if (result.status === "error") throw new Error(result.error);
         } else if (settingType === "api_key") {
-          await commands.changePostProcessApiKeySetting(providerId, value);
+          const result = await commands.changePostProcessApiKeySetting(
+            providerId,
+            value,
+          );
+          if (result.status === "error") throw new Error(result.error);
         } else if (settingType === "model") {
-          await commands.changePostProcessModelSetting(providerId, value);
+          const result = await commands.changePostProcessModelSetting(
+            providerId,
+            value,
+          );
+          if (result.status === "error") throw new Error(result.error);
         }
         await refreshSettings();
       } catch (error) {
@@ -502,6 +531,7 @@ export const useSettingsStore = create<SettingsStore>()(
           `Failed to update post-process ${settingType.replace("_", " ")}:`,
           error,
         );
+        throw error;
       } finally {
         setUpdating(updateKey, false);
       }
@@ -520,8 +550,7 @@ export const useSettingsStore = create<SettingsStore>()(
           baseUrl,
         );
         if (urlResult.status === "error") {
-          console.error("Failed to persist base URL:", urlResult.error);
-          return;
+          throw new Error(urlResult.error);
         }
 
         // Reset the stored model since the previous value is almost certainly
@@ -532,8 +561,7 @@ export const useSettingsStore = create<SettingsStore>()(
           "",
         );
         if (modelResult.status === "error") {
-          console.error("Failed to reset model setting:", modelResult.error);
-          return;
+          throw new Error(modelResult.error);
         }
 
         // Clear cached model options only after both backend writes succeed.
@@ -548,6 +576,7 @@ export const useSettingsStore = create<SettingsStore>()(
         await refreshSettings();
       } catch (error) {
         console.error("Failed to update post-process base URL:", error);
+        throw error;
       } finally {
         setUpdating(updateKey, false);
       }
@@ -581,13 +610,12 @@ export const useSettingsStore = create<SettingsStore>()(
           setPostProcessModelOptions(providerId, result.data);
           return result.data;
         } else {
-          console.error("Failed to fetch models:", result.error);
-          return [];
+          throw new Error(result.error);
         }
       } catch (error) {
         console.error("Failed to fetch models:", error);
         // Don't cache empty array on error - let user retry
-        return [];
+        throw error;
       } finally {
         setUpdating(updateKey, false);
       }

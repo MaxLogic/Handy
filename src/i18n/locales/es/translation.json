@@ -199,13 +199,20 @@
           "transcribe_with_post_process": {
             "name": "Tecla de post procesamiento",
             "description": "Opcional: Una tecla de acceso rápido dedicada que siempre aplica post procesamiento con IA a tu transcripción."
+          },
+          "assistant": {
+            "name": "Selected-text assistant",
+            "description": "Apply a spoken instruction to the original selected text, or generate text at a verified empty cursor."
           }
         },
         "errors": {
           "restore": "Error al restaurar el atajo original",
           "set": "Error al configurar el atajo: {{error}}",
-          "reset": "Error al restablecer el atajo al valor original"
-        }
+          "reset": "Error al restablecer el atajo al valor original",
+          "navigationKey": "Enter, Escape and Tab cannot be used alone as a shortcut. Choose another key or a key combination."
+        },
+        "change": "Change {{name}} shortcut",
+        "reset": "Reset {{name}} shortcut"
       },
       "language": {
         "title": "Idioma",
@@ -425,7 +432,9 @@
         "baseUrl": {
           "title": "URL base",
           "description": "URL base de la API para el proveedor seleccionado. Solo se puede editar el proveedor personalizado.",
-          "placeholder": "https://api.openai.com/v1"
+          "placeholder": "https://api.openai.com/v1",
+          "disabledReason": "Base URL is managed by the selected provider.",
+          "saving": "Saving the base URL. Wait for the save to finish before editing it again."
         },
         "apiKey": {
           "title": "Clave API",
@@ -438,7 +447,9 @@
           "descriptionDefault": "Elige un modelo expuesto por el proveedor seleccionado.",
           "placeholderWithOptions": "Buscar o seleccionar un modelo",
           "placeholderNoOptions": "Escribe un nombre de modelo",
-          "refreshModels": "Actualizar modelos"
+          "refreshModels": "Actualizar modelos",
+          "useModel": "Use \"{{model}}\"",
+          "fetchError": "Could not fetch models. Check the provider and connection settings, then try again."
         }
       },
       "prompts": {
@@ -461,6 +472,34 @@
         "cancel": "Cancelar",
         "selectToEdit": "Selecciona un prompt arriba para ver y editar sus detalles.",
         "createFirst": "Haz clic en 'Crear nuevo prompt' arriba para crear tu primer prompt de post procesamiento."
+      },
+      "assistant": {
+        "title": "Selected-text assistant",
+        "description": "Uses the provider, model and request options above. Cleanup can be disabled without disabling the assistant.",
+        "prompt": "Assistant prompt",
+        "noPrompt": "No assistant prompt selected",
+        "editPrompt": "Edit assistant prompt",
+        "promptRequired": "Enter a prompt name and instructions.",
+        "saveError": "Could not save these settings. Check your settings and try again.",
+        "save": "Save assistant prompt",
+        "sharedPrompt": "Prompts are shared with cleanup. Editing this prompt also changes cleanup if it uses the same prompt."
+      },
+      "requestOptions": {
+        "title": "LLM request options",
+        "description": "Shared by cleanup and the assistant. Changes apply to the next recording.",
+        "temperature": "Temperature (optional)",
+        "max_output_tokens": "Maximum output tokens (optional)",
+        "timeout_secs": "Overall timeout (seconds)",
+        "connect_timeout_secs": "Connection timeout (seconds)",
+        "help": "Leave temperature or maximum output tokens blank to use the server default. Temperature: 0 to 2. Output tokens: 1 to 131072. Overall timeout: 1 to 300 seconds. Connection timeout: 1 to 30 seconds, no longer than the overall timeout.",
+        "invalid": "Check the highlighted request option fields.",
+        "save": "Save request options",
+        "invalidTemperature": "Temperature must be a number from 0 to 2, or blank for the server default.",
+        "invalidMaxOutputTokens": "Maximum output tokens must be a whole number from 1 to 131072, or blank for the server default.",
+        "invalidTimeout": "Overall timeout must be a whole number from 1 to 300 seconds.",
+        "invalidConnectTimeout": "Connection timeout must be a whole number from 1 to 30 seconds.",
+        "connectExceedsOverall": "Connection timeout must not exceed the overall timeout.",
+        "saved": "Saved"
       }
     },
     "history": {
@@ -477,7 +516,20 @@
       "retranscribe": "Re-transcribir",
       "retranscribeError": "No se pudo re-transcribir. Por favor, inténtalo de nuevo.",
       "transcribing": "Transcribiendo...",
-      "transcriptionFailed": "La transcripción falló. Puedes re-transcribir usando el icono de reintentar."
+      "transcriptionFailed": "La transcripción falló. Puedes re-transcribir usando el icono de reintentar.",
+      "assistant": {
+        "title": "Assistant results awaiting recovery",
+        "description": "Results are kept until dismissed or Handy exits. Copy does not insert into another app or dismiss the result.",
+        "generated": "Generated text",
+        "instruction": "Spoken instruction",
+        "copyGenerated": "Copy generated text",
+        "copyInstruction": "Copy instruction",
+        "actionError": "Could not complete this recovery action. Try again.",
+        "uncertain": "Delivery could not be confirmed. Check the target before copying or inserting again.",
+        "refused": "Automatic insertion failed or was refused. The generated text is available here.",
+        "generatedCopied": "Generated text copied.",
+        "instructionCopied": "Instruction copied."
+      }
     },
     "debug": {
       "title": "Depuración",
@@ -669,7 +721,8 @@
     "open": "Abrir",
     "copy": "Copiar",
     "clear": "Limpiar",
-    "noOptionsFound": "No se encontraron opciones"
+    "noOptionsFound": "No se encontraron opciones",
+    "dismiss": "Dismiss"
   },
   "accessibility": {
     "permissionsDescription": "Handy necesita permisos de accesibilidad para escribir texto transcrito.",
@@ -691,7 +744,22 @@
     "modelLoadFailedUnknown": "modelo desconocido",
     "pasteFailedTitle": "Error al pegar el texto",
     "pasteFailed": "No se pudo pegar el texto en la aplicación activa.",
-    "transcriptionFailedTitle": "Error de transcripción"
+    "transcriptionFailedTitle": "Error de transcripción",
+    "cleanupFallback": "Cleanup failed. Raw text was used. You can find the raw transcription in History.",
+    "assistantTextTooLong": "Text too long for this model. The original selection was left untouched. Use a shorter selection or a model with a larger context.",
+    "assistantFailed": "Assistant failed. No replacement was inserted. Check the model and connection settings, then try again.",
+    "assistantConfiguration": "Assistant is not configured. Check its prompt, provider, model and request options.",
+    "assistantRecovery": "Assistant delivery failed or could not be confirmed. Open History to recover the generated text.",
+    "assistantRecoveryFull": "Assistant recovery is full. Dismiss assistant recovery items in History before starting again.",
+    "assistantSelectionTooLarge": "The selection is too large. Select less text and try again.",
+    "assistantPasswordField": "Password fields cannot be used with the assistant. Choose another editable field.",
+    "assistantReadOnly": "This field is read-only. Choose an editable field and try again.",
+    "assistantBusy": "An operation is already running. Wait for it to finish or cancel it before starting again.",
+    "cleanupFallbackHistory": "Cleanup failed. Raw text is available in History.",
+    "cleanupFallbackNoHistory": "Cleanup failed. Raw text was used. This transcription could not be saved to History.",
+    "cleanupPasteFailedHistory": "Cleanup and paste failed. Raw text is available in History.",
+    "cleanupPasteFailedNoHistory": "Cleanup and paste failed. This transcription could not be saved to History. Dictate it again.",
+    "cleanupFallbackNotDelivered": "Cleanup failed. No text was delivered, and this transcription could not be saved to History."
   },
   "appLanguage": {
     "title": "Idioma de la aplicación",

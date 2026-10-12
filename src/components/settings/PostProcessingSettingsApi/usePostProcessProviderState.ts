@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { useCallback, useMemo, useState } from "react";
 import { useSettings } from "../../../hooks/useSettings";
 import { commands, type PostProcessProvider } from "@/bindings";
@@ -5,6 +6,7 @@ import type { ModelOption } from "./types";
 import type { DropdownOption } from "../../ui/Dropdown";
 
 type PostProcessProviderState = {
+  error: string;
   providerOptions: DropdownOption[];
   selectedProviderId: string;
   selectedProvider: PostProcessProvider | undefined;
@@ -41,6 +43,28 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
     fetchPostProcessModels,
     postProcessModelOptions,
   } = useSettings();
+
+  const { t } = useTranslation();
+  const [error, setError] = useState("");
+  const report = useCallback(
+    async (action: () => Promise<unknown>, fetching = false) => {
+      setError("");
+      try {
+        await action();
+        return true;
+      } catch {
+        setError(
+          t(
+            fetching
+              ? "settings.postProcessing.api.model.fetchError"
+              : "settings.postProcessing.assistant.saveError",
+          ),
+        );
+        return false;
+      }
+    },
+    [t],
+  );
 
   // Settings are guaranteed to have providers after migration
   const providers = settings?.post_process_providers || [];
@@ -89,7 +113,7 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
         }
       }
 
-      await setPostProcessProvider(providerId);
+      if (!(await report(() => setPostProcessProvider(providerId)))) return;
 
       // Auto-fetch available models for the new provider so the model dropdown
       // reflects what's actually valid. Without this, a stale model value from
@@ -103,7 +127,7 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
         const hasApiKey = apiKey.trim() !== "";
 
         if (provider?.id === "custom" ? hasBaseUrl : hasApiKey) {
-          void fetchPostProcessModels(providerId);
+          void report(() => fetchPostProcessModels(providerId), true);
         }
       }
     },
@@ -113,6 +137,7 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
       fetchPostProcessModels,
       providers,
       settings,
+      report,
     ],
   );
 
@@ -123,50 +148,54 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
       }
       const trimmed = value.trim();
       if (trimmed && trimmed !== baseUrl) {
-        void updatePostProcessBaseUrl(selectedProvider.id, trimmed);
+        void report(() =>
+          updatePostProcessBaseUrl(selectedProvider.id, trimmed),
+        );
       }
     },
-    [selectedProvider, baseUrl, updatePostProcessBaseUrl],
+    [selectedProvider, baseUrl, updatePostProcessBaseUrl, report],
   );
 
   const handleApiKeyChange = useCallback(
     (value: string) => {
       const trimmed = value.trim();
       if (trimmed !== apiKey) {
-        void updatePostProcessApiKey(selectedProviderId, trimmed);
+        void report(() => updatePostProcessApiKey(selectedProviderId, trimmed));
       }
     },
-    [apiKey, selectedProviderId, updatePostProcessApiKey],
+    [apiKey, selectedProviderId, updatePostProcessApiKey, report],
   );
 
   const handleModelChange = useCallback(
     (value: string) => {
       const trimmed = value.trim();
       if (trimmed !== model) {
-        void updatePostProcessModel(selectedProviderId, trimmed);
+        void report(() => updatePostProcessModel(selectedProviderId, trimmed));
       }
     },
-    [model, selectedProviderId, updatePostProcessModel],
+    [model, selectedProviderId, updatePostProcessModel, report],
   );
 
   const handleModelSelect = useCallback(
     (value: string) => {
-      void updatePostProcessModel(selectedProviderId, value.trim());
+      void report(() =>
+        updatePostProcessModel(selectedProviderId, value.trim()),
+      );
     },
-    [selectedProviderId, updatePostProcessModel],
+    [selectedProviderId, updatePostProcessModel, report],
   );
 
   const handleModelCreate = useCallback(
     (value: string) => {
-      void updatePostProcessModel(selectedProviderId, value);
+      void report(() => updatePostProcessModel(selectedProviderId, value));
     },
-    [selectedProviderId, updatePostProcessModel],
+    [selectedProviderId, updatePostProcessModel, report],
   );
 
   const handleRefreshModels = useCallback(() => {
     if (isAppleProvider) return;
-    void fetchPostProcessModels(selectedProviderId);
-  }, [fetchPostProcessModels, isAppleProvider, selectedProviderId]);
+    void report(() => fetchPostProcessModels(selectedProviderId), true);
+  }, [fetchPostProcessModels, isAppleProvider, selectedProviderId, report]);
 
   const availableModelsRaw = postProcessModelOptions[selectedProviderId] || [];
 
@@ -210,6 +239,7 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
   // No automatic fetching - user must click refresh button
 
   return {
+    error,
     providerOptions,
     selectedProviderId,
     selectedProvider,

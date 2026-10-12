@@ -15,6 +15,7 @@ import { formatDateTime } from "@/utils/dateFormat";
 import { AudioPlayer, AudioPlayerGroup } from "../../ui/AudioPlayer";
 import { Button } from "../../ui/Button";
 import { copyToClipboard } from "./clipboard";
+import { AssistantRecovery } from "./AssistantRecovery";
 
 const IconButton: React.FC<{
   onClick: () => void;
@@ -32,6 +33,7 @@ const IconButton: React.FC<{
         : "text-text/50 hover:text-logo-primary"
     }`}
     title={title}
+    aria-label={title}
   >
     {children}
   </button>
@@ -267,10 +269,15 @@ export const HistorySettings: React.FC = () => {
 
   return (
     <div className="max-w-3xl w-full mx-auto space-y-6">
+      <AssistantRecovery />
       <div className="space-y-2">
         <div className="px-4 flex items-center justify-between">
           <div>
-            <h2 className="text-xs font-medium text-mid-gray uppercase tracking-wide">
+            <h2
+              id="history-title"
+              tabIndex={-1}
+              className="text-xs font-medium text-mid-gray uppercase tracking-wide focus-visible:outline focus-visible:outline-logo-primary"
+            >
               {t("settings.history.title")}
             </h2>
           </div>

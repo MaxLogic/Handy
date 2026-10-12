@@ -771,7 +771,8 @@ fn should_send_auto_submit(auto_submit: bool, paste_method: PasteMethod) -> bool
     auto_submit && paste_method != PasteMethod::None
 }
 
-pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
+/// Return whether text was delivered, using the same settings as the paste itself.
+pub fn paste(text: String, app_handle: AppHandle) -> Result<bool, String> {
     let settings = get_settings(&app_handle);
     let paste_method = settings.paste_method;
     let paste_delay_ms = settings.paste_delay_ms;
@@ -822,7 +823,7 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
                     )
                 });
                 match reliable_result {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => return Ok(true),
                     Err(e) => {
                         log::warn!("Reliable paste unavailable ({e}); falling back to legacy paste")
                     }
@@ -860,7 +861,7 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
         write_text_to_clipboard(&app_handle, &text)?;
     }
 
-    Ok(())
+    Ok(paste_method != PasteMethod::None)
 }
 
 #[cfg(test)]

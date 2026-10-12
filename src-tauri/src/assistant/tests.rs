@@ -294,6 +294,38 @@ async fn llm_provider_failure_never_commits_and_keeps_no_item() {
     assert_eq!(store.free_slots(), 8);
     assert_eq!(released.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn context_exceeded_preserves_selection_and_keeps_no_recovery_item() {
+    let server = FakeServer::new(vec![Step::Respond(400,
+        r#"{"error":{"code":400,"message":"request (18012 tokens) exceeds the available context size (16384 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":18012,"n_ctx":16384}}"#.into())]).await;
+    let store = RecoveryStore::new(8);
+    let (session, released) = session(
+        &server.url,
+        CapturedText::Selected("original selection".into()),
+        &store,
+    );
+    let report = complete_session(
+        session,
+        "instruction",
+        never_cancel(),
+        |_| panic!("selection must stay untouched"),
+        &TRACKER,
+    )
+    .await;
+    assert!(matches!(
+        report.outcome,
+        SessionOutcome::Failed(AssistantError {
+            code: "llm_context_exceeded",
+            reason: Some("context_exceeded"),
+            ..
+        })
+    ));
+    assert_eq!(report.commit_calls, 0);
+    assert!(store.items().is_empty());
+    assert_eq!(store.free_slots(), 8);
+    assert_eq!(released.load(Ordering::SeqCst), 1);
+}
 #[tokio::test]
 async fn llm_invalid_or_reasoning_only_output_never_commits() {
     for text in [
