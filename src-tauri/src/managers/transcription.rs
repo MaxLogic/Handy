@@ -1073,7 +1073,9 @@ impl TranscriptionManager {
     /// cancelled. There is no timeout here: waiting behind a model load is a
     /// queue position, not a failure (#1841), and the engine bounds the
     /// finalize itself by the audio it still has to decode.
-    pub fn finalize_stream(&self) -> Result<Option<String>> {
+    ///
+    /// Finalize with language evidence from this utterance for cleanup routing.
+    pub fn finalize_stream(&self) -> Result<Option<(String, OutputLanguageEvidence)>> {
         let Some(tx) = self.router.take() else {
             return Ok(None);
         };
@@ -1101,7 +1103,7 @@ impl TranscriptionManager {
         });
 
         self.maybe_unload_immediately("streaming transcription");
-        Ok(Some(filtered))
+        Ok(Some((filtered, finalized.output_language)))
     }
 
     /// Abandon any active stream without producing text (e.g. on cancel).
@@ -1130,6 +1132,14 @@ impl TranscriptionManager {
     }
 
     pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {
+        self.transcribe_with_language(audio).map(|(text, _)| text)
+    }
+
+    /// Transcribe with language evidence from this utterance for cleanup routing.
+    pub fn transcribe_with_language(
+        &self,
+        audio: Vec<f32>,
+    ) -> Result<(String, OutputLanguageEvidence)> {
         #[cfg(debug_assertions)]
         if std::env::var("HANDY_FORCE_TRANSCRIPTION_FAILURE").is_ok() {
             return Err(anyhow::anyhow!(
@@ -1148,7 +1158,7 @@ impl TranscriptionManager {
         if audio.is_empty() {
             debug!("Empty audio vector");
             self.maybe_unload_immediately("empty audio");
-            return Ok(String::new());
+            return Ok((String::new(), OutputLanguageEvidence::Unknown));
         }
 
         // Check if model is loaded, if not try to load it
@@ -1253,7 +1263,7 @@ impl TranscriptionManager {
 
         self.maybe_unload_immediately("transcription");
 
-        Ok(final_result)
+        Ok((final_result, output_language))
     }
 
     /// transcribe-cpp: the model runs in the engine's worker process, which

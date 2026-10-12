@@ -43,6 +43,7 @@ const OUTCOMES = [
   ...ASSISTANT_OUTCOMES,
   "pasted",
   "cleanup_fallback",
+  "cleanup_skipped",
   "empty_output",
   "paste_error",
   "main_thread_error",
@@ -192,6 +193,8 @@ export function validateRecord(v: unknown): string | null {
   if (o.mode !== "raw" && o.mode !== "cleanup" && o.mode !== "assistant")
     return "mode must be raw|cleanup|assistant";
   if (!OUTCOMES.includes(o.outcome as Outcome)) return "unknown outcome";
+  if (o.outcome === "cleanup_skipped" && o.mode !== "cleanup")
+    return "cleanup_skipped requires cleanup mode";
   if (
     o.mode !== "assistant" &&
     (ASSISTANT_OUTCOMES as readonly string[]).includes(o.outcome as string)
@@ -350,6 +353,7 @@ export interface WorkloadSummary {
   total: Stats | null;
   stages: Partial<Record<StageKey, Stats>>;
   failures: Partial<Record<Outcome, number>>;
+  skipped: number;
 }
 
 export interface AssistantSummary {
@@ -541,6 +545,7 @@ export function summarize(
   const cold: number[] = [];
   const warmByKey = new Map<string, TimingRecord[]>();
   const failuresByKey = new Map<string, Partial<Record<Outcome, number>>>();
+  const skippedByKey = new Map<string, number>();
   const keyOf = (language: string, mode: string, duration: number) =>
     `${language}|${mode}|${duration}`;
 
@@ -558,6 +563,10 @@ export function summarize(
       continue;
     }
     const key = keyOf(workloadLanguage(r), r.mode, bucket);
+    if (r.outcome === "cleanup_skipped") {
+      skippedByKey.set(key, (skippedByKey.get(key) ?? 0) + 1);
+      continue;
+    }
     // Cleanup fallback delivered raw text, not a successful cleanup latency sample.
     if (r.outcome !== "pasted") {
       const counts = failuresByKey.get(key) ?? {};
@@ -603,6 +612,7 @@ export function summarize(
           total: taken.length > 0 ? stats(taken.map((r) => r.total_us)) : null,
           stages: stageStats,
           failures: failuresByKey.get(key) ?? {},
+          skipped: skippedByKey.get(key) ?? 0,
         });
       }
     }
@@ -711,6 +721,7 @@ export function formatSummary(
       if (parts.length > 0)
         out.push(`    stage median/p95: ${parts.join(", ")}`);
     }
+    if (w.skipped > 0) out.push(`    skipped: cleanup_skipped=${w.skipped}`);
     const failures = Object.entries(w.failures);
     if (failures.length > 0) {
       out.push(

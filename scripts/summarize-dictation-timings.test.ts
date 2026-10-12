@@ -217,6 +217,26 @@ function summarizeText(
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Patch = (r: any) => void;
 
+test("cleanup skips are separate from failures and latency samples", () => {
+  const records = baselineText
+    .trimEnd()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const index = records.findIndex((r) => r.mode === "cleanup" && !r.cold);
+  const result = summarizeText(
+    mutateLine(baselineText, index, (r) => {
+      r.outcome = "cleanup_skipped";
+      r.llm_requests = 0;
+    }),
+  );
+  expect(result.code).toBe(1); // A skip cannot replace a required cleanup success sample.
+  expect(result.output).toContain("skipped: cleanup_skipped=1");
+  expect(result.output).toContain("en cleanup 5s: n=29");
+  expect(result.output).not.toContain("failures: cleanup_skipped");
+  const record = { ...assistantRecord(), outcome: "cleanup_skipped" };
+  expect(validateRecord(record)).toContain("requires cleanup mode");
+});
+
 function mutateLine(text: string, index: number, patch: Patch): string {
   const lines = text.trimEnd().split("\n");
   const record = JSON.parse(lines[index]);

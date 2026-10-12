@@ -199,6 +199,8 @@ pub enum Outcome {
     Pasted,
     /// Cleanup failed; unchanged raw text was successfully pasted instead.
     CleanupFallback,
+    /// Cleanup was inapplicable; unchanged raw text was successfully pasted.
+    CleanupSkipped,
     /// STT and cleanup produced no text to insert.
     EmptyOutput,
     PasteError,

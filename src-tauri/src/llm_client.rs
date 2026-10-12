@@ -180,6 +180,8 @@ pub struct ChatRequest<'a> {
     pub user: &'a str,
     pub schema: Option<(&'static str, Value)>,
     pub disable_reasoning: bool,
+    /// Fixed S1 cleanup format requires reasoning off with no compatibility retry.
+    pub s1_cleanup: bool,
     pub options: &'a LlmRequestOptions,
 }
 
@@ -187,6 +189,11 @@ pub struct ChatReply {
     pub content: Option<String>,
     pub finish_reason: Option<String>,
     pub had_reasoning: bool,
+}
+
+/// Model names returned by local servers and qualified repository/quantization names.
+pub(crate) fn is_s1_mini(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("s1-mini")
 }
 
 // Intentionally no Debug/Display: the cache identity contains credentials.
@@ -633,7 +640,7 @@ pub(crate) async fn chat_completion_with_limits(
             req.provider.base_url.trim_end_matches('/')
         );
         let key = endpoint_key(req.provider, req.model);
-        let reasoning = if req.disable_reasoning && !is_known_rejected(&key) {
+        let reasoning = if req.disable_reasoning && (req.s1_cleanup || !is_known_rejected(&key)) {
             reasoning_disable_params(req.provider)
         } else {
             ReasoningParams::default()
@@ -684,7 +691,10 @@ pub(crate) async fn chat_completion_with_limits(
             .send()
             .await
             .map_err(|e| LlmError::Transport(report_reqwest_error("HTTP request failed", &e)))?;
-        if matches!(response.status().as_u16(), 400 | 422) && !body.reasoning.is_empty() {
+        if matches!(response.status().as_u16(), 400 | 422)
+            && !body.reasoning.is_empty()
+            && !req.s1_cleanup
+        {
             // Context overflow is not a reasoning compatibility rejection.
             // Never repeat an oversized request or weaken its input.
             let rejection = provider_error(response, false).await;
@@ -1193,6 +1203,7 @@ mod tests {
                 user: "untrusted",
                 schema: None,
                 disable_reasoning: reasoning,
+                s1_cleanup: false,
                 options,
             },
             cache,
@@ -1263,6 +1274,7 @@ mod tests {
                 user: "user",
                 schema: Some(("assistant_output", serde_json::json!({"type": "object"}))),
                 disable_reasoning: false,
+                s1_cleanup: false,
                 options: &options,
             },
             &ClientCache::default(),
@@ -1578,6 +1590,7 @@ mod tests {
                     user: "usr",
                     schema: None,
                     disable_reasoning: false,
+                    s1_cleanup: false,
                     options: &options,
                 },
                 &cache,
@@ -1668,6 +1681,7 @@ mod tests {
                 user: &user,
                 schema: None,
                 disable_reasoning: false,
+                s1_cleanup: false,
                 options: &test_options(),
             },
             &ClientCache::default(),

@@ -1,4 +1,5 @@
 use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, SoundType};
+use crate::audio_toolkit::text::OutputLanguageEvidence;
 use crate::audio_toolkit::{is_microphone_access_denied, is_no_input_device_error, VadPolicy};
 use crate::dictation_timing::{self, Mode, OperationTimer, Outcome, Stage, SttPath};
 use crate::managers::audio::AudioRecordingManager;
@@ -178,23 +179,43 @@ pub(crate) struct ProcessedTranscription {
     pub post_processed_text: Option<String>,
     pub post_process_prompt: Option<String>,
     pub cleanup_error: Option<String>,
+    pub cleanup_skipped: Option<prompts::CleanupSkipReason>,
 }
 
 impl ProcessedTranscription {
     fn paste_outcome(&self) -> Outcome {
         if self.cleanup_error.is_some() {
             Outcome::CleanupFallback
+        } else if self.cleanup_skipped.is_some() {
+            Outcome::CleanupSkipped
         } else {
             Outcome::Pasted
         }
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn process_transcription_output(
     session: &DictationSession,
     transcription: &str,
 ) -> ProcessedTranscription {
-    process_transcription_output_with(session, transcription, prompts::cleanup).await
+    process_transcription_output_with_language(
+        session,
+        transcription,
+        &OutputLanguageEvidence::Unknown,
+    )
+    .await
+}
+
+pub(crate) async fn process_transcription_output_with_language(
+    session: &DictationSession,
+    transcription: &str,
+    evidence: &OutputLanguageEvidence,
+) -> ProcessedTranscription {
+    process_transcription_output_with(session, transcription, |req, text| {
+        prompts::cleanup(req, text, evidence)
+    })
+    .await
 }
 
 async fn process_transcription_output_with<'a, F, Fut>(
@@ -204,12 +225,13 @@ async fn process_transcription_output_with<'a, F, Fut>(
 ) -> ProcessedTranscription
 where
     F: FnOnce(&'a prompts::CleanupRequest, &'a str) -> Fut,
-    Fut: Future<Output = Result<String, crate::llm_client::LlmError>>,
+    Fut: Future<Output = Result<prompts::CleanupOutcome, crate::llm_client::LlmError>>,
 {
     let mut final_text = transcription.to_string();
     let mut post_processed_text: Option<String> = None;
     let mut post_process_prompt: Option<String> = None;
     let mut cleanup_error = None;
+    let mut cleanup_skipped = None;
 
     // The STT manager has already applied deterministic/custom-word cleanup.
     // Preserve that exact recoverable result whenever cleanup fails.
@@ -217,11 +239,18 @@ where
         if !prompts::is_blank_transcription(transcription) {
             match request.as_ref() {
                 Ok(request) => match cleanup(request, transcription).await {
-                    Ok(text) => {
+                    Ok(prompts::CleanupOutcome::Cleaned(text)) => {
                         post_processed_text = Some(text.clone());
                         final_text = text;
-                        post_process_prompt = Some(request.prompt.clone());
+                        // S1 uses fixed controls rather than the user's cleanup prompt.
+                        if request.target.provider.id
+                            == crate::settings::APPLE_INTELLIGENCE_PROVIDER_ID
+                            || !crate::llm_client::is_s1_mini(&request.target.model)
+                        {
+                            post_process_prompt = Some(request.prompt.clone());
+                        }
                     }
+                    Ok(prompts::CleanupOutcome::Skipped(reason)) => cleanup_skipped = Some(reason),
                     Err(error) => cleanup_error = Some(error.to_string()),
                 },
                 Err(error) => cleanup_error = Some(error.to_string()),
@@ -234,6 +263,7 @@ where
         post_processed_text,
         post_process_prompt,
         cleanup_error,
+        cleanup_skipped,
     }
 }
 
@@ -299,7 +329,7 @@ pub(crate) fn report_cleanup_failure(
 ) {
     if let Some(error) = &output.cleanup_error {
         app.play_failure_feedback();
-        warn!("LLM cleanup skipped/failed: {error}");
+        warn!("LLM cleanup failed: {error}");
         app.emit_notice("cleanup-fallback", notice);
     }
 }
@@ -600,13 +630,13 @@ impl TranscribeAction {
                         // or its worker crashed) falls back to a full batch
                         // transcription of the same audio. A cancelled finalize is
                         // surfaced instead, so a cancel never starts a batch run.
-                        Ok(Some(text)) if !text.trim().is_empty() => {
+                        Ok(Some((text, language))) if !text.trim().is_empty() => {
                             timer.set_stt_path(SttPath::StreamFinalize);
-                            Ok(text)
+                            Ok((text, language))
                         }
                         Ok(_) => {
                             timer.set_stt_path(SttPath::Batch);
-                            tm.transcribe(samples)
+                            tm.transcribe_with_language(samples)
                         }
                         Err(err) => Err(err),
                     };
@@ -651,7 +681,7 @@ impl TranscribeAction {
                     }
 
                     match transcription_result {
-                        Ok(transcription) => {
+                        Ok((transcription, output_language)) => {
                             debug!(
                                 "Transcription completed in {:?}: '{}'",
                                 transcription_time.elapsed(),
@@ -690,7 +720,11 @@ impl TranscribeAction {
                             }
                             let cleanup_started = Instant::now();
                             let processed = complete_unless_cancelled(
-                                process_transcription_output(&session, &transcription),
+                                process_transcription_output_with_language(
+                                    &session,
+                                    &transcription,
+                                    &output_language,
+                                ),
                                 || rm.was_cancelled_since(cancel_generation),
                             )
                             .await;
@@ -917,6 +951,7 @@ mod tests {
                     post_processed_text: None,
                     post_process_prompt: None,
                     cleanup_error: cleanup_failed.then(|| "llm_timeout".into()),
+                    cleanup_skipped: None,
                 };
                 super::report_transcription_delivery(
                     &reporter,
@@ -950,6 +985,7 @@ mod tests {
                 post_processed_text: None,
                 post_process_prompt: None,
                 cleanup_error: Some("llm_timeout".into()),
+                cleanup_skipped: None,
             };
             super::report_transcription_delivery(&reporter, &output, history_saved, &Ok(false));
             assert_eq!(
@@ -973,6 +1009,7 @@ mod tests {
             post_processed_text: None,
             post_process_prompt: None,
             cleanup_error: Some("llm_timeout".into()),
+            cleanup_skipped: None,
         };
         let reporter = FakeCleanupReporter::default();
         let notice = super::CleanupFallbackNotice {
@@ -1002,6 +1039,7 @@ mod tests {
             post_processed_text: None,
             post_process_prompt: None,
             cleanup_error: Some("llm_timeout".into()),
+            cleanup_skipped: None,
         };
         let notice = super::CleanupFallbackNotice {
             history_available: true,
@@ -1022,6 +1060,149 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn handy009_r2_skipped_cleanup_delivers_exact_raw_without_failure_events() {
+        for (language, evidence, reason) in [
+            (
+                "auto",
+                OutputLanguageEvidence::Unknown,
+                prompts::CleanupSkipReason::UnknownOutputLanguage,
+            ),
+            (
+                "auto",
+                OutputLanguageEvidence::ModelDetected("pl".into()),
+                prompts::CleanupSkipReason::NonEnglishOutput,
+            ),
+            (
+                "pl",
+                OutputLanguageEvidence::ModelDetected("pl".into()),
+                prompts::CleanupSkipReason::NonEnglishOutput,
+            ),
+        ] {
+            let server = FakeServer::new(vec![]).await;
+            let mut settings = configured_settings(&server.url);
+            settings.selected_language = language.into();
+            settings
+                .post_process_models
+                .insert("custom".into(), "S1-mini".into());
+            let session = DictationSession::snapshot(WorkflowMode::Cleanup, &settings).unwrap();
+            let raw = "  Call Paweł, then TADOQuery.Open.\n";
+            let output = process_transcription_output_with_language(&session, raw, &evidence).await;
+            assert_eq!(output.final_text, raw);
+            assert_eq!(output.cleanup_skipped, Some(reason));
+            assert!(output.cleanup_error.is_none());
+            assert!(output.post_processed_text.is_none());
+            assert!(output.post_process_prompt.is_none());
+            assert_eq!(
+                serde_json::to_value(output.paste_outcome()).unwrap(),
+                "cleanup_skipped"
+            );
+            assert!(server.requests.lock().unwrap().is_empty());
+            let reporter = FakeCleanupReporter::default();
+            for delivered in [true, false] {
+                report_transcription_delivery(&reporter, &output, true, &Ok(delivered));
+            }
+            assert_eq!(reporter.cues.get(), 0);
+            assert!(reporter.events.borrow().is_empty());
+            assert!(reporter.paste_events.borrow().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn handy009_r3_stale_translation_setting_skips_s1_without_failure_events() {
+        let server = FakeServer::new(vec![]).await;
+        let mut settings = configured_settings(&server.url);
+        settings.translate_to_english = true;
+        settings.selected_model = "small".into();
+        // Switching to Turbo leaves the hidden translation setting enabled.
+        settings.selected_model = "turbo".into();
+        settings.selected_language = "pl".into();
+        settings
+            .post_process_models
+            .insert("custom".into(), "S1-mini".into());
+        let session = DictationSession::snapshot(WorkflowMode::Cleanup, &settings).unwrap();
+        let raw = "Proszę wysłać raport jutro.";
+        let output = process_transcription_output_with_language(
+            &session,
+            raw,
+            &OutputLanguageEvidence::UserSelected("pl".into()),
+        )
+        .await;
+        assert_eq!(output.final_text, raw);
+        assert_eq!(
+            output.cleanup_skipped,
+            Some(prompts::CleanupSkipReason::NonEnglishOutput)
+        );
+        assert!(output.cleanup_error.is_none());
+        assert!(output.post_processed_text.is_none());
+        assert!(output.post_process_prompt.is_none());
+        assert!(server.requests.lock().unwrap().is_empty());
+        let reporter = FakeCleanupReporter::default();
+        for delivered in [true, false] {
+            report_transcription_delivery(&reporter, &output, true, &Ok(delivered));
+        }
+        assert_eq!(reporter.cues.get(), 0);
+        assert!(reporter.events.borrow().is_empty());
+        assert!(reporter.paste_events.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handy009_r3_translated_cleanup_does_not_record_unsent_custom_prompt() {
+        let server = FakeServer::new(vec![Step::Respond(
+            200,
+            completion(Some("Please send the report tomorrow."), "stop"),
+        )])
+        .await;
+        let mut settings = configured_settings(&server.url);
+        settings.selected_language = "pl".into();
+        settings.translate_to_english = true;
+        settings
+            .post_process_models
+            .insert("custom".into(), "S1-mini".into());
+        let session = DictationSession::snapshot(WorkflowMode::Cleanup, &settings).unwrap();
+        let output = process_transcription_output_with_language(
+            &session,
+            "please send the report tomorrow",
+            &OutputLanguageEvidence::TranslatedToEnglish,
+        )
+        .await;
+        assert_eq!(output.final_text, "Please send the report tomorrow.");
+        assert_eq!(
+            output.post_processed_text.as_deref(),
+            Some("Please send the report tomorrow.")
+        );
+        assert!(output.cleanup_error.is_none());
+        assert!(output.cleanup_skipped.is_none());
+        assert!(output.post_process_prompt.is_none());
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handy009_r2_auto_language_evidence_reaches_cleanup_pipeline() {
+        let server = FakeServer::new(vec![Step::Respond(
+            200,
+            completion(Some("Sounds good."), "stop"),
+        )])
+        .await;
+        let mut settings = configured_settings(&server.url);
+        settings.selected_language = "auto".into();
+        settings
+            .post_process_models
+            .insert("custom".into(), "S1-mini".into());
+        let session = DictationSession::snapshot(WorkflowMode::Cleanup, &settings).unwrap();
+        let output = process_transcription_output_with_language(
+            &session,
+            "sounds good",
+            &OutputLanguageEvidence::ModelDetected("en".into()),
+        )
+        .await;
+        assert_eq!(output.final_text, "Sounds good.");
+        assert!(output.cleanup_error.is_none());
+        assert!(output.cleanup_skipped.is_none());
+        assert_eq!(output.paste_outcome(), Outcome::Pasted);
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+    }
 
     fn configured_settings(url: &str) -> AppSettings {
         let mut settings = crate::settings::get_default_settings();
@@ -1090,7 +1271,7 @@ mod tests {
         )
         .unwrap();
         let output = process_transcription_output_with(&session, "raw", |_, _| {
-            future::ready(Ok("Cleaned.".into()))
+            future::ready(Ok(prompts::CleanupOutcome::Cleaned("Cleaned.".into())))
         })
         .await;
         assert_eq!(output.final_text, "Cleaned.");
@@ -1107,7 +1288,7 @@ mod tests {
         let output = process_transcription_output_with(&session, raw, |_, _| {
             panic!("raw mode must never invoke an LLM client");
             #[allow(unreachable_code)]
-            future::ready(Ok(String::new()))
+            future::ready(Ok(prompts::CleanupOutcome::Cleaned(String::new())))
         })
         .await;
         assert_eq!(output.final_text, raw);
@@ -1239,7 +1420,7 @@ mod tests {
         let output = process_transcription_output_with(&session, "raw", |_, _| {
             panic!("a later configuration fix must not change this session");
             #[allow(unreachable_code)]
-            future::ready(Ok(String::new()))
+            future::ready(Ok(prompts::CleanupOutcome::Cleaned(String::new())))
         })
         .await;
         assert_eq!(output.final_text, "raw");
@@ -1275,7 +1456,7 @@ mod tests {
             let _guard = RequestGuard(&dropped);
             // Cancel only after the real processing path has entered the request.
             cancelled.store(true, Ordering::Release);
-            future::pending::<Result<String, LlmError>>().await
+            future::pending::<Result<prompts::CleanupOutcome, LlmError>>().await
         });
         let output =
             complete_unless_cancelled(operation, || cancelled.load(Ordering::Acquire)).await;
