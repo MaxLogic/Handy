@@ -32,7 +32,15 @@ export const DEFAULT_WARMUP = 3;
 export const DEFAULT_COLD = 5;
 export const DEFAULT_LANGUAGES = ["en", "pl"];
 
+const ASSISTANT_OUTCOMES = [
+  "committed",
+  "commit_refused",
+  "commit_failed",
+  "commit_uncertain",
+  "llm_error",
+] as const;
 const OUTCOMES = [
+  ...ASSISTANT_OUTCOMES,
   "pasted",
   "cleanup_fallback",
   "empty_output",
@@ -57,6 +65,7 @@ const STAGE_KEYS = [
   "history_us",
   "main_sched_us",
   "paste_us",
+  "commit_us",
 ] as const;
 export type StageKey = (typeof STAGE_KEYS)[number];
 
@@ -65,12 +74,14 @@ export interface TimingRecord {
   session: number;
   seq: number;
   op_id: number;
-  mode: "raw" | "cleanup";
+  mode: "raw" | "cleanup" | "assistant";
   outcome: Outcome;
   language: string;
   label?: string;
   cold: boolean;
   audio_ms?: number;
+  capture_us?: number;
+  selection_scalars?: number;
   stages: Partial<Record<StageKey, number>>;
   total_us: number;
   model_loads_delta: number;
@@ -178,9 +189,27 @@ export function validateRecord(v: unknown): string | null {
   ]) {
     if (!isCount(o[key])) return `${key} must be a non-negative integer`;
   }
-  if (o.mode !== "raw" && o.mode !== "cleanup")
-    return "mode must be raw|cleanup";
+  if (o.mode !== "raw" && o.mode !== "cleanup" && o.mode !== "assistant")
+    return "mode must be raw|cleanup|assistant";
   if (!OUTCOMES.includes(o.outcome as Outcome)) return "unknown outcome";
+  if (
+    o.mode !== "assistant" &&
+    (ASSISTANT_OUTCOMES as readonly string[]).includes(o.outcome as string)
+  ) {
+    return "assistant outcome requires assistant mode";
+  }
+  if (
+    o.mode === "assistant" &&
+    ["pasted", "cleanup_fallback", "paste_error", "main_thread_error"].includes(
+      o.outcome as string,
+    )
+  ) {
+    return "dictation outcome is invalid for assistant mode";
+  }
+  for (const field of ["capture_us", "selection_scalars"]) {
+    if (o[field] !== undefined && !isCount(o[field]))
+      return `${field} must be a non-negative integer`;
+  }
   if (typeof o.language !== "string" || o.language === "") {
     return "language must be a non-empty string";
   }
@@ -323,8 +352,63 @@ export interface WorkloadSummary {
   failures: Partial<Record<Outcome, number>>;
 }
 
+export interface AssistantSummary {
+  outcomes: Partial<Record<Outcome, number>>;
+  groups: {
+    bucket: string;
+    count: number;
+    total: Stats | null;
+    capture: Stats | null;
+  }[];
+}
+function assistantSummary(records: TimingRecord[]): AssistantSummary {
+  const outcomes: Partial<Record<Outcome, number>> = {};
+  const groups = new Map<string, TimingRecord[]>();
+  for (const record of records) {
+    if (record.mode !== "assistant") continue;
+    outcomes[record.outcome] = (outcomes[record.outcome] ?? 0) + 1;
+    const n = record.selection_scalars;
+    const bucket =
+      n === undefined
+        ? "unavailable"
+        : n === 0
+          ? "empty"
+          : n <= 100
+            ? "<=100"
+            : n <= 2000
+              ? "<=2000"
+              : n <= 20000
+                ? "<=20000"
+                : ">20000";
+    const list = groups.get(bucket) ?? [];
+    list.push(record);
+    groups.set(bucket, list);
+  }
+  return {
+    outcomes,
+    groups: ["empty", "<=100", "<=2000", "<=20000", ">20000", "unavailable"]
+      .filter((bucket) => groups.has(bucket))
+      .map((bucket) => {
+        const list = groups.get(bucket)!;
+        const committed = list.filter((r) => r.outcome === "committed");
+        const captures = committed
+          .map((r) => r.capture_us)
+          .filter((n): n is number => n !== undefined);
+        return {
+          bucket,
+          count: list.length,
+          total: committed.length
+            ? stats(committed.map((r) => r.total_us))
+            : null,
+          capture: captures.length ? stats(captures) : null,
+        };
+      }),
+  };
+}
+
 export interface Summary {
   recordCount: number;
+  assistant: AssistantSummary;
   synthetic: boolean;
   workloads: WorkloadSummary[];
   cold: { count: number; totalsUs: number[] };
@@ -422,7 +506,8 @@ export function summarize(
       "synthetic records are not measurements (pass --allow-synthetic to summarize test data)",
     );
   }
-  const ambiguous = records.filter(
+  const dictation = records.filter((r) => r.mode !== "assistant");
+  const ambiguous = dictation.filter(
     (r) => r.label === undefined && r.language === "auto",
   ).length;
   if (ambiguous > 0) {
@@ -442,7 +527,7 @@ export function summarize(
     problems.push(`${violationTotal} invariant violation(s)`);
   }
 
-  const seenLanguages = [...new Set(records.map(workloadLanguage))].sort();
+  const seenLanguages = [...new Set(dictation.map(workloadLanguage))].sort();
   const languages = opts.languages;
   if (languages.length === 0) problems.push("no records");
   for (const seen of seenLanguages) {
@@ -459,7 +544,7 @@ export function summarize(
   const keyOf = (language: string, mode: string, duration: number) =>
     `${language}|${mode}|${duration}`;
 
-  for (const r of [...records].sort(orderKey)) {
+  for (const r of [...dictation].sort(orderKey)) {
     const bucket =
       r.audio_ms === undefined
         ? null
@@ -529,6 +614,7 @@ export function summarize(
 
   return {
     recordCount: records.length,
+    assistant: assistantSummary(records),
     synthetic: records.some((r) => r.synthetic === true),
     workloads,
     cold: { count: cold.length, totalsUs: cold },
@@ -639,6 +725,23 @@ export function formatSummary(
     );
   } else {
     out.push("cold starts: none");
+  }
+  if (s.assistant.groups.length > 0) {
+    out.push("assistant (separate from raw/cleanup samples and baseline):");
+    out.push(
+      `  outcomes: ${Object.entries(s.assistant.outcomes)
+        .map(([outcome, count]) => `${outcome}=${count}`)
+        .join(", ")}`,
+    );
+    for (const group of s.assistant.groups) {
+      out.push(
+        `  selection ${group.bucket}: n=${group.count}` +
+          (group.total
+            ? ` committed=${group.total.n} total median=${ms(group.total.median)} p95=${ms(group.total.p95)}`
+            : " committed=0") +
+          (group.capture ? ` capture median=${ms(group.capture.median)}` : ""),
+      );
+    }
   }
   if (s.unbucketed > 0) {
     out.push(`records outside every duration bucket: ${s.unbucketed}`);

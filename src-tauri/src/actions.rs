@@ -58,6 +58,7 @@ pub trait ShortcutAction: Send + Sync {
 pub(crate) enum WorkflowMode {
     Raw,
     Cleanup,
+    Assistant,
 }
 
 impl WorkflowMode {
@@ -65,6 +66,7 @@ impl WorkflowMode {
         match id {
             "transcribe" => Some(Self::Raw),
             "transcribe_with_post_process" => Some(Self::Cleanup),
+            "assistant" => Some(Self::Assistant),
             _ => None,
         }
     }
@@ -73,6 +75,7 @@ impl WorkflowMode {
         match self {
             Self::Raw => "transcribe",
             Self::Cleanup => "transcribe_with_post_process",
+            Self::Assistant => "assistant",
         }
     }
 
@@ -80,6 +83,7 @@ impl WorkflowMode {
         match self {
             Self::Raw => Mode::Raw,
             Self::Cleanup => Mode::Cleanup,
+            Self::Assistant => Mode::Assistant,
         }
     }
 }
@@ -94,6 +98,7 @@ pub(crate) struct DictationSession {
 
 enum SessionWorkflow {
     Raw,
+    Assistant(Box<crate::assistant::AssistantSession>),
     Cleanup(Box<Result<prompts::CleanupRequest, crate::llm_client::LlmError>>),
 }
 
@@ -102,26 +107,49 @@ impl DictationSession {
         match &self.workflow {
             SessionWorkflow::Raw => WorkflowMode::Raw,
             SessionWorkflow::Cleanup(_) => WorkflowMode::Cleanup,
+            SessionWorkflow::Assistant(_) => WorkflowMode::Assistant,
         }
     }
 
-    pub(crate) fn snapshot(mode: WorkflowMode, settings: &AppSettings) -> Self {
-        Self {
+    pub(crate) fn snapshot(mode: WorkflowMode, settings: &AppSettings) -> Option<Self> {
+        Some(Self {
             workflow: match mode {
                 WorkflowMode::Raw => SessionWorkflow::Raw,
+                WorkflowMode::Assistant => return None,
                 WorkflowMode::Cleanup => SessionWorkflow::Cleanup(Box::new(
                     prompts::CleanupRequest::from_settings(settings),
                 )),
             },
             language: settings.selected_language.clone(),
             overlay_style: settings.overlay_style,
+        })
+    }
+    pub(crate) fn assistant(
+        settings: &AppSettings,
+        session: crate::assistant::AssistantSession,
+    ) -> Self {
+        Self {
+            workflow: SessionWorkflow::Assistant(Box::new(session)),
+            language: settings.selected_language.clone(),
+            overlay_style: settings.overlay_style,
         }
+    }
+    pub(crate) fn into_assistant(self) -> Result<crate::assistant::AssistantSession, Self> {
+        if matches!(self.workflow, SessionWorkflow::Assistant(_)) {
+            if let SessionWorkflow::Assistant(session) = self.workflow {
+                return Ok(*session);
+            }
+        }
+        Err(self)
     }
 }
 
 pub(crate) struct TranscribeAction;
 
-async fn complete_unless_cancelled<F, C>(operation: F, is_cancelled: C) -> Option<F::Output>
+pub(crate) async fn complete_unless_cancelled<F, C>(
+    operation: F,
+    is_cancelled: C,
+) -> Option<F::Output>
 where
     F: Future,
     C: Fn() -> bool,
@@ -411,7 +439,9 @@ impl TranscribeAction {
             .invalidate_recording_readiness();
 
         // Unregister the cancel shortcut when transcription stops
-        shortcut::unregister_cancel_shortcut(app);
+        if session.mode() != WorkflowMode::Assistant {
+            shortcut::unregister_cancel_shortcut(app);
+        }
 
         let stop_time = Instant::now();
         debug!("TranscribeAction::stop called for binding: {}", binding_id);
@@ -450,6 +480,8 @@ impl TranscribeAction {
         tauri::async_runtime::spawn(async move {
             timer.add_since(Stage::TaskSched, spawned_at);
             let _guard = FinishGuard(ah.clone(), Arc::clone(&tm));
+            // Drop assistant cancel ownership before notifying the coordinator.
+            let session = session;
             debug!(
                 "Starting async transcription task for binding: {}",
                 binding_id
@@ -489,10 +521,14 @@ impl TranscribeAction {
                     let file_name = format!("handy-{}.wav", chrono::Utc::now().timestamp());
                     let wav_path = hm.recordings_dir().join(&file_name);
                     let wav_path_for_verify = wav_path.clone();
-                    let samples_for_wav = samples.clone();
-                    let wav_handle = tauri::async_runtime::spawn_blocking(move || {
-                        crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav)
-                    });
+                    let wav_handle = if session.mode() == WorkflowMode::Assistant {
+                        None
+                    } else {
+                        let samples_for_wav = samples.clone();
+                        Some(tauri::async_runtime::spawn_blocking(move || {
+                            crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav)
+                        }))
+                    };
 
                     // Transcribe concurrently with WAV save. If a live stream was
                     // running, finalize it and use its text (all audio was already
@@ -520,27 +556,31 @@ impl TranscribeAction {
 
                     // Await WAV save and verify
                     let wav_wait_started = Instant::now();
-                    let wav_saved = match wav_handle.await {
-                        Ok(Ok(())) => {
-                            match crate::audio_toolkit::verify_wav_file(
-                                &wav_path_for_verify,
-                                sample_count,
-                            ) {
-                                Ok(()) => true,
-                                Err(e) => {
-                                    error!("WAV verification failed: {}", e);
-                                    false
+                    let wav_saved = if let Some(wav_handle) = wav_handle {
+                        match wav_handle.await {
+                            Ok(Ok(())) => {
+                                match crate::audio_toolkit::verify_wav_file(
+                                    &wav_path_for_verify,
+                                    sample_count,
+                                ) {
+                                    Ok(()) => true,
+                                    Err(e) => {
+                                        error!("WAV verification failed: {}", e);
+                                        false
+                                    }
                                 }
                             }
+                            Ok(Err(e)) => {
+                                error!("Failed to save WAV file: {}", e);
+                                false
+                            }
+                            Err(e) => {
+                                error!("WAV save task panicked: {}", e);
+                                false
+                            }
                         }
-                        Ok(Err(e)) => {
-                            error!("Failed to save WAV file: {}", e);
-                            false
-                        }
-                        Err(e) => {
-                            error!("WAV save task panicked: {}", e);
-                            false
-                        }
+                    } else {
+                        false
                     };
                     timer.add_since(Stage::WavWait, wav_wait_started);
 
@@ -560,6 +600,29 @@ impl TranscribeAction {
                                 utils::redact_text(&transcription)
                             );
 
+                            let session = match session.into_assistant() {
+                                Ok(session) => {
+                                    if use_streaming_overlay {
+                                        tm.emit_stream_working(StreamWorkKind::Polishing);
+                                    } else {
+                                        show_processing_overlay(&ah);
+                                    }
+                                    let probe: crate::assistant::CancelProbe =
+                                        Arc::new(move || rm.was_cancelled_since(cancel_generation));
+                                    crate::assistant::finish(
+                                        &ah,
+                                        session,
+                                        &transcription,
+                                        &timer,
+                                        probe,
+                                    )
+                                    .await;
+                                    utils::hide_recording_overlay(&ah);
+                                    set_tray_state(&ah, TrayIconState::Idle);
+                                    return;
+                                }
+                                Err(session) => session,
+                            };
                             if session.mode() == WorkflowMode::Cleanup {
                                 if use_streaming_overlay {
                                     tm.emit_stream_working(StreamWorkKind::Polishing);
@@ -805,7 +868,8 @@ mod tests {
         let session = DictationSession::snapshot(
             WorkflowMode::Cleanup,
             &configured_settings("http://unused.invalid"),
-        );
+        )
+        .unwrap();
         let output = process_transcription_output_with(&session, "recoverable raw", |_, _| {
             future::ready(Err(LlmError::Timeout))
         })
@@ -822,7 +886,7 @@ mod tests {
         let mut settings = configured_settings("http://unused.invalid");
         settings.post_process_models.clear();
         assert!(prompts::CleanupRequest::from_settings(&settings).is_err());
-        let session = DictationSession::snapshot(WorkflowMode::Cleanup, &settings);
+        let session = DictationSession::snapshot(WorkflowMode::Cleanup, &settings).unwrap();
 
         let output = process_transcription_output(&session, "recoverable raw").await;
 
@@ -836,7 +900,8 @@ mod tests {
         let session = DictationSession::snapshot(
             WorkflowMode::Cleanup,
             &configured_settings("http://unused.invalid"),
-        );
+        )
+        .unwrap();
         let output = process_transcription_output_with(&session, "raw", |_, _| {
             future::ready(Ok("Cleaned.".into()))
         })
@@ -850,7 +915,7 @@ mod tests {
         let mut settings = configured_settings("http://unused.invalid");
         settings.post_process_enabled = true;
         settings.custom_words = vec!["TFDQuery".into(), "TADOQuery.Open".into()];
-        let session = DictationSession::snapshot(WorkflowMode::Raw, &settings);
+        let session = DictationSession::snapshot(WorkflowMode::Raw, &settings).unwrap();
         let raw = "Call TADOQuery.Open on TFDQuery.";
         let output = process_transcription_output_with(&session, raw, |_, _| {
             panic!("raw mode must never invoke an LLM client");
@@ -890,7 +955,7 @@ mod tests {
             .unwrap()
             .prompt
             .clone();
-        let session = DictationSession::snapshot(WorkflowMode::Cleanup, &settings);
+        let session = DictationSession::snapshot(WorkflowMode::Cleanup, &settings).unwrap();
 
         // All edits affect the next utterance, including the enabled flag.
         settings.post_process_provider_id = "other".into();
@@ -946,7 +1011,8 @@ mod tests {
             let session = DictationSession::snapshot(
                 WorkflowMode::Cleanup,
                 &configured_settings(&server.url),
-            );
+            )
+            .unwrap();
             let raw = "TFDQuery and TADOQuery.Open.";
             let output = process_transcription_output(&session, raw).await;
             assert_eq!(output.final_text, raw);
@@ -967,7 +1033,7 @@ mod tests {
         let mut settings = configured_settings(&server.url);
         settings.post_process_request_options.timeout_secs = 1;
         settings.post_process_request_options.connect_timeout_secs = 1;
-        let session = DictationSession::snapshot(WorkflowMode::Cleanup, &settings);
+        let session = DictationSession::snapshot(WorkflowMode::Cleanup, &settings).unwrap();
         let output = process_transcription_output(&session, "recoverable raw").await;
         assert_eq!(output.final_text, "recoverable raw");
         assert_eq!(output.cleanup_error.as_deref(), Some("llm_timeout"));
@@ -979,7 +1045,7 @@ mod tests {
     async fn missing_config_is_snapshotted_and_blank_stt_never_calls_client() {
         let mut settings = configured_settings("http://unused.invalid");
         settings.post_process_models.clear();
-        let session = DictationSession::snapshot(WorkflowMode::Cleanup, &settings);
+        let session = DictationSession::snapshot(WorkflowMode::Cleanup, &settings).unwrap();
         settings
             .post_process_models
             .insert("custom".into(), "fixed-later".into());
@@ -992,7 +1058,7 @@ mod tests {
         assert_eq!(output.final_text, "raw");
         assert_eq!(output.cleanup_error.as_deref(), Some("llm_config"));
 
-        let session = DictationSession::snapshot(WorkflowMode::Cleanup, &settings);
+        let session = DictationSession::snapshot(WorkflowMode::Cleanup, &settings).unwrap();
         let output = process_transcription_output_with(&session, " \r\n", |_, _| {
             panic!("blank STT must not call the client");
             #[allow(unreachable_code)]
@@ -1008,7 +1074,8 @@ mod tests {
         let session = DictationSession::snapshot(
             WorkflowMode::Cleanup,
             &configured_settings("http://unused.invalid"),
-        );
+        )
+        .unwrap();
         let cancelled = AtomicBool::new(false);
         let dropped = AtomicBool::new(false);
         struct RequestGuard<'a>(&'a AtomicBool);
@@ -1037,7 +1104,8 @@ mod tests {
         let session = DictationSession::snapshot(
             WorkflowMode::Cleanup,
             &configured_settings("http://unused.invalid"),
-        );
+        )
+        .unwrap();
         for error in [
             LlmError::Config(ConfigError::NoModel),
             LlmError::Timeout,

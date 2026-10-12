@@ -9,7 +9,166 @@ import {
   regressionThreshold,
   run,
   stats,
+  validateRecord,
+  parseJsonl,
+  summarize,
+  parseArgs,
 } from "./summarize-dictation-timings";
+
+function assistantRecord(seq = 1) {
+  return {
+    schema: 1,
+    session: 777,
+    seq,
+    op_id: seq,
+    mode: "assistant",
+    outcome: "committed",
+    language: "auto",
+    cold: false,
+    audio_ms: 5000,
+    total_us: 1000000,
+    capture_us: 9000,
+    selection_scalars: 0,
+    stages: { llm_us: 100000, commit_us: 100000 },
+    model_loads_delta: 0,
+    worker_spawns_delta: 0,
+    worker_pid_before: 1,
+    worker_pid_after: 1,
+    llm_requests: 1,
+    paste_calls: 1,
+    active_ops: 1,
+    dropped_records: 0,
+    synthetic: true,
+  };
+}
+function assistantText(records = [assistantRecord()]) {
+  return (
+    records.map((r) => JSON.stringify(r)).join("\n") +
+    "\n" +
+    JSON.stringify({
+      kind: "session_end",
+      schema: 1,
+      session: 777,
+      records: records.length,
+      dropped_records: 0,
+    }) +
+    "\n"
+  );
+}
+
+describe("assistant records", () => {
+  test("accepted and reported separately with capture and commit timing", () => {
+    const result = summarizeText(baselineText + assistantText());
+    expect(result.code).toBe(0);
+    expect(result.output).toContain(
+      "assistant (separate from raw/cleanup samples and baseline)",
+    );
+    expect(result.output).toContain("committed=1");
+    expect(result.output).toContain("selection empty");
+    expect(result.output).toContain("capture median=9.0");
+  });
+  test("assistant outcomes are rejected under raw and cleanup", () => {
+    for (const mode of ["raw", "cleanup"]) {
+      for (const outcome of [
+        "committed",
+        "commit_refused",
+        "commit_failed",
+        "commit_uncertain",
+        "llm_error",
+      ]) {
+        expect(validateRecord({ ...assistantRecord(), mode, outcome })).toBe(
+          "assistant outcome requires assistant mode",
+        );
+      }
+    }
+  });
+  test("raw/cleanup delivery outcomes are rejected under assistant", () => {
+    for (const outcome of [
+      "pasted",
+      "cleanup_fallback",
+      "paste_error",
+      "main_thread_error",
+    ]) {
+      expect(validateRecord({ ...assistantRecord(), outcome })).toBe(
+        "dictation outcome is invalid for assistant mode",
+      );
+    }
+  });
+  test("assistant never supplies raw/cleanup samples or cold starts", () => {
+    const opts = parseArgs([
+      "--input",
+      "unused",
+      "--samples",
+      "1",
+      "--warmup",
+      "0",
+      "--cold",
+      "1",
+      "--durations",
+      "5",
+      "--modes",
+      "raw",
+      "--languages",
+      "en",
+      "--allow-synthetic",
+    ]).opts;
+    const record = { ...assistantRecord(), cold: true };
+    const parsed = parseJsonl(assistantText([record]));
+    expect(parsed.errors).toEqual([]);
+    const summary = summarize(parsed.records, opts, parsed.ends);
+    expect(summary.workloads[0].available).toBe(0);
+    expect(summary.cold.count).toBe(0);
+    expect(summary.unbucketed).toBe(0);
+    expect(summary.problems).toContain(
+      "en raw 5s: 0 warm sample(s) after 0 warmup, need 1",
+    );
+  });
+  test("selection groups and outcome counts preserve refused and failed results", () => {
+    const records = [0, 100, 2000, 20000, 20001].map(
+      (selection_scalars, i) => ({
+        ...assistantRecord(i + 1),
+        selection_scalars,
+        outcome: i === 0 ? "commit_refused" : "committed",
+      }),
+    );
+    const parsed = parseJsonl(assistantText(records));
+    expect(parsed.errors).toEqual([]);
+    const opts = parseArgs([
+      "--input",
+      "unused",
+      "--samples",
+      "1",
+      "--allow-synthetic",
+    ]).opts;
+    const summary = summarize(parsed.records, opts, parsed.ends);
+    expect(summary.assistant.groups.map((g) => g.bucket)).toEqual([
+      "empty",
+      "<=100",
+      "<=2000",
+      "<=20000",
+      ">20000",
+    ]);
+    expect(summary.assistant.outcomes.commit_refused).toBe(1);
+    expect(summary.assistant.outcomes.committed).toBe(4);
+    expect(summary.assistant.groups[0].total).toBeNull();
+  });
+  test("new optional fields and commit stage remain strictly validated", () => {
+    expect(validateRecord({ ...assistantRecord(), capture_us: -1 })).toContain(
+      "capture_us",
+    );
+    expect(
+      validateRecord({ ...assistantRecord(), selection_scalars: 0.5 }),
+    ).toContain("selection_scalars");
+    expect(
+      validateRecord({ ...assistantRecord(), stages: { commit_us: -1 } }),
+    ).toContain("commit_us");
+    const result = summarizeText(
+      baselineText + assistantText([{ ...assistantRecord(), paste_calls: 2 }]),
+    );
+    expect(result.code).toBe(1);
+    expect(result.output).toContain("duplicate_paste");
+  });
+});
 
 const FIXTURE = join(
   import.meta.dir,

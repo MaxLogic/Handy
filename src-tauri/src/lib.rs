@@ -1,6 +1,7 @@
 mod actions;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod apple_intelligence;
+mod assistant;
 mod audio_feedback;
 pub mod audio_toolkit;
 mod autostart;
@@ -642,6 +643,9 @@ pub fn run(cli_args: CliArgs) {
 
     let specta_builder = Builder::<tauri::Wry>::new()
         .commands(collect_commands![
+            commands::assistant::get_assistant_recovery_state,
+            commands::assistant::copy_assistant_recovery_text,
+            commands::assistant::dismiss_assistant_recovery_item,
             shortcut::change_binding,
             shortcut::reset_binding,
             shortcut::change_shortcut_activation_setting,
@@ -763,6 +767,8 @@ pub fn run(cli_args: CliArgs) {
             helpers::clamshell::is_laptop,
         ])
         .events(collect_events![
+            assistant::AssistantRecoveryUpdate,
+            assistant::AssistantErrorEvent,
             managers::history::HistoryUpdatePayload,
             managers::transcription::StreamTextEvent,
             managers::transcription::StreamPhaseEvent,
@@ -1001,6 +1007,7 @@ pub fn run(cli_args: CliArgs) {
             // honors the runtime `--debug` override applied to `settings` above.
             WEBVIEW_LOG_STREAMING.store(settings.debug_mode, Ordering::Relaxed);
             let app_handle = app.handle().clone();
+            app.manage(assistant::recovery::RecoveryStore::new(assistant::RECOVERY_CAPACITY));
             app.manage(TranscriptionCoordinator::new(app_handle.clone()));
 
             initialize_core_logic(&app_handle);
@@ -1112,15 +1119,18 @@ pub fn run(cli_args: CliArgs) {
             }
             show_main_window(app);
         }
-        // On exit, write the timing log's end marker and stop the selection
-        // worker (bounded at 2 s). There is no
+        // On exit, reject assistant intake, stop the selection worker (bounded
+        // at 2 s), await strict commit/abort settlement (bounded at 16 s), then
+        // close the timing log. There is no ASR
         // transcription teardown: transcribe.cpp runs only in the
         // worker process, which exits by itself as soon as this process's end
         // of its stdin closes, even if it is hung. Waiting on an unload here
         // could block quitting behind a hung model load.
         tauri::RunEvent::Exit => {
-            dictation_timing::finish_session();
+            assistant::begin_shutdown();
             selection::shutdown();
+            assistant::await_commits(assistant::EXIT_COMMIT_WAIT);
+            dictation_timing::finish_session();
         }
         _ => {}
     });
@@ -1138,5 +1148,70 @@ mod headless_guard_tests {
     #[test]
     fn converts_worker_panics_to_runtime_failures() {
         assert_eq!(run_headless_guarded(|| panic!("simulated failure")), 1);
+    }
+}
+
+#[cfg(test)]
+mod bindings_export_tests {
+    fn assistant_types() -> specta::TypeCollection {
+        let mut types = specta::TypeCollection::default();
+        types
+            .register::<super::assistant::AssistantRecoveryState>()
+            .register::<super::assistant::AssistantRecoveryUpdate>()
+            .register::<super::assistant::AssistantErrorEvent>()
+            .register::<super::assistant::RecoveryPart>();
+        types
+    }
+    #[test]
+    fn assistant_binding_type_declarations_match_real_specta_export() {
+        let expected = super::Typescript::default()
+            .bigint(super::BigIntExportBehavior::Number)
+            .export(&assistant_types())
+            .expect("export assistant types");
+        let bindings = include_str!("../../src/bindings.ts");
+        let canonical = |text: &str| {
+            text.chars()
+                .filter(|c| !c.is_whitespace() && *c != ';')
+                .collect::<String>()
+        };
+        let mut compared = 0;
+        for declaration in expected
+            .split("\n\n")
+            .filter(|s| s.starts_with("export type "))
+        {
+            let (name, body) = declaration
+                .strip_prefix("export type ")
+                .unwrap()
+                .split_once('=')
+                .unwrap();
+            let prefix = format!("export type {} =", name.trim());
+            let actual = bindings
+                .split_once(&prefix)
+                .expect("frontend type present")
+                .1
+                .split("\n\n")
+                .next()
+                .unwrap();
+            assert_eq!(
+                canonical(actual),
+                canonical(body),
+                "{} must match specta rc.18 optionality and shape",
+                name.trim()
+            );
+            compared += 1;
+        }
+        assert_eq!(compared, 8, "all public assistant types were compared");
+    }
+    #[test]
+    #[ignore = "Explicitly exports assistant API types without starting the application"]
+    fn export_typescript_bindings() {
+        super::Typescript::default()
+            .bigint(super::BigIntExportBehavior::Number)
+            .export_to(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../.agents/slices/HANDY-005/assistant-types.ts"),
+                &assistant_types(),
+            )
+            .expect("export assistant TypeScript types");
     }
 }

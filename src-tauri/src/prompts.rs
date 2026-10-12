@@ -139,8 +139,6 @@ pub struct AssistantRequest {
 }
 
 impl AssistantRequest {
-    // Called by the assistant coordinator in HANDY-005.
-    #[allow(dead_code)]
     pub fn from_settings(settings: &AppSettings) -> Result<Self, LlmError> {
         let target = LlmTarget::from_settings(settings)?;
         if target.provider.id == APPLE_INTELLIGENCE_PROVIDER_ID {
@@ -365,8 +363,6 @@ pub async fn cleanup(req: &CleanupRequest, transcript: &str) -> Result<String, L
     )
 }
 
-// Entry point for HANDY-005; this slice only wires the existing cleanup action.
-#[allow(dead_code)]
 pub async fn assist(
     req: &AssistantRequest,
     instruction: &str,

@@ -82,7 +82,8 @@ pub async fn retry_history_entry_transcription(
     } else {
         WorkflowMode::Raw
     };
-    let session = DictationSession::snapshot(mode, &crate::settings::get_settings(&app));
+    let session = DictationSession::snapshot(mode, &crate::settings::get_settings(&app))
+        .ok_or("assistant sessions cannot be retried")?;
 
     let audio_path = history_manager.get_audio_file_path(&entry.file_name);
     let samples = crate::audio_toolkit::read_wav_samples(&audio_path)

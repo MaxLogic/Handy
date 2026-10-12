@@ -2,6 +2,7 @@ use crate::actions::{DictationSession, TranscribeAction, WorkflowMode};
 use crate::managers::audio::AudioRecordingManager;
 use crate::settings::{get_settings, ShortcutActivation};
 use log::{debug, error, warn};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -123,6 +124,7 @@ fn classify_busy_input(
 #[derive(Debug, PartialEq, Eq)]
 enum Stage {
     Idle,
+    Capturing(String),
     Recording(String), // binding_id
     Processing,
 }
@@ -157,6 +159,20 @@ impl InputEvent {
 /// production transitions without a Tauri `AppHandle` or real timers.
 #[derive(Debug, PartialEq, Eq)]
 enum Effect {
+    BeginCapture {
+        binding_id: String,
+        hotkey_string: String,
+        session: u64,
+    },
+    CancelCapture {
+        session: u64,
+    },
+    StartAssistant {
+        binding_id: String,
+        hotkey_string: String,
+        session: u64,
+    },
+    RejectAssistant,
     Start {
         binding_id: String,
         hotkey_string: String,
@@ -170,8 +186,28 @@ enum Effect {
 /// Commands processed sequentially by the coordinator thread.
 enum Command {
     Input(InputEvent),
-    Cancel { recording_was_active: bool },
+    Cancel,
     ProcessingFinished,
+    CaptureDone {
+        session: u64,
+        result: Result<crate::selection::Captured, crate::selection::CaptureError>,
+    },
+}
+
+/// Explicit cancels shared by callers and the coordinator's admission decisions.
+#[derive(Clone, Default)]
+struct CancelRequests(Arc<AtomicU64>);
+
+impl CancelRequests {
+    /// The only constructor of Command::Cancel. Publish before enqueueing.
+    fn request(&self, tx: &Sender<Command>) -> bool {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        if tx.send(Command::Cancel).is_ok() {
+            return true;
+        }
+        self.0.fetch_sub(1, Ordering::SeqCst);
+        false
+    }
 }
 
 /// Decide whether a key-up should be deferred (so auto-repeat can cancel it)
@@ -216,6 +252,20 @@ fn classify_ptt_event(
 /// * toggle — releases are ignored, the next press stops (locked from the start)
 /// * hold-or-toggle — a release after a long hold stops; a release after a
 ///   short tap locks the session, and the next press stops
+struct PendingCapture {
+    binding_id: String,
+    hotkey_string: String,
+    session: u64,
+    pressed_at: Instant,
+    locked: bool,
+}
+#[derive(Debug, PartialEq, Eq)]
+enum CaptureResolution {
+    Start(Effect),
+    Failed,
+    Discard,
+}
+
 struct CoordinatorState {
     stage: Stage,
     hold: Option<Hold>,
@@ -223,6 +273,11 @@ struct CoordinatorState {
     pending_release: Option<PendingRelease>,
     pending_press: Option<PendingPress>,
     session: Option<DictationSession>,
+    capture: Option<PendingCapture>,
+    next_assistant_session: u64,
+    assistant_rejected_held: bool,
+    cancels: CancelRequests,
+    cancels_handled: u64,
 }
 
 impl CoordinatorState {
@@ -234,7 +289,16 @@ impl CoordinatorState {
             pending_release: None,
             pending_press: None,
             session: None,
+            capture: None,
+            next_assistant_session: 1,
+            assistant_rejected_held: false,
+            cancels: CancelRequests::default(),
+            cancels_handled: 0,
         }
+    }
+
+    fn cancel_queued(&self) -> bool {
+        self.cancels.0.load(Ordering::SeqCst) > self.cancels_handled
     }
 
     /// Deadline of the deferred release, if any — drives `recv_timeout`.
@@ -247,15 +311,24 @@ impl CoordinatorState {
     fn is_locked(&self) -> bool {
         self.hold.as_ref().is_some_and(|h| h.locked)
             || self.pending_press.as_ref().is_some_and(|p| p.locked)
+            || self.capture.as_ref().is_some_and(|p| p.locked)
     }
 
     fn on_input(&mut self, input: InputEvent, now: Instant) -> Option<Effect> {
+        let assistant =
+            WorkflowMode::from_binding_id(&input.binding_id) == Some(WorkflowMode::Assistant);
+        if assistant && self.assistant_rejected_held {
+            if !input.is_pressed {
+                self.assistant_rejected_held = false;
+            }
+            return None;
+        }
         let pending_release_binding = self
             .pending_release
             .as_ref()
             .map(|pending| pending.binding_id.as_str());
         let held_binding = match &self.stage {
-            Stage::Recording(id) => Some(id.as_str()),
+            Stage::Capturing(id) | Stage::Recording(id) => Some(id.as_str()),
             Stage::Processing => self.pending_press.as_ref().map(|p| p.binding_id.as_str()),
             Stage::Idle => None,
         };
@@ -298,6 +371,36 @@ impl CoordinatorState {
                 return None;
             }
             self.last_press = Some(now);
+        }
+
+        if assistant
+            && input.is_pressed
+            && (matches!(self.stage, Stage::Processing)
+                || matches!(&self.stage, Stage::Recording(id) if id != &input.binding_id))
+        {
+            self.assistant_rejected_held = true;
+            return Some(Effect::RejectAssistant);
+        }
+        if let Stage::Capturing(id) = &self.stage {
+            if id != &input.binding_id {
+                return None;
+            }
+            if input.is_pressed {
+                if self.is_locked() || input.mode == ShortcutActivation::Toggle {
+                    return self.cancel_capture();
+                }
+            } else if hold_to_talk {
+                let threshold = input.effective_hold_threshold();
+                let release = PendingRelease {
+                    binding_id: input.binding_id,
+                    hotkey_string: input.hotkey_string,
+                    deadline: now,
+                    released_at: now,
+                    hold_threshold: threshold,
+                };
+                return self.finish_capture_hold(&release);
+            }
+            return None;
         }
 
         // A busy pipeline can't accept lifecycle changes now: classify the
@@ -346,6 +449,27 @@ impl CoordinatorState {
         if input.is_pressed {
             match &self.stage {
                 Stage::Idle => {
+                    if self.cancel_queued() {
+                        debug!("Vetoing admission: cancellation outstanding");
+                        return None;
+                    }
+                    if assistant {
+                        let session = self.next_assistant_session;
+                        self.next_assistant_session += 1;
+                        self.stage = Stage::Capturing(input.binding_id.clone());
+                        self.capture = Some(PendingCapture {
+                            binding_id: input.binding_id.clone(),
+                            hotkey_string: input.hotkey_string.clone(),
+                            session,
+                            pressed_at: now,
+                            locked: input.mode == ShortcutActivation::Toggle,
+                        });
+                        return Some(Effect::BeginCapture {
+                            binding_id: input.binding_id,
+                            hotkey_string: input.hotkey_string,
+                            session,
+                        });
+                    }
                     // Toggle never ends on a release: locked from the start.
                     let locked = input.mode == ShortcutActivation::Toggle;
                     return Some(self.begin_recording(
@@ -389,6 +513,7 @@ impl CoordinatorState {
     fn on_grace_expired(&mut self) -> Option<Effect> {
         let pending = self.pending_release.take()?;
         match &self.stage {
+            Stage::Capturing(id) if *id == pending.binding_id => self.finish_capture_hold(&pending),
             Stage::Recording(id) if *id == pending.binding_id => self.finish_hold(
                 pending.binding_id,
                 pending.hotkey_string,
@@ -460,7 +585,74 @@ impl CoordinatorState {
         None
     }
 
-    fn on_cancel(&mut self, recording_was_active: bool) {
+    fn cancel_capture(&mut self) -> Option<Effect> {
+        let capture = self.capture.take()?;
+        self.stage = Stage::Idle;
+        self.pending_release = None;
+        Some(Effect::CancelCapture {
+            session: capture.session,
+        })
+    }
+    fn finish_capture_hold(&mut self, release: &PendingRelease) -> Option<Effect> {
+        let capture = self
+            .capture
+            .as_mut()
+            .filter(|p| p.binding_id == release.binding_id)?;
+        if release
+            .released_at
+            .saturating_duration_since(capture.pressed_at)
+            >= release.hold_threshold
+        {
+            self.cancel_capture()
+        } else {
+            capture.locked = true;
+            None
+        }
+    }
+    fn on_capture_rejected(&mut self, session: u64) {
+        if self.capture.as_ref().is_some_and(|p| p.session == session) {
+            self.cancel_capture();
+        }
+    }
+    fn on_capture_done(&mut self, session: u64, ok: bool) -> CaptureResolution {
+        if !matches!(self.stage, Stage::Capturing(_))
+            || !self.capture.as_ref().is_some_and(|p| p.session == session)
+        {
+            return CaptureResolution::Discard;
+        }
+        if !ok {
+            self.cancel_capture();
+            return CaptureResolution::Failed;
+        }
+        if self.cancel_queued() {
+            self.cancel_capture();
+            return CaptureResolution::Discard;
+        }
+        if let Some(release) = self.pending_release.take() {
+            if self.finish_capture_hold(&release).is_some() {
+                return CaptureResolution::Discard;
+            }
+        }
+        let Some(capture) = self.capture.take() else {
+            return CaptureResolution::Discard;
+        };
+        self.stage = Stage::Recording(capture.binding_id.clone());
+        self.hold = Some(Hold {
+            pressed_at: capture.pressed_at,
+            locked: capture.locked,
+        });
+        CaptureResolution::Start(Effect::StartAssistant {
+            binding_id: capture.binding_id,
+            hotkey_string: capture.hotkey_string,
+            session,
+        })
+    }
+    fn on_cancel(&mut self, recording_was_active: bool) -> Option<Effect> {
+        if self.cancel_queued() {
+            self.cancels_handled += 1;
+        }
+        self.assistant_rejected_held = false;
+        let effect = self.cancel_capture();
         self.session = None;
         self.pending_release = None;
         // An explicit cancel abandons any remembered start too — the user
@@ -473,12 +665,16 @@ impl CoordinatorState {
             self.stage = Stage::Idle;
             self.hold = None;
         }
+        effect
     }
 
     fn on_processing_finished(&mut self) -> Option<Effect> {
         self.session = None;
         self.stage = Stage::Idle;
         self.hold = None;
+        if self.cancel_queued() {
+            self.pending_press = None;
+        }
         let pending = self.pending_press.take()?;
         debug!(
             "Pipeline drained; starting remembered press for '{}'",
@@ -539,15 +735,23 @@ impl CoordinatorState {
 /// returned [`Effect`]s.
 pub struct TranscriptionCoordinator {
     tx: Sender<Command>,
+    cancels: CancelRequests,
 }
 
 impl TranscriptionCoordinator {
     pub fn new(app: AppHandle) -> Self {
         let (tx, rx) = mpsc::channel();
 
+        let executor_tx = tx.clone();
+        let mut state = CoordinatorState::new();
+        let cancels = state.cancels.clone();
         thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut state = CoordinatorState::new();
+                let mut executor = Executor {
+                    app,
+                    tx: executor_tx,
+                    intake: None,
+                };
 
                 loop {
                     let cmd = if let Some(deadline) = state.grace_deadline() {
@@ -555,7 +759,7 @@ impl TranscriptionCoordinator {
                             Ok(cmd) => cmd,
                             Err(mpsc::RecvTimeoutError::Timeout) => {
                                 if let Some(effect) = state.on_grace_expired() {
-                                    run_effect(&app, &mut state, effect);
+                                    run_effect(&mut executor, &mut state, effect);
                                 }
                                 continue;
                             }
@@ -568,21 +772,7 @@ impl TranscriptionCoordinator {
                         }
                     };
 
-                    match cmd {
-                        Command::Input(input) => {
-                            if let Some(effect) = state.on_input(input, Instant::now()) {
-                                run_effect(&app, &mut state, effect);
-                            }
-                        }
-                        Command::Cancel {
-                            recording_was_active,
-                        } => state.on_cancel(recording_was_active),
-                        Command::ProcessingFinished => {
-                            if let Some(effect) = state.on_processing_finished() {
-                                run_effect(&app, &mut state, effect);
-                            }
-                        }
-                    }
+                    handle_command(&mut executor, &mut state, cmd, &mut run_effect);
                 }
                 debug!("Transcription coordinator exited");
             }));
@@ -591,7 +781,7 @@ impl TranscriptionCoordinator {
             }
         });
 
-        Self { tx }
+        Self { tx, cancels }
     }
 
     /// Send a keyboard input event for a transcribe binding. `hold_threshold`
@@ -652,16 +842,12 @@ impl TranscriptionCoordinator {
         }
     }
 
-    pub fn notify_cancel(&self, recording_was_active: bool) {
-        if self
-            .tx
-            .send(Command::Cancel {
-                recording_was_active,
-            })
-            .is_err()
-        {
+    pub(crate) fn request_cancel(&self) -> bool {
+        let queued = self.cancels.request(&self.tx);
+        if !queued {
             warn!("Transcription coordinator channel closed");
         }
+        queued
     }
 
     pub fn notify_processing_finished(&self) {
@@ -671,8 +857,185 @@ impl TranscriptionCoordinator {
     }
 }
 
-fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
+struct Intake {
+    session: u64,
+    ticket: crate::selection::CaptureTicket,
+    admission: crate::assistant::Admission,
+    cancel_arm: crate::assistant::CancelArm,
+    started: Instant,
+}
+struct Executor<C = AppHandle> {
+    app: C,
+    tx: Sender<Command>,
+    intake: Option<Intake>,
+}
+/// Native action/audio boundary, substituted by deterministic runtime tests.
+trait RecordingStartContext {
+    fn start_action(&self, binding_id: &str, settings: &crate::settings::AppSettings);
+    fn is_recording(&self) -> bool;
+    fn cancel_operation(&self) -> bool;
+    fn capture_error(&self, error: crate::assistant::AssistantError);
+}
+impl RecordingStartContext for AppHandle {
+    fn start_action(&self, binding_id: &str, settings: &crate::settings::AppSettings) {
+        TranscribeAction::start(self, binding_id, settings);
+    }
+    fn is_recording(&self) -> bool {
+        self.try_state::<Arc<AudioRecordingManager>>()
+            .is_some_and(|audio| audio.is_recording())
+    }
+    fn cancel_operation(&self) -> bool {
+        crate::utils::perform_cancellation(self)
+    }
+
+    fn capture_error(&self, error: crate::assistant::AssistantError) {
+        error.emit(self);
+    }
+}
+impl<C: RecordingStartContext> Executor<C> {
+    fn accept_intake(&mut self, intake: Intake) {
+        self.intake = Some(intake);
+    }
+
+    fn on_cancel(&mut self, state: &mut CoordinatorState) -> Option<Effect> {
+        let was = self.app.cancel_operation();
+        state.on_cancel(was)
+    }
+
+    fn cancel_capture(&mut self, session: u64) {
+        if self
+            .intake
+            .as_ref()
+            .is_some_and(|intake| intake.session == session)
+        {
+            if let Some(intake) = self.intake.take() {
+                intake.ticket.cancel();
+            }
+        }
+    }
+
+    fn capture_done(
+        &mut self,
+        state: &mut CoordinatorState,
+        session: u64,
+        result: Result<crate::selection::Captured, crate::selection::CaptureError>,
+    ) {
+        let resolution = state.on_capture_done(session, result.is_ok());
+        let matching = self
+            .intake
+            .as_ref()
+            .is_some_and(|intake| intake.session == session);
+        match resolution {
+            CaptureResolution::Start(Effect::StartAssistant {
+                binding_id,
+                hotkey_string: _,
+                session: _,
+            }) if matching => {
+                if let (Some(intake), Ok(captured)) = (self.intake.take(), result) {
+                    let assistant = crate::assistant::AssistantSession {
+                        id: crate::selection::SessionId(session),
+                        request: intake.admission.request,
+                        captured: captured.text,
+                        token: captured.token,
+                        reservation: intake.admission.reservation,
+                        clipboard_handling: intake.admission.clipboard_handling,
+                        capture: intake.started.elapsed(),
+                        cancel_arm: intake.cancel_arm,
+                    };
+                    let snapshot =
+                        DictationSession::assistant(&intake.admission.settings, assistant);
+                    let snapshot =
+                        start_session(&self.app, &binding_id, &intake.admission.settings, snapshot);
+                    state.on_start_result(&binding_id, snapshot);
+                }
+            }
+            CaptureResolution::Failed => {
+                if matching {
+                    self.intake = None;
+                }
+                if let Err(error) = result {
+                    if !matches!(
+                        error,
+                        crate::selection::CaptureError::Cancelled
+                            | crate::selection::CaptureError::ShuttingDown
+                    ) {
+                        self.app
+                            .capture_error(crate::assistant::AssistantError::new(
+                                crate::assistant::AssistantStage::Capture,
+                                error.code(),
+                            ));
+                    }
+                }
+            }
+            _ => {
+                if matching {
+                    self.intake = None;
+                }
+            }
+        }
+    }
+}
+fn handle_command<C: RecordingStartContext>(
+    executor: &mut Executor<C>,
+    state: &mut CoordinatorState,
+    cmd: Command,
+    run: &mut impl FnMut(&mut Executor<C>, &mut CoordinatorState, Effect),
+) {
+    let effect = match cmd {
+        Command::Input(input) => state.on_input(input, Instant::now()),
+        Command::Cancel => executor.on_cancel(state),
+        Command::CaptureDone { session, result } => {
+            executor.capture_done(state, session, result);
+            None
+        }
+        Command::ProcessingFinished => state.on_processing_finished(),
+    };
+    if let Some(effect) = effect {
+        run(executor, state, effect);
+    }
+}
+
+fn run_effect(executor: &mut Executor, state: &mut CoordinatorState, effect: Effect) {
+    let app = &executor.app;
     match effect {
+        Effect::BeginCapture {
+            binding_id: _,
+            hotkey_string: _,
+            session,
+        } => {
+            let settings = get_settings(app);
+            let store = app.state::<Arc<crate::assistant::recovery::RecoveryStore>>();
+            match crate::assistant::admit(crate::assistant::is_shutting_down(), &settings, &store) {
+                Err(error) => {
+                    state.on_capture_rejected(session);
+                    error.error().emit(app);
+                }
+                Ok(admission) => {
+                    let started = Instant::now();
+                    let cancel_arm = crate::assistant::CancelArm::arm(app);
+                    let tx = executor.tx.clone();
+                    let ticket = crate::selection::begin_capture(
+                        crate::selection::SessionId(session),
+                        move |result| {
+                            let _ = tx.send(Command::CaptureDone { session, result });
+                        },
+                    );
+                    executor.accept_intake(Intake {
+                        session,
+                        ticket,
+                        admission,
+                        cancel_arm,
+                        started,
+                    });
+                }
+            }
+        }
+        Effect::CancelCapture { session } => executor.cancel_capture(session),
+        Effect::RejectAssistant => {
+            crate::assistant::AssistantError::new(crate::assistant::AssistantStage::Intake, "busy")
+                .emit(app)
+        }
+        Effect::StartAssistant { .. } => unreachable!("capture completion owns assistant start"),
         Effect::Start {
             binding_id,
             hotkey_string,
@@ -704,11 +1067,17 @@ fn start(app: &AppHandle, binding_id: &str, _hotkey_string: &str) -> Option<Dict
         return None;
     };
     let settings = get_settings(app);
-    let session = DictationSession::snapshot(mode, &settings);
-    TranscribeAction::start(app, binding_id, &settings);
-    let recording = app
-        .try_state::<Arc<AudioRecordingManager>>()
-        .is_some_and(|a| a.is_recording());
+    let session = DictationSession::snapshot(mode, &settings)?;
+    start_session(app, binding_id, &settings, session)
+}
+fn start_session(
+    app: &impl RecordingStartContext,
+    binding_id: &str,
+    settings: &crate::settings::AppSettings,
+    session: DictationSession,
+) -> Option<DictationSession> {
+    app.start_action(binding_id, settings);
+    let recording = app.is_recording();
     if !recording {
         debug!("Start for '{binding_id}' did not begin recording; staying idle");
     }
@@ -716,8 +1085,1328 @@ fn start(app: &AppHandle, binding_id: &str, _hotkey_string: &str) -> Option<Dict
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    // CancelArm and shortcut ownership are process globals. Serialize only
+    // fixtures that exercise those globals, including the utils order tests.
+    pub(crate) static CANCEL_RUNTIME_TEST: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
+    #[derive(Default)]
+    struct Runtime {
+        mic: Option<u64>,
+        stream: Option<u64>,
+        stt: Option<u64>,
+        tray: &'static str,
+        overlay: bool,
+        unloads: usize,
+        starts: u64,
+        stream_cancels: Vec<u64>,
+        stt_kills: Vec<u64>,
+        calls: Vec<(thread::ThreadId, &'static str)>,
+        fallback: bool,
+    }
+
+    impl Runtime {
+        fn call(&mut self, edge: &'static str) {
+            self.calls.push((thread::current().id(), edge));
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeRuntime {
+        runtime: Arc<std::sync::Mutex<Runtime>>,
+        cancels: CancelRequests,
+        tx: Sender<Command>,
+        pause: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+    }
+
+    impl crate::shortcut::CancelShortcutContext for FakeRuntime {
+        fn register_cancel_fallback(&self) {
+            self.runtime.lock().unwrap().fallback = true;
+        }
+        fn unregister_cancel_fallback(&self) {
+            let mut r = self.runtime.lock().unwrap();
+            r.call("unregister");
+            r.fallback = false;
+        }
+        fn schedule_cancel_reconcile(&self) {}
+    }
+
+    impl crate::utils::CancellationContext for FakeRuntime {
+        fn cancel_audio(&self) -> bool {
+            let mut r = self.runtime.lock().unwrap();
+            r.call("audio");
+            r.mic.take().is_some()
+        }
+        fn cancel_transcription(&self) {
+            let mut r = self.runtime.lock().unwrap();
+            r.call("transcription");
+            if let Some(id) = r.stream.take() {
+                r.stream_cancels.push(id);
+            }
+            if let Some(id) = r.stt.take() {
+                r.stt_kills.push(id);
+            }
+        }
+        fn reset_after_cancel(&self) {
+            let mut r = self.runtime.lock().unwrap();
+            r.call("reset");
+            r.tray = "idle";
+            r.overlay = false;
+            r.unloads += 1;
+        }
+        fn request_cancel(&self) -> bool {
+            let queued = self.cancels.request(&self.tx);
+            if let Some((paused, resume)) = &self.pause {
+                paused.wait();
+                resume.wait();
+            }
+            queued
+        }
+    }
+
+    impl RecordingStartContext for FakeRuntime {
+        fn start_action(&self, _: &str, _: &crate::settings::AppSettings) {
+            let mut r = self.runtime.lock().unwrap();
+            r.starts += 1;
+            r.mic = Some(r.starts);
+            r.stream = r.mic;
+            r.tray = "recording";
+            r.overlay = true;
+        }
+        fn is_recording(&self) -> bool {
+            self.runtime.lock().unwrap().mic.is_some()
+        }
+        fn cancel_operation(&self) -> bool {
+            crate::utils::perform_cancellation(self)
+        }
+        fn capture_error(&self, _: crate::assistant::AssistantError) {
+            panic!("unexpected capture error")
+        }
+    }
+
+    struct Harness {
+        state: CoordinatorState,
+        executor: Executor<FakeRuntime>,
+        rx: mpsc::Receiver<Command>,
+        store: Arc<crate::assistant::recovery::RecoveryStore>,
+        effects: Vec<Effect>,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let state = CoordinatorState::new();
+            let (tx, rx) = mpsc::channel();
+            let app = FakeRuntime {
+                runtime: Arc::new(std::sync::Mutex::new(Runtime {
+                    tray: "idle",
+                    ..Runtime::default()
+                })),
+                cancels: state.cancels.clone(),
+                tx: tx.clone(),
+                pause: None,
+            };
+            Self {
+                state,
+                executor: Executor {
+                    app,
+                    tx,
+                    intake: None,
+                },
+                rx,
+                store: crate::assistant::recovery::RecoveryStore::new(8),
+                effects: Vec::new(),
+            }
+        }
+        fn drive(&mut self, cmd: Command) {
+            let store = self.store.clone();
+            let effects = &mut self.effects;
+            handle_command(
+                &mut self.executor,
+                &mut self.state,
+                cmd,
+                &mut |ex, state, effect| match effect {
+                    Effect::Start { binding_id, .. } => {
+                        let settings =
+                            crate::assistant::tests::configured_settings("http://127.0.0.1:1");
+                        let mode = WorkflowMode::from_binding_id(&binding_id).unwrap();
+                        let snapshot = DictationSession::snapshot(mode, &settings).unwrap();
+                        let snapshot = start_session(&ex.app, &binding_id, &settings, snapshot);
+                        state.on_start_result(&binding_id, snapshot);
+                    }
+                    Effect::BeginCapture { session, .. } => {
+                        let settings =
+                            crate::assistant::tests::configured_settings("http://127.0.0.1:1");
+                        ex.accept_intake(Intake {
+                            session,
+                            ticket: crate::selection::CaptureTicket::test_pending(),
+                            admission: crate::assistant::admit(false, &settings, &store)
+                                .ok()
+                                .unwrap(),
+                            cancel_arm: crate::assistant::CancelArm::arm(&ex.app),
+                            started: Instant::now(),
+                        });
+                    }
+                    Effect::CancelCapture { session } => ex.cancel_capture(session),
+                    other => effects.push(other),
+                },
+            );
+        }
+        fn request(&self) {
+            crate::utils::cancel_current_operation(&self.executor.app);
+        }
+        fn next(&mut self) {
+            let cmd = self.rx.try_recv().expect("queued command");
+            self.drive(cmd);
+        }
+        fn press(&mut self, mode: WorkflowMode) {
+            self.drive(Command::Input(workflow_input(mode)));
+        }
+        fn captured(
+            &self,
+        ) -> (
+            Command,
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<std::sync::atomic::AtomicBool>,
+        ) {
+            use crate::selection::{Captured, CapturedText, SessionId, TargetId, TargetToken};
+            use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
+            let session = self.state.capture.as_ref().unwrap().session;
+            let released = Arc::new(AtomicUsize::new(0));
+            let early = Arc::new(AtomicBool::new(false));
+            let r = released.clone();
+            let e = early.clone();
+            let runtime = self.executor.app.runtime.clone();
+            (
+                Command::CaptureDone {
+                    session,
+                    result: Ok(Captured {
+                        text: CapturedText::Empty,
+                        token: TargetToken::new(
+                            TargetId(session),
+                            SessionId(session),
+                            true,
+                            Arc::new(AtomicU8::new(0)),
+                            Arc::new(move |_| {
+                                e.store(runtime.lock().unwrap().mic.is_some(), Ordering::SeqCst);
+                                r.fetch_add(1, Ordering::SeqCst);
+                            }),
+                        ),
+                    }),
+                },
+                released,
+                early,
+            )
+        }
+        fn admit_assistant(
+            &mut self,
+        ) -> (
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<std::sync::atomic::AtomicBool>,
+        ) {
+            self.press(WorkflowMode::Assistant);
+            let (done, released, early) = self.captured();
+            self.drive(done);
+            assert_eq!(self.state.stage, Stage::Recording("assistant".into()));
+            assert!(self.state.session.is_some());
+            assert_eq!(released.load(Ordering::SeqCst), 0);
+            (released, early)
+        }
+        fn assert_idle(&self) {
+            assert_eq!(self.state.stage, Stage::Idle);
+            assert!(self.executor.intake.is_none());
+            assert!(self.state.session.is_none());
+            assert!(self.executor.app.runtime.lock().unwrap().mic.is_none());
+            assert_eq!(self.store.free_slots(), 8);
+            assert!(!crate::assistant::cancel_armed());
+            assert!(!self.executor.app.runtime.lock().unwrap().fallback);
+        }
+    }
+
+    #[test]
+    fn assistant_executor_uncancelled_admission_retains_recording_session() {
+        let _guard = CANCEL_RUNTIME_TEST.blocking_lock();
+        let mut h = Harness::new();
+        let (released, early) = h.admit_assistant();
+        assert_eq!(h.executor.app.runtime.lock().unwrap().starts, 1);
+        assert_eq!(h.store.free_slots(), 7);
+        h.request();
+        h.next();
+        h.assert_idle();
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert!(!early.load(Ordering::SeqCst));
+    }
+
+    fn delayed_caller(raw_successor: bool) {
+        let _guard = CANCEL_RUNTIME_TEST.blocking_lock();
+        let mut h = Harness::new();
+        let (released, early) = h.admit_assistant();
+        let paused = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let mut caller = h.executor.app.clone();
+        caller.pause = Some((paused.clone(), resume.clone()));
+        let t = thread::spawn(move || crate::utils::cancel_current_operation(&caller));
+        let caller_id = t.thread().id();
+        paused.wait();
+        struct ParkedCaller {
+            resume: Arc<std::sync::Barrier>,
+            thread: Option<thread::JoinHandle<()>>,
+        }
+        impl ParkedCaller {
+            fn release(&mut self) {
+                if let Some(t) = self.thread.take() {
+                    self.resume.wait();
+                    t.join().unwrap();
+                }
+            }
+        }
+        impl Drop for ParkedCaller {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+        let mut parked = ParkedCaller {
+            resume,
+            thread: Some(t),
+        };
+        // Save assertions until the parked caller can always be resumed and joined.
+        let before = h.executor.app.runtime.lock().unwrap().calls.clone();
+        h.next();
+        let teardown = {
+            let r = h.executor.app.runtime.lock().unwrap();
+            (r.stream_cancels.clone(), r.tray, r.overlay, r.unloads)
+        };
+        let was_idle =
+            h.state.stage == Stage::Idle && h.state.session.is_none() && h.store.free_slots() == 8;
+        let successor_release = if raw_successor {
+            h.press(WorkflowMode::Raw);
+            None
+        } else {
+            Some(h.admit_assistant().0)
+        };
+        {
+            let mut r = h.executor.app.runtime.lock().unwrap();
+            r.stt = r.mic;
+        }
+        parked.release();
+        assert!(
+            before.is_empty(),
+            "caller must enqueue without destructive edges"
+        );
+        assert_eq!(teardown, (vec![1], "idle", false, 1));
+        assert!(was_idle);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert!(
+            !early.load(Ordering::SeqCst),
+            "stop microphone before releasing A's target"
+        );
+        assert!(matches!(h.rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        let r = h.executor.app.runtime.lock().unwrap();
+        assert_eq!(r.mic, Some(2));
+        assert_eq!(r.stream, Some(2));
+        assert_eq!(r.stt, Some(2));
+        assert_eq!(r.stream_cancels, [1]);
+        assert!(r.stt_kills.is_empty());
+        assert_eq!(r.tray, "recording");
+        assert!(r.overlay);
+        assert_eq!(r.unloads, 1);
+        assert!(r.calls.iter().all(|(id, _)| *id != caller_id));
+        drop(r);
+        assert_eq!(
+            h.state.stage,
+            Stage::Recording(
+                if raw_successor {
+                    "transcribe"
+                } else {
+                    "assistant"
+                }
+                .into()
+            )
+        );
+        assert!(h.state.session.is_some());
+        if let Some(released) = successor_release {
+            assert_eq!(released.load(Ordering::SeqCst), 0);
+        }
+        h.request();
+        h.next();
+        h.assert_idle();
+    }
+
+    #[test]
+    fn delayed_cancel_caller_cannot_touch_successor_stream_or_stt() {
+        delayed_caller(false);
+    }
+    #[test]
+    fn delayed_cancel_caller_cannot_touch_raw_successor() {
+        delayed_caller(true);
+    }
+
+    #[test]
+    fn cancel_before_capture_done_never_opens_microphone() {
+        let _guard = CANCEL_RUNTIME_TEST.blocking_lock();
+        let mut h = Harness::new();
+        h.press(WorkflowMode::Assistant);
+        let (done, released, early) = h.captured();
+        h.request();
+        h.executor.tx.send(done).unwrap();
+        h.next();
+        h.next();
+        h.assert_idle();
+        assert_eq!(h.executor.app.runtime.lock().unwrap().starts, 0);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert!(!early.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn cancel_requested_while_capture_done_queued_vetoes_start() {
+        let _guard = CANCEL_RUNTIME_TEST.blocking_lock();
+        let mut h = Harness::new();
+        h.press(WorkflowMode::Assistant);
+        let (done, released, early) = h.captured();
+        h.executor.tx.send(done).unwrap();
+        h.request();
+        h.next();
+        h.assert_idle();
+        assert_eq!(h.executor.app.runtime.lock().unwrap().starts, 0);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert!(!early.load(Ordering::SeqCst));
+        h.next();
+        h.assert_idle();
+    }
+
+    #[test]
+    fn cancel_after_capture_start_stops_audio_before_target_release() {
+        let _guard = CANCEL_RUNTIME_TEST.blocking_lock();
+        let mut h = Harness::new();
+        let (released, early) = h.admit_assistant();
+        h.request();
+        assert!(h.executor.app.is_recording());
+        h.next();
+        h.assert_idle();
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert!(!early.load(Ordering::SeqCst));
+        let r = h.executor.app.runtime.lock().unwrap();
+        let edges: Vec<_> = r.calls.iter().map(|(_, edge)| *edge).collect();
+        assert_eq!(edges, ["audio", "transcription", "reset", "unregister"]);
+    }
+
+    #[test]
+    fn cancel_requested_before_drain_abandons_remembered_press() {
+        let _guard = CANCEL_RUNTIME_TEST.blocking_lock();
+        let mut h = Harness::new();
+        h.state.stage = Stage::Processing;
+        h.press(WorkflowMode::Raw);
+        assert!(h.state.pending_press.is_some());
+        h.executor.tx.send(Command::ProcessingFinished).unwrap();
+        h.request();
+        h.next();
+        assert_eq!(h.executor.app.runtime.lock().unwrap().starts, 0);
+        assert!(h.state.pending_press.is_none());
+        assert_eq!(h.state.stage, Stage::Idle);
+        h.next();
+        h.assert_idle();
+    }
+
+    #[test]
+    fn cancel_handled_after_remembered_start_stops_it() {
+        let _guard = CANCEL_RUNTIME_TEST.blocking_lock();
+        let mut h = Harness::new();
+        h.state.stage = Stage::Processing;
+        h.press(WorkflowMode::Raw);
+        h.drive(Command::ProcessingFinished);
+        assert!(h.executor.app.is_recording());
+        assert!(h.state.session.is_some());
+        h.request();
+        h.next();
+        h.assert_idle();
+        assert_eq!(h.executor.app.runtime.lock().unwrap().starts, 1);
+    }
+
+    #[test]
+    fn cancel_requested_after_press_queued_is_never_ignored() {
+        let _guard = CANCEL_RUNTIME_TEST.blocking_lock();
+        for workflow in [WorkflowMode::Assistant, WorkflowMode::Raw] {
+            for handled_first in [false, true] {
+                let mut h = Harness::new();
+                h.executor
+                    .tx
+                    .send(Command::Input(workflow_input(workflow)))
+                    .unwrap();
+                if handled_first {
+                    h.next();
+                }
+                h.request();
+                if !handled_first {
+                    h.next();
+                }
+                h.next();
+                h.assert_idle();
+                assert_eq!(
+                    h.executor.app.runtime.lock().unwrap().starts,
+                    u64::from(handled_first && workflow == WorkflowMode::Raw)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_burst_vetoes_admission_until_last_cancel_handled() {
+        let _guard = CANCEL_RUNTIME_TEST.blocking_lock();
+        let mut h = Harness::new();
+        h.request();
+        h.request();
+        h.next();
+        h.press(WorkflowMode::Raw);
+        h.assert_idle();
+        assert_eq!(h.executor.app.runtime.lock().unwrap().starts, 0);
+        h.next();
+        h.press(WorkflowMode::Raw);
+        assert_eq!(h.state.stage, Stage::Recording("transcribe".into()));
+        assert_eq!(h.executor.app.runtime.lock().unwrap().starts, 1);
+        h.request();
+        h.next();
+        h.assert_idle();
+    }
+
+    #[test]
+    fn cancel_during_processing_kills_only_current_stt() {
+        let _guard = CANCEL_RUNTIME_TEST.blocking_lock();
+        let mut h = Harness::new();
+        h.press(WorkflowMode::Raw);
+        h.state.stage = Stage::Processing;
+        {
+            let mut r = h.executor.app.runtime.lock().unwrap();
+            r.mic = None;
+            r.stream = None;
+            r.stt = Some(1);
+        }
+        h.request();
+        h.next();
+        assert_eq!(h.state.stage, Stage::Processing);
+        h.press(WorkflowMode::Raw);
+        h.drive(Command::ProcessingFinished);
+        {
+            let mut r = h.executor.app.runtime.lock().unwrap();
+            r.stt = Some(2);
+            assert_eq!(r.stt_kills, [1]);
+            assert_eq!(r.mic, Some(2));
+        }
+        assert!(matches!(h.rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert_eq!(h.executor.app.runtime.lock().unwrap().stt, Some(2));
+        h.request();
+        h.next();
+        h.assert_idle();
+    }
+
+    #[test]
+    fn cancel_queued_vetoes_idle_press_drain_start_and_capture_start() {
+        let (tx, rx) = mpsc::channel();
+        let mut state = CoordinatorState::new();
+        assert!(state.cancels.request(&tx));
+        assert!(state
+            .on_input(workflow_input(WorkflowMode::Raw), Instant::now())
+            .is_none());
+        assert!(state
+            .on_input(workflow_input(WorkflowMode::Assistant), Instant::now())
+            .is_none());
+        assert_eq!(state.stage, Stage::Idle);
+        state.on_cancel(false);
+        assert!(matches!(rx.try_recv(), Ok(Command::Cancel)));
+        state.stage = Stage::Processing;
+        state.on_input(workflow_input(WorkflowMode::Raw), Instant::now());
+        assert!(state.cancels.request(&tx));
+        assert!(state.on_processing_finished().is_none());
+        assert!(state.pending_press.is_none());
+        state.on_cancel(false);
+        assert!(matches!(rx.try_recv(), Ok(Command::Cancel)));
+        let session = capture(&mut state, ShortcutActivation::Toggle, Instant::now());
+        assert!(state.cancels.request(&tx));
+        assert_eq!(
+            state.on_capture_done(session, true),
+            CaptureResolution::Discard
+        );
+        assert_eq!(state.stage, Stage::Idle);
+        assert!(state.capture.is_none());
+        state.on_cancel(false);
+        state.on_cancel(false); // Unrequested direct calls cannot drift.
+        assert!(matches!(rx.try_recv(), Ok(Command::Cancel)));
+        assert!(state.cancels.request(&tx));
+        assert!(state.cancel_queued());
+    }
+
+    #[test]
+    fn closed_cancel_channel_rolls_back_request_for_inline_fallback() {
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        let state = CoordinatorState::new();
+        assert!(!state.cancels.request(&tx));
+        assert!(!state.cancel_queued());
+    }
+
+    #[derive(Clone)]
+    struct CancelTestContext {
+        cancels: CancelRequests,
+        tx: Sender<Command>,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        fallback: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        registrations: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    impl crate::shortcut::CancelShortcutContext for CancelTestContext {
+        fn register_cancel_fallback(&self) {
+            self.fallback
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn unregister_cancel_fallback(&self) {
+            self.fallback
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn schedule_cancel_reconcile(&self) {
+            self.registrations
+                .lock()
+                .unwrap()
+                .push(crate::shortcut::cancel_requested());
+        }
+    }
+    impl crate::utils::CancellationContext for CancelTestContext {
+        fn cancel_audio(&self) -> bool {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            false
+        }
+        fn cancel_transcription(&self) {}
+        fn reset_after_cancel(&self) {}
+        fn request_cancel(&self) -> bool {
+            self.cancels.request(&self.tx)
+        }
+    }
+
+    impl RecordingStartContext for CancelTestContext {
+        fn start_action(&self, _: &str, _: &crate::settings::AppSettings) {
+            panic!("unexpected start")
+        }
+        fn is_recording(&self) -> bool {
+            false
+        }
+        fn cancel_operation(&self) -> bool {
+            crate::utils::perform_cancellation(self)
+        }
+        fn capture_error(&self, _: crate::assistant::AssistantError) {
+            panic!("unexpected capture error")
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_cancel_during_blocked_commit_keeps_escape_until_ack_then_raw_owns_it() {
+        use crate::assistant::{
+            self, recovery::RecoveryStore, tests as fixtures, CancelArm, CommitTracker,
+            SessionOutcome,
+        };
+        use crate::llm_client::test_http::FakeServer;
+        use crate::selection::{CapturedText, ClipboardSettlement, CommitOutcome, RefuseReason};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
+
+        static TRACKER: CommitTracker = CommitTracker::new();
+        let server = FakeServer::new(vec![fixtures::successful_server_step("generated")]).await;
+        let store = RecoveryStore::new(8);
+        let (mut session, released) = fixtures::session(&server.url, CapturedText::Empty, &store);
+        let _guard = CANCEL_RUNTIME_TEST.lock().await;
+        let mut state = CoordinatorState::new();
+        let (tx, rx) = mpsc::channel();
+        let context = CancelTestContext {
+            cancels: state.cancels.clone(),
+            tx: tx.clone(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            fallback: Arc::new(AtomicBool::new(false)),
+            registrations: Arc::new(Mutex::new(Vec::new())),
+        };
+        state.stage = Stage::Processing;
+        session.cancel_arm = CancelArm::arm(&context);
+        let cancelled = Arc::clone(&context.cancelled);
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (acknowledge, wait) = std::sync::mpsc::channel();
+        let task = tokio::spawn(assistant::complete_session(
+            session,
+            "instruction",
+            Arc::new(move || cancelled.load(Ordering::SeqCst)),
+            move |request| {
+                entered.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!((request.is_cancelled)());
+                CommitOutcome::Refused {
+                    reason: RefuseReason::Cancelled,
+                    clipboard: ClipboardSettlement::Restored,
+                }
+            },
+            &TRACKER,
+        ));
+        ready.await.unwrap();
+
+        // Escape, CLI --cancel and tray all call this production entry point.
+        crate::utils::cancel_current_operation(&context);
+        assert!(
+            !context.cancelled.load(Ordering::SeqCst),
+            "request performs no caller-side teardown"
+        );
+        let mut executor = Executor {
+            app: context.clone(),
+            tx,
+            intake: None,
+        };
+        handle_command(
+            &mut executor,
+            &mut state,
+            rx.try_recv().unwrap(),
+            &mut |_, _, _| panic!("unexpected effect"),
+        );
+        assert!(context.cancelled.load(Ordering::SeqCst));
+        assert!(assistant::cancel_armed());
+        assert!(
+            crate::shortcut::cancel_requested(),
+            "Escape must stay owned while strict abort/settlement is blocked"
+        );
+        assert!(context.fallback.load(Ordering::SeqCst));
+        assert_eq!(*context.registrations.lock().unwrap(), [true]);
+        assert_eq!(state.stage, Stage::Processing);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        assert_eq!(store.free_slots(), 7);
+
+        // A fresh raw press after cancellation is remembered until acknowledgment.
+        assert!(state
+            .on_input(input(ShortcutActivation::Toggle, true), Instant::now())
+            .is_none());
+        acknowledge.send(()).unwrap();
+        assert!(matches!(
+            task.await.unwrap().outcome,
+            SessionOutcome::Discarded
+        ));
+        assert!(!assistant::cancel_armed());
+        assert!(!crate::shortcut::cancel_requested());
+        assert!(!context.fallback.load(Ordering::SeqCst));
+        assert_eq!(*context.registrations.lock().unwrap(), [true, false]);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert_eq!(store.free_slots(), 8);
+        assert!(store.items().is_empty());
+        assert!(
+            matches!(state.on_processing_finished(), Some(Effect::Start { binding_id, .. }) if binding_id == "transcribe")
+        );
+        crate::shortcut::register_cancel_shortcut(&context);
+        assert!(crate::shortcut::cancel_requested());
+        assert!(context.fallback.load(Ordering::SeqCst));
+        assert_eq!(*context.registrations.lock().unwrap(), [true, false, true]);
+        crate::shortcut::unregister_cancel_shortcut(&context);
+        assert_eq!(
+            *context.registrations.lock().unwrap(),
+            [true, false, true, false]
+        );
+    }
+
+    fn assistant_input(mode: ShortcutActivation, pressed: bool) -> InputEvent {
+        InputEvent {
+            binding_id: "assistant".into(),
+            hotkey_string: "test".into(),
+            is_pressed: pressed,
+            mode,
+            hold_threshold: Duration::from_millis(300),
+            external: false,
+        }
+    }
+    fn capture(state: &mut CoordinatorState, mode: ShortcutActivation, now: Instant) -> u64 {
+        let Some(Effect::BeginCapture { session, .. }) =
+            state.on_input(assistant_input(mode, true), now)
+        else {
+            panic!("capture expected")
+        };
+        session
+    }
+    #[test]
+    fn assistant_capture_success_starts_locked_toggle_recording() {
+        let mut state = CoordinatorState::new();
+        let id = capture(&mut state, ShortcutActivation::Toggle, Instant::now());
+        assert!(
+            matches!(state.on_capture_done(id, true), CaptureResolution::Start(Effect::StartAssistant { session, .. }) if session == id)
+        );
+        assert_eq!(state.stage, Stage::Recording("assistant".into()));
+        assert!(state.is_locked());
+    }
+    #[test]
+    fn assistant_capture_failure_returns_idle_without_start() {
+        let mut state = CoordinatorState::new();
+        let id = capture(&mut state, ShortcutActivation::Toggle, Instant::now());
+        assert_eq!(state.on_capture_done(id, false), CaptureResolution::Failed);
+        assert_eq!(state.stage, Stage::Idle);
+        assert!(state.capture.is_none());
+    }
+    #[test]
+    fn assistant_capture_rejected_by_admission_returns_idle() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        let id = capture(&mut state, ShortcutActivation::Toggle, now);
+        state.on_capture_rejected(id);
+        assert_eq!(state.stage, Stage::Idle);
+        assert!(matches!(
+            state.on_input(ptt_input(true), now + Duration::from_secs(1)),
+            Some(Effect::Start { .. })
+        ));
+    }
+    #[test]
+    fn stale_capture_result_is_discarded() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        let first = capture(&mut state, ShortcutActivation::Toggle, now);
+        assert_eq!(
+            state.on_cancel(false),
+            Some(Effect::CancelCapture { session: first })
+        );
+        let second = capture(
+            &mut state,
+            ShortcutActivation::Toggle,
+            now + Duration::from_secs(1),
+        );
+        assert_ne!(first, second);
+        assert_eq!(
+            state.on_capture_done(first, true),
+            CaptureResolution::Discard
+        );
+        assert_eq!(state.stage, Stage::Capturing("assistant".into()));
+        assert!(matches!(
+            state.on_capture_done(second, true),
+            CaptureResolution::Start(_)
+        ));
+    }
+    #[test]
+    fn ptt_release_during_capture_cancels_pending_session() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        let id = capture(&mut state, ShortcutActivation::PushToTalk, now);
+        assert!(state
+            .on_input(
+                assistant_input(ShortcutActivation::PushToTalk, false),
+                now + Duration::from_millis(40)
+            )
+            .is_none());
+        assert_eq!(
+            state.on_grace_expired(),
+            Some(Effect::CancelCapture { session: id })
+        );
+        assert_eq!(state.on_capture_done(id, true), CaptureResolution::Discard);
+        assert_eq!(state.stage, Stage::Idle);
+    }
+    #[test]
+    fn ptt_release_in_grace_when_capture_completes_discards() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        let id = capture(&mut state, ShortcutActivation::PushToTalk, now);
+        state.on_input(
+            assistant_input(ShortcutActivation::PushToTalk, false),
+            now + Duration::from_millis(20),
+        );
+        assert_eq!(state.on_capture_done(id, true), CaptureResolution::Discard);
+        assert_eq!(state.stage, Stage::Idle);
+        assert!(state.grace_deadline().is_none());
+    }
+    #[test]
+    fn hold_or_toggle_tap_during_capture_starts_locked() {
+        for grace_elapsed in [false, true] {
+            let mut state = CoordinatorState::new();
+            let now = Instant::now();
+            let id = capture(&mut state, ShortcutActivation::HoldOrToggle, now);
+            state.on_input(
+                assistant_input(ShortcutActivation::HoldOrToggle, false),
+                now + Duration::from_millis(100),
+            );
+            if grace_elapsed {
+                assert!(state.on_grace_expired().is_none());
+            }
+            assert!(matches!(
+                state.on_capture_done(id, true),
+                CaptureResolution::Start(_)
+            ));
+            assert!(state.is_locked());
+            assert!(matches!(
+                state.on_input(
+                    assistant_input(ShortcutActivation::HoldOrToggle, true),
+                    now + Duration::from_secs(1)
+                ),
+                Some(Effect::Stop { .. })
+            ));
+        }
+    }
+    #[test]
+    fn hold_or_toggle_long_hold_released_during_capture_cancels() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        let id = capture(&mut state, ShortcutActivation::HoldOrToggle, now);
+        state.on_input(
+            assistant_input(ShortcutActivation::HoldOrToggle, false),
+            now + Duration::from_millis(300),
+        );
+        assert_eq!(
+            state.on_grace_expired(),
+            Some(Effect::CancelCapture { session: id })
+        );
+        assert_eq!(state.on_capture_done(id, true), CaptureResolution::Discard);
+    }
+    #[test]
+    fn toggle_second_press_during_capture_cancels() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        let id = capture(&mut state, ShortcutActivation::Toggle, now);
+        assert_eq!(
+            state.on_input(
+                assistant_input(ShortcutActivation::Toggle, true),
+                now + Duration::from_millis(100)
+            ),
+            Some(Effect::CancelCapture { session: id })
+        );
+        assert_eq!(state.stage, Stage::Idle);
+    }
+    #[test]
+    fn cancel_during_capture_emits_cancel_capture() {
+        let mut state = CoordinatorState::new();
+        let id = capture(&mut state, ShortcutActivation::PushToTalk, Instant::now());
+        assert_eq!(
+            state.on_cancel(false),
+            Some(Effect::CancelCapture { session: id })
+        );
+        assert_eq!(state.on_cancel(false), None);
+        assert_eq!(state.stage, Stage::Idle);
+    }
+    #[test]
+    fn assistant_press_while_busy_is_rejected_not_remembered() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        drive_into_processing(&mut state, now);
+        state.on_input(toggle_input(true), now + Duration::from_millis(200));
+        assert_eq!(
+            state.on_input(
+                assistant_input(ShortcutActivation::Toggle, true),
+                now + Duration::from_millis(300)
+            ),
+            Some(Effect::RejectAssistant)
+        );
+        assert_eq!(state.pending_press.as_ref().unwrap().binding_id, BINDING);
+        assert!(
+            matches!(state.on_processing_finished(), Some(Effect::Start { binding_id, .. }) if binding_id == BINDING)
+        );
+    }
+    #[test]
+    fn assistant_press_while_raw_recording_is_rejected() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        state.on_input(ptt_input(true), now);
+        assert_eq!(
+            state.on_input(
+                assistant_input(ShortcutActivation::Toggle, true),
+                now + Duration::from_millis(100)
+            ),
+            Some(Effect::RejectAssistant)
+        );
+        assert_eq!(state.stage, Stage::Recording(BINDING.into()));
+        assert!(state.pending_press.is_none());
+    }
+    #[test]
+    fn rejected_assistant_release_and_repeat_are_consumed_after_drain() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        drive_into_processing(&mut state, now);
+        assert_eq!(
+            state.on_input(
+                assistant_input(ShortcutActivation::PushToTalk, true),
+                now + Duration::from_millis(100)
+            ),
+            Some(Effect::RejectAssistant)
+        );
+        assert!(state.on_processing_finished().is_none());
+        assert!(state
+            .on_input(
+                assistant_input(ShortcutActivation::PushToTalk, true),
+                now + Duration::from_millis(200)
+            )
+            .is_none());
+        assert!(state
+            .on_input(
+                assistant_input(ShortcutActivation::PushToTalk, false),
+                now + Duration::from_millis(300)
+            )
+            .is_none());
+        assert!(matches!(
+            state.on_input(
+                assistant_input(ShortcutActivation::PushToTalk, true),
+                now + Duration::from_millis(400)
+            ),
+            Some(Effect::BeginCapture { .. })
+        ));
+    }
+    #[test]
+    fn raw_press_during_assistant_processing_is_remembered_until_drain() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        let id = capture(&mut state, ShortcutActivation::Toggle, now);
+        state.on_capture_done(id, true);
+        assert!(matches!(
+            state.on_input(
+                assistant_input(ShortcutActivation::Toggle, true),
+                now + Duration::from_secs(1)
+            ),
+            Some(Effect::Stop { .. })
+        ));
+        assert!(state
+            .on_input(ptt_input(true), now + Duration::from_secs(2))
+            .is_none());
+        assert_eq!(state.stage, Stage::Processing);
+        assert!(
+            matches!(state.on_processing_finished(), Some(Effect::Start { binding_id, .. }) if binding_id == BINDING)
+        );
+    }
+    #[test]
+    fn full_recovery_rejects_assistant_but_not_raw() {
+        let store = crate::assistant::recovery::RecoveryStore::new(8);
+        let slots: Vec<_> = (0..8).map(|_| store.reserve().unwrap()).collect();
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        let id = capture(&mut state, ShortcutActivation::Toggle, now);
+        assert!(matches!(
+            crate::assistant::admit(
+                false,
+                &crate::assistant::tests::configured_settings("http://unused.invalid"),
+                &store
+            ),
+            Err(crate::assistant::IntakeRejection::RecoveryFull)
+        ));
+        state.on_capture_rejected(id);
+        assert!(matches!(
+            state.on_input(ptt_input(true), now + Duration::from_secs(1)),
+            Some(Effect::Start { .. })
+        ));
+        drop(slots);
+    }
+    #[test]
+    fn raw_and_cleanup_inputs_during_capture_are_ignored() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        let id = capture(&mut state, ShortcutActivation::Toggle, now);
+        for (n, workflow) in [WorkflowMode::Raw, WorkflowMode::Cleanup]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(state
+                .on_input(
+                    workflow_input(workflow),
+                    now + Duration::from_millis(100 + n as u64 * 100)
+                )
+                .is_none());
+        }
+        assert_eq!(state.capture.as_ref().unwrap().session, id);
+        assert!(state.pending_press.is_none());
+    }
+
+    async fn coordinator_assistant_case(
+        text: crate::selection::CapturedText,
+        step: Step,
+        outcome: crate::selection::CommitOutcome,
+        expected_calls: u32,
+    ) {
+        static TRACKER: crate::assistant::CommitTracker = crate::assistant::CommitTracker::new();
+        let server = FakeServer::new(vec![step]).await;
+        let store = crate::assistant::recovery::RecoveryStore::new(8);
+        let settings = crate::assistant::tests::configured_settings(&server.url);
+        let (session, released) = crate::assistant::tests::session(&server.url, text, &store);
+        let mut state = CoordinatorState::new();
+        state.next_assistant_session = session.id.0;
+        let now = Instant::now();
+        let id = capture(&mut state, ShortcutActivation::Toggle, now);
+        let (tx, _) = mpsc::channel();
+        let mut executor = Executor {
+            app: FakeRuntime {
+                runtime: Arc::new(std::sync::Mutex::new(Runtime::default())),
+                cancels: state.cancels.clone(),
+                tx: tx.clone(),
+                pause: None,
+            },
+            tx,
+            intake: None,
+        };
+        executor.accept_intake(Intake {
+            session: id,
+            ticket: crate::selection::CaptureTicket::test_pending(),
+            admission: crate::assistant::Admission {
+                request: session.request,
+                reservation: session.reservation,
+                clipboard_handling: session.clipboard_handling,
+                settings,
+            },
+            cancel_arm: session.cancel_arm,
+            started: now,
+        });
+        executor.capture_done(
+            &mut state,
+            id,
+            Ok(crate::selection::Captured {
+                text: session.captured,
+                token: session.token,
+            }),
+        );
+        assert!(
+            executor.app.is_recording(),
+            "Executor must start instruction audio before the pipeline"
+        );
+        assert_eq!(executor.app.runtime.lock().unwrap().starts, 1);
+        assert_eq!(released.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(
+            state.on_input(
+                assistant_input(ShortcutActivation::Toggle, true),
+                now + Duration::from_secs(1)
+            ),
+            Some(Effect::Stop { .. })
+        ));
+        // Simulate the audio/STT boundary after the real coordinator stop edge.
+        executor.app.runtime.lock().unwrap().mic = None;
+        let session = state
+            .session
+            .take()
+            .unwrap()
+            .into_assistant()
+            .unwrap_or_else(|_| panic!());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let report = crate::assistant::complete_session(
+            session,
+            "spoken instruction",
+            crate::assistant::tests::never_cancel(),
+            move |req| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(req.replacement, "generated");
+                assert_ne!(req.replacement, "spoken instruction");
+                outcome
+            },
+            &TRACKER,
+        )
+        .await;
+        assert_eq!(state.stage, Stage::Processing);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            expected_calls as usize
+        );
+        assert_eq!(report.commit_calls, expected_calls);
+        assert_eq!(released.load(std::sync::atomic::Ordering::SeqCst), 1);
+        if expected_calls == 0 {
+            assert!(matches!(
+                report.outcome,
+                crate::assistant::SessionOutcome::Failed(_)
+            ));
+            assert_eq!(store.free_slots(), 8);
+        }
+        if matches!(
+            report.outcome,
+            crate::assistant::SessionOutcome::Recoverable(_)
+        ) {
+            assert_eq!(store.items()[0].generated, "generated");
+        }
+        assert!(state.on_processing_finished().is_none());
+        assert_eq!(state.stage, Stage::Idle);
+    }
+    fn assistant_delivered() -> crate::selection::CommitOutcome {
+        crate::selection::CommitOutcome::Delivered {
+            clipboard: crate::selection::ClipboardSettlement::Restored,
+        }
+    }
+    #[tokio::test]
+    async fn coordinator_selected_replacement_end_to_end() {
+        coordinator_assistant_case(
+            crate::selection::CapturedText::Selected("source".into()),
+            crate::assistant::tests::successful_server_step("generated"),
+            assistant_delivered(),
+            1,
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn coordinator_empty_insertion_end_to_end() {
+        coordinator_assistant_case(
+            crate::selection::CapturedText::Empty,
+            crate::assistant::tests::successful_server_step("generated"),
+            assistant_delivered(),
+            1,
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn coordinator_whitespace_selection_end_to_end() {
+        coordinator_assistant_case(
+            crate::selection::CapturedText::Selected(" \t\n".into()),
+            crate::assistant::tests::successful_server_step("generated"),
+            assistant_delivered(),
+            1,
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn coordinator_llm_failure_before_mutation() {
+        coordinator_assistant_case(
+            crate::selection::CapturedText::Selected("original".into()),
+            Step::Respond(503, "offline".into()),
+            assistant_delivered(),
+            0,
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn coordinator_stale_target_is_recoverable_not_pasted() {
+        for reason in [
+            crate::selection::StaleReason::FocusChanged,
+            crate::selection::StaleReason::SelectionChanged,
+        ] {
+            coordinator_assistant_case(
+                crate::selection::CapturedText::Selected("original".into()),
+                crate::assistant::tests::successful_server_step("generated"),
+                crate::selection::CommitOutcome::Refused {
+                    reason: crate::selection::RefuseReason::TargetStale(reason),
+                    clipboard: crate::selection::ClipboardSettlement::Untouched,
+                },
+                1,
+            )
+            .await;
+        }
+    }
+    #[tokio::test]
+    async fn coordinator_assistant_commits_at_most_once() {
+        coordinator_assistant_case(
+            crate::selection::CapturedText::Empty,
+            crate::assistant::tests::successful_server_step("generated"),
+            crate::selection::CommitOutcome::Uncertain {
+                reason: crate::selection::UncertainReason::NoReceipt,
+                clipboard: crate::selection::ClipboardSettlement::Restored,
+            },
+            1,
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn coordinator_drain_waits_for_commit_settlement() {
+        static TRACKER: crate::assistant::CommitTracker = crate::assistant::CommitTracker::new();
+        let server = FakeServer::new(vec![crate::assistant::tests::successful_server_step(
+            "generated",
+        )])
+        .await;
+        let store = crate::assistant::recovery::RecoveryStore::new(8);
+        let (session, _) = crate::assistant::tests::session(
+            &server.url,
+            crate::selection::CapturedText::Empty,
+            &store,
+        );
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        let id = capture(&mut state, ShortcutActivation::Toggle, now);
+        state.on_capture_done(id, true);
+        state.on_input(
+            assistant_input(ShortcutActivation::Toggle, true),
+            now + Duration::from_secs(1),
+        );
+        state.on_input(ptt_input(true), now + Duration::from_secs(2));
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let mut task = tokio::spawn(crate::assistant::complete_session(
+            session,
+            "instruction",
+            crate::assistant::tests::never_cancel(),
+            move |_| {
+                entered.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(3)).unwrap();
+                assistant_delivered()
+            },
+            &TRACKER,
+        ));
+        ready.await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut task)
+            .await
+            .is_err());
+        assert_eq!(state.stage, Stage::Processing);
+        assert_eq!(state.pending_press.as_ref().unwrap().binding_id, BINDING);
+        release.send(()).unwrap();
+        assert!(matches!(
+            task.await.unwrap().outcome,
+            crate::assistant::SessionOutcome::Delivered
+        ));
+        assert!(matches!(
+            state.on_processing_finished(),
+            Some(Effect::Start { .. })
+        ));
+    }
+    #[tokio::test]
+    async fn coordinator_cancel_during_llm_never_commits() {
+        static TRACKER: crate::assistant::CommitTracker = crate::assistant::CommitTracker::new();
+        let server = FakeServer::new(vec![Step::StallBeforeHeaders]).await;
+        let store = crate::assistant::recovery::RecoveryStore::new(8);
+        let (session, _) = crate::assistant::tests::session(
+            &server.url,
+            crate::selection::CapturedText::Empty,
+            &store,
+        );
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        let id = capture(&mut state, ShortcutActivation::Toggle, now);
+        state.on_capture_done(id, true);
+        state.on_input(
+            assistant_input(ShortcutActivation::Toggle, true),
+            now + Duration::from_secs(1),
+        );
+        state.on_input(ptt_input(true), now + Duration::from_secs(2));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = Arc::clone(&cancelled);
+        let task = tokio::spawn(crate::assistant::complete_session(
+            session,
+            "instruction",
+            Arc::new(move || probe.load(std::sync::atomic::Ordering::SeqCst)),
+            |_| panic!("cancel forbids mutation"),
+            &TRACKER,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.requests.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.on_cancel(false).is_none());
+        cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome,
+            crate::assistant::SessionOutcome::Discarded
+        ));
+        assert!(state.on_processing_finished().is_none());
+        assert_eq!(store.free_slots(), 8);
+    }
+
+    #[test]
+    fn assistant_press_begins_capture_before_any_start() {
+        let mut state = CoordinatorState::new();
+        let effect = state.on_input(
+            InputEvent {
+                binding_id: "assistant".into(),
+                hotkey_string: "test".into(),
+                is_pressed: true,
+                mode: ShortcutActivation::Toggle,
+                hold_threshold: Duration::ZERO,
+                external: false,
+            },
+            Instant::now(),
+        );
+        assert!(
+            matches!(effect, Some(Effect::BeginCapture { .. })),
+            "assistant admission must begin capture, got {effect:?}"
+        );
+        assert!(matches!(state.stage, Stage::Capturing(_)));
+    }
     use crate::actions::process_transcription_output;
     use crate::llm_client::test_http::{completion, FakeServer, Step};
 
@@ -751,7 +2440,7 @@ mod tests {
         ));
         state.on_start_result(
             WorkflowMode::Cleanup.binding_id(),
-            Some(DictationSession::snapshot(WorkflowMode::Cleanup, &settings)),
+            Some(DictationSession::snapshot(WorkflowMode::Cleanup, &settings).unwrap()),
         );
         settings.post_process_providers[0].base_url = other.url.clone();
         settings
@@ -805,7 +2494,7 @@ mod tests {
         state.on_input(workflow_input(WorkflowMode::Raw), now);
         state.on_start_result(
             WorkflowMode::Raw.binding_id(),
-            Some(DictationSession::snapshot(WorkflowMode::Raw, &settings)),
+            Some(DictationSession::snapshot(WorkflowMode::Raw, &settings).unwrap()),
         );
         // Another workflow cannot alter the recording already in progress.
         assert!(state
@@ -842,7 +2531,7 @@ mod tests {
         state.on_input(workflow_input(WorkflowMode::Raw), now);
         state.on_start_result(
             WorkflowMode::Raw.binding_id(),
-            Some(DictationSession::snapshot(WorkflowMode::Raw, &settings)),
+            Some(DictationSession::snapshot(WorkflowMode::Raw, &settings).unwrap()),
         );
         state.on_input(
             workflow_input(WorkflowMode::Raw),
@@ -866,7 +2555,7 @@ mod tests {
         assert_eq!(binding_id, WorkflowMode::Cleanup.binding_id());
         state.on_start_result(
             &binding_id,
-            Some(DictationSession::snapshot(WorkflowMode::Cleanup, &settings)),
+            Some(DictationSession::snapshot(WorkflowMode::Cleanup, &settings).unwrap()),
         );
         state.on_input(
             workflow_input(WorkflowMode::Cleanup),
@@ -886,7 +2575,7 @@ mod tests {
             state.on_input(workflow_input(mode), now);
             state.on_start_result(
                 mode.binding_id(),
-                Some(DictationSession::snapshot(mode, &settings)),
+                Some(DictationSession::snapshot(mode, &settings).unwrap()),
             );
             assert!(state.session.is_some());
             state.on_cancel(true);
@@ -1110,6 +2799,7 @@ mod tests {
                 Some(Effect::Start { .. }) => starts += 1,
                 Some(Effect::Stop { .. }) => stops += 1,
                 None => {}
+                other => panic!("unexpected raw effect: {other:?}"),
             }
         }
 

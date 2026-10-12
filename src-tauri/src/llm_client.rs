@@ -91,6 +91,38 @@ impl std::fmt::Debug for LlmError {
 }
 
 impl LlmError {
+    /// Stable, content-free recovery detail for translation and diagnostics.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Config(error) => match error {
+                ConfigError::NoProvider => "no_provider",
+                ConfigError::NoModel => "no_model",
+                ConfigError::NoPrompt => "no_prompt",
+                ConfigError::PromptNotFound => "prompt_not_found",
+                ConfigError::EmptyPrompt => "empty_prompt",
+                ConfigError::InvalidOptions(_) => "invalid_options",
+                ConfigError::UnsupportedProvider => "unsupported_provider",
+                ConfigError::InvalidHeader => "invalid_header",
+                ConfigError::OptionsRejected { .. } => "options_rejected",
+            },
+            Self::Input(InputError::BlankText) => "blank_text",
+            Self::Input(InputError::TooLong { .. }) => "too_long",
+            Self::Timeout => "timeout",
+            Self::Transport(_) => "transport",
+            Self::Provider { .. } => "provider",
+            Self::ResponseTooLarge => "response_too_large",
+            Self::InvalidOutput(error) => match error {
+                OutputError::MalformedResponse => "malformed_response",
+                OutputError::Empty => "empty",
+                OutputError::ReasoningOnly => "reasoning_only",
+                OutputError::Truncated => "truncated",
+                OutputError::Filtered => "filtered",
+                OutputError::MalformedJson => "malformed_json",
+                OutputError::MissingField => "missing_field",
+                OutputError::TooLarge => "too_large",
+            },
+        }
+    }
     pub fn code(&self) -> &'static str {
         match self {
             Self::Config(_) => "llm_config",
@@ -104,7 +136,6 @@ impl LlmError {
     }
 
     /// Provider details are for explicit UI display only, never logging.
-    #[allow(dead_code)] // Recovery UI consumes this in later slices.
     pub fn detail(&self) -> Option<&str> {
         match self {
             Self::Provider { detail, .. }

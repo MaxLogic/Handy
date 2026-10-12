@@ -12,26 +12,23 @@ use crate::settings::{self, ShortcutBinding};
 use super::handler::handle_shortcut_event;
 
 /// Initialize shortcuts using Tauri's global-shortcut plugin
-pub fn init_shortcuts(app: &AppHandle) {
-    let default_bindings = settings::get_default_settings().bindings;
-    let user_settings = settings::load_or_create_app_settings(app);
-
-    // Register all default shortcuts, applying user customizations
-    for (id, default_binding) in default_bindings {
-        if id == "cancel" {
-            continue; // Skip cancel shortcut, it will be registered dynamically
-        }
-        // Skip post-processing shortcut when the feature is disabled
-        if id == "transcribe_with_post_process" && !user_settings.post_process_enabled {
-            continue;
-        }
-        let binding = user_settings
-            .bindings
-            .get(&id)
-            .cloned()
-            .unwrap_or(default_binding);
-
-        if let Err(e) = register_shortcut(app, binding) {
+pub(crate) trait InitContext {
+    fn settings(&self) -> settings::AppSettings;
+    fn register(&self, binding: ShortcutBinding) -> Result<(), String>;
+}
+impl InitContext for AppHandle {
+    fn settings(&self) -> settings::AppSettings {
+        settings::load_or_create_app_settings(self)
+    }
+    fn register(&self, binding: ShortcutBinding) -> Result<(), String> {
+        register_shortcut(self, binding)
+    }
+}
+pub(crate) fn init_shortcuts(app: &impl InitContext) {
+    let user_settings = app.settings();
+    for binding in super::configured_bindings(&user_settings) {
+        let id = binding.id.clone();
+        if let Err(e) = app.register(binding) {
             error!("Failed to register shortcut {} during init: {}", id, e);
         }
     }
@@ -188,5 +185,97 @@ mod tests {
         ] {
             assert_eq!(validate_shortcut(raw), Ok(()), "{raw} should be accepted");
         }
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod assistant_registration_tests {
+    use crate::settings;
+    struct FakeInit {
+        settings: settings::AppSettings,
+        registered: std::sync::Mutex<Vec<settings::ShortcutBinding>>,
+    }
+    fn initialized(settings: &settings::AppSettings) -> Vec<settings::ShortcutBinding> {
+        let context = FakeInit {
+            settings: settings.clone(),
+            registered: std::sync::Mutex::new(Vec::new()),
+        };
+        super::init_shortcuts(&context);
+        context.registered.into_inner().unwrap()
+    }
+    impl super::InitContext for FakeInit {
+        fn settings(&self) -> settings::AppSettings {
+            self.settings.clone()
+        }
+        fn register(&self, binding: settings::ShortcutBinding) -> Result<(), String> {
+            super::validate_shortcut(&binding.current_binding)?;
+            self.registered.lock().unwrap().push(binding);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn assistant_tauri_impl_registration_order_keeps_raw_and_cleanup_first() {
+        let mut settings = settings::get_default_settings();
+        settings.keyboard_implementation = settings::KeyboardImplementation::Tauri;
+        settings.post_process_enabled = true;
+        let bindings = initialized(&settings);
+        assert_eq!(
+            bindings.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+            ["transcribe", "transcribe_with_post_process", "assistant"]
+        );
+        for binding in bindings {
+            assert!(super::validate_shortcut(&binding.current_binding).is_ok());
+        }
+        settings.post_process_enabled = false;
+        assert_eq!(
+            initialized(&settings)
+                .iter()
+                .map(|b| b.id.as_str())
+                .collect::<Vec<_>>(),
+            ["transcribe", "assistant"]
+        );
+    }
+
+    #[test]
+    fn assistant_tauri_impl_conflict_preserves_existing_binding_and_missing_defaults() {
+        let mut settings = settings::get_default_settings();
+        settings.keyboard_implementation = settings::KeyboardImplementation::Tauri;
+        settings.post_process_enabled = true;
+        settings
+            .bindings
+            .get_mut("transcribe")
+            .unwrap()
+            .current_binding = "ctrl+alt+space".into();
+        let before = serde_json::to_value(&settings.bindings).unwrap();
+        assert_eq!(
+            initialized(&settings)
+                .iter()
+                .map(|b| b.id.as_str())
+                .collect::<Vec<_>>(),
+            ["transcribe", "transcribe_with_post_process"]
+        );
+        assert_eq!(serde_json::to_value(&settings.bindings).unwrap(), before);
+        settings.bindings.remove("assistant");
+        assert_eq!(initialized(&settings).len(), 2);
+        settings
+            .bindings
+            .get_mut("transcribe")
+            .unwrap()
+            .current_binding = "ctrl+f8".into();
+        assert_eq!(initialized(&settings).last().unwrap().id, "assistant");
+        settings
+            .bindings
+            .get_mut("transcribe_with_post_process")
+            .unwrap()
+            .current_binding = "ctrl+alt+space".into();
+        settings.post_process_enabled = false;
+        assert_eq!(
+            initialized(&settings)
+                .iter()
+                .map(|b| b.id.as_str())
+                .collect::<Vec<_>>(),
+            ["transcribe"]
+        );
     }
 }

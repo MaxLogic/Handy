@@ -1019,6 +1019,13 @@ pub fn get_default_settings() -> AppSettings {
         },
     );
 
+    #[cfg(target_os = "windows")]
+    bindings.insert("assistant".into(), ShortcutBinding {
+        id: "assistant".into(), name: "Selected Text Assistant".into(),
+        description: "Edits selected text or writes text at the cursor from a spoken instruction.".into(),
+        default_binding: "ctrl+alt+space".into(), current_binding: "ctrl+alt+space".into(),
+    });
+
     AppSettings {
         settings_schema_version: default_settings_schema_version(),
         bindings,
@@ -1147,15 +1154,7 @@ pub fn get_settings(app: &AppHandle) -> AppSettings {
             updated = true;
         }
 
-        // Merge in any bindings added since this store was written.
-        for (key, value) in get_default_settings().bindings {
-            if let std::collections::hash_map::Entry::Vacant(entry) = settings.bindings.entry(key) {
-                debug!("Adding missing binding: {}", entry.key());
-                entry.insert(value);
-                updated = true;
-            }
-        }
-
+        updated |= merge_missing_bindings(&mut settings);
         if updated {
             store.set("settings", serde_json::to_value(&settings).unwrap());
         }
@@ -1172,6 +1171,18 @@ pub fn get_settings(app: &AppHandle) -> AppSettings {
     }
 
     settings
+}
+
+fn merge_missing_bindings(settings: &mut AppSettings) -> bool {
+    let mut updated = false;
+    for (key, value) in get_default_settings().bindings {
+        if let std::collections::hash_map::Entry::Vacant(entry) = settings.bindings.entry(key) {
+            debug!("Adding missing binding: {}", entry.key());
+            entry.insert(value);
+            updated = true;
+        }
+    }
+    updated
 }
 
 /// Rebuilds settings from a store value that failed to deserialize as a whole.
@@ -1397,6 +1408,48 @@ pub fn get_recording_retention_period(app: &AppHandle) -> RecordingRetentionPeri
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn assistant_binding_missing_migration_preserves_custom_bindings_and_prompt_choices() {
+        let mut previous = get_default_settings();
+        previous.bindings.remove("assistant");
+        previous
+            .bindings
+            .get_mut("transcribe")
+            .unwrap()
+            .current_binding = "ctrl+alt+space".into();
+        previous
+            .bindings
+            .get_mut("transcribe_with_post_process")
+            .unwrap()
+            .current_binding = "ctrl+shift+f9".into();
+        previous.assistant_selected_prompt_id = None;
+        let serialized = serde_json::to_value(&previous).unwrap();
+        let mut settings: AppSettings = serde_json::from_value(serialized).unwrap();
+        let existing = serde_json::to_value(&settings.bindings).unwrap();
+        assert!(merge_missing_bindings(&mut settings));
+        assert_eq!(
+            settings.bindings["assistant"].default_binding,
+            "ctrl+alt+space"
+        );
+        assert_eq!(
+            settings.bindings["assistant"].current_binding,
+            "ctrl+alt+space"
+        );
+        let mut without_assistant = settings.bindings.clone();
+        without_assistant.remove("assistant");
+        assert_eq!(serde_json::to_value(without_assistant).unwrap(), existing);
+        assert_eq!(settings.assistant_selected_prompt_id, None);
+        assert!(!merge_missing_bindings(&mut settings));
+        settings
+            .bindings
+            .get_mut("assistant")
+            .unwrap()
+            .current_binding = "ctrl+f10".into();
+        assert!(!merge_missing_bindings(&mut settings));
+        assert_eq!(settings.bindings["assistant"].current_binding, "ctrl+f10");
+    }
     use super::*;
 
     #[test]

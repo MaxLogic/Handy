@@ -2,7 +2,7 @@ use crate::managers::audio::AudioRecordingManager;
 use crate::managers::transcription::TranscriptionManager;
 use crate::shortcut;
 use crate::TranscriptionCoordinator;
-use log::info;
+use log::{info, warn};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 
@@ -81,40 +81,58 @@ fn native_windows_machine() -> Option<u16> {
     }
 }
 
-/// Centralized cancellation function that can be called from anywhere in the app.
-/// Handles cancelling both recording and transcription operations and updates UI state.
-pub fn cancel_current_operation(app: &AppHandle) {
-    info!("Initiating operation cancellation...");
+/// Native cancellation edges, substituted by deterministic lifecycle tests.
+pub(crate) trait CancellationContext: shortcut::CancelShortcutContext {
+    fn cancel_audio(&self) -> bool;
+    fn cancel_transcription(&self);
+    fn reset_after_cancel(&self);
+    fn request_cancel(&self) -> bool;
+}
 
-    // Unregister the cancel shortcut asynchronously
-    shortcut::unregister_cancel_shortcut(app);
-
-    // Cancel any ongoing recording
-    let audio_manager = app.state::<Arc<AudioRecordingManager>>();
-    let recording_was_active = audio_manager.is_recording();
-    audio_manager.cancel_recording();
-
-    // Abandon any live streaming transcription, and stop a transcription
-    // already in progress
-    let tm = app.state::<Arc<TranscriptionManager>>();
-    tm.cancel_stream();
-    tm.cancel_transcription();
-
-    // Update tray icon and hide overlay
-    set_tray_state(app, crate::tray::TrayIconState::Idle);
-    hide_recording_overlay(app);
-
-    // Unload model if immediate unload is enabled. Done before notifying the
-    // coordinator, so a recording started next always loads afresh; it
-    // doesn't wait for the cancelled work, so it never blocks this thread.
-    tm.maybe_unload_immediately("cancellation");
-
-    // Notify coordinator so it can keep lifecycle state coherent.
-    if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
-        coordinator.notify_cancel(recording_was_active);
+impl CancellationContext for AppHandle {
+    fn cancel_audio(&self) -> bool {
+        let audio_manager = self.state::<Arc<AudioRecordingManager>>();
+        let recording_was_active = audio_manager.is_recording();
+        audio_manager.cancel_recording();
+        recording_was_active
     }
+    fn cancel_transcription(&self) {
+        let tm = self.state::<Arc<TranscriptionManager>>();
+        tm.cancel_stream();
+        tm.cancel_transcription();
+    }
+    fn reset_after_cancel(&self) {
+        set_tray_state(self, crate::tray::TrayIconState::Idle);
+        hide_recording_overlay(self);
+        self.state::<Arc<TranscriptionManager>>()
+            .maybe_unload_immediately("cancellation");
+    }
+    fn request_cancel(&self) -> bool {
+        self.try_state::<TranscriptionCoordinator>()
+            .is_some_and(|coordinator| coordinator.request_cancel())
+    }
+}
 
-    info!("Operation cancellation completed - returned to idle state");
+/// Queue cancellation for the coordinator; tear down inline only without one.
+pub(crate) fn cancel_current_operation(app: &impl CancellationContext) {
+    if app.request_cancel() {
+        info!("Cancellation requested");
+        return;
+    }
+    warn!("No transcription coordinator; cancelling inline");
+    perform_cancellation(app);
+}
+
+/// Coordinator-owned teardown, also used by the no-coordinator fallback.
+pub(crate) fn perform_cancellation(app: &impl CancellationContext) -> bool {
+    // Assistant ownership is retained until strict commit/abort acknowledgment.
+    shortcut::unregister_cancel_shortcut(app);
+    let recording_was_active = app.cancel_audio();
+    app.cancel_transcription();
+    // Unload before the coordinator reads its next command, so the next
+    // recording loads afresh. This does not wait for cancelled work.
+    app.reset_after_cancel();
+    recording_was_active
 }
 
 /// Check if using the Wayland display server protocol
@@ -172,6 +190,63 @@ pub fn env_flag_enabled(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FakeCancellation {
+        queued: bool,
+        requests: std::sync::atomic::AtomicUsize,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+    impl shortcut::CancelShortcutContext for FakeCancellation {
+        fn register_cancel_fallback(&self) {}
+        fn unregister_cancel_fallback(&self) {
+            self.calls.lock().unwrap().push("unregister");
+        }
+        fn schedule_cancel_reconcile(&self) {}
+    }
+    impl CancellationContext for FakeCancellation {
+        fn cancel_audio(&self) -> bool {
+            self.calls.lock().unwrap().push("audio");
+            true
+        }
+        fn cancel_transcription(&self) {
+            self.calls.lock().unwrap().push("transcription");
+        }
+        fn reset_after_cancel(&self) {
+            self.calls.lock().unwrap().push("reset");
+        }
+        fn request_cancel(&self) -> bool {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.queued
+        }
+    }
+    #[test]
+    fn cancel_request_runs_no_teardown_on_caller() {
+        let _guard = crate::transcription_coordinator::tests::CANCEL_RUNTIME_TEST.blocking_lock();
+        let app = FakeCancellation {
+            queued: true,
+            requests: std::sync::atomic::AtomicUsize::new(0),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        cancel_current_operation(&app);
+        assert_eq!(app.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(app.calls.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn cancel_without_coordinator_tears_down_inline_in_order() {
+        let _guard = crate::transcription_coordinator::tests::CANCEL_RUNTIME_TEST.blocking_lock();
+        let app = FakeCancellation {
+            queued: false,
+            requests: std::sync::atomic::AtomicUsize::new(0),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        cancel_current_operation(&app);
+        assert_eq!(app.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            *app.calls.lock().unwrap(),
+            ["unregister", "audio", "transcription", "reset"]
+        );
+    }
 
     #[test]
     fn arm64_native_machine_is_the_only_match() {

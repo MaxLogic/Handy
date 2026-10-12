@@ -13,9 +13,6 @@
 //! sequence is the generic `commit::run_commit`, so both are unit-tested
 //! without a desktop. Other platforms report `CaptureError::Unsupported`.
 
-// TODO(HANDY-005): remove when the assistant workflow consumes this API.
-#![cfg_attr(not(test), allow(dead_code))]
-
 mod commit;
 mod evidence;
 #[cfg(all(test, target_os = "windows"))]
@@ -78,6 +75,8 @@ pub(crate) struct Captured {
 /// Why capture failed. Nothing was mutated in any of these cases.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CaptureError {
+    // Constructed by the unsupported-platform implementation and tests.
+    #[cfg_attr(all(not(test), target_os = "windows"), allow(dead_code))]
     Unsupported,
     ShuttingDown,
     Busy,
@@ -233,6 +232,7 @@ pub(crate) enum RefuseReason {
     ClipboardTimeout,
     ClipboardChanged,
     ModifiersHeld,
+    #[cfg_attr(all(not(test), target_os = "windows"), allow(dead_code))]
     WorkerUnavailable,
 }
 
@@ -347,6 +347,8 @@ impl TargetToken {
         self.session
     }
 
+    // The native owner retains range evidence; fixtures inspect this opaque flag.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_empty_target(&self) -> bool {
         self.empty
     }
@@ -400,6 +402,11 @@ pub(crate) struct CaptureTicket {
 }
 
 impl CaptureTicket {
+    #[cfg(test)]
+    pub(crate) fn test_pending() -> Self {
+        let (tx, _rx) = mpsc::channel();
+        Self { tx }
+    }
     /// Idempotent and non-blocking. The capture reports `Cancelled` unless its
     /// result was already delivered.
     pub(crate) fn cancel(&self) {

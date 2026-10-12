@@ -30,6 +30,130 @@ use crate::tray;
 
 // Note: Commands are accessed via shortcut::handy_keys:: in lib.rs
 
+/// Compare backend key identities, including inactive and cancel bindings.
+/// HandyKeys generic modifiers overlap either side; Tauri uses accelerator identity.
+pub(crate) fn binding_conflict(
+    bindings: &std::collections::HashMap<String, ShortcutBinding>,
+    id: &str,
+    candidate: &str,
+    implementation: KeyboardImplementation,
+) -> Option<String> {
+    let mut ids: Vec<_> = bindings
+        .keys()
+        .filter(|other| other.as_str() != id)
+        .collect();
+    ids.sort();
+    ids.into_iter()
+        .find(|other| {
+            let existing = &bindings[*other].current_binding;
+            match implementation {
+                KeyboardImplementation::Tauri => {
+                    match (
+                        candidate.parse::<tauri_plugin_global_shortcut::Shortcut>(),
+                        existing.parse::<tauri_plugin_global_shortcut::Shortcut>(),
+                    ) {
+                        (Ok(candidate), Ok(existing)) => candidate == existing,
+                        _ => false,
+                    }
+                }
+                KeyboardImplementation::HandyKeys => {
+                    match (
+                        candidate.parse::<::handy_keys::Hotkey>(),
+                        existing.parse::<::handy_keys::Hotkey>(),
+                    ) {
+                        (Ok(candidate), Ok(existing)) => {
+                            handy_keys_bindings_overlap(candidate, existing)
+                        }
+                        _ => false,
+                    }
+                }
+            }
+        })
+        .cloned()
+}
+
+fn handy_keys_bindings_overlap(a: ::handy_keys::Hotkey, b: ::handy_keys::Hotkey) -> bool {
+    use ::handy_keys::Modifiers;
+    // Each generic alias is the union of its left/right bits. Intersection
+    // therefore means both bindings can match at least one common side.
+    a.key == b.key
+        && a.modifiers.contains(Modifiers::FN) == b.modifiers.contains(Modifiers::FN)
+        && [
+            Modifiers::CTRL,
+            Modifiers::OPT,
+            Modifiers::SHIFT,
+            Modifiers::CMD,
+        ]
+        .into_iter()
+        .all(|group| {
+            let a = a.modifiers & group;
+            let b = b.modifiers & group;
+            (a.is_empty() && b.is_empty()) || a.intersects(b)
+        })
+}
+
+pub(crate) fn ordered_binding_ids(
+    bindings: &std::collections::HashMap<String, ShortcutBinding>,
+) -> Vec<String> {
+    let mut ids: Vec<_> = bindings.keys().cloned().collect();
+    ids.sort_by_key(|id| {
+        (
+            match id.as_str() {
+                "transcribe" => 0,
+                "transcribe_with_post_process" => 1,
+                "assistant" => 3,
+                _ => 2,
+            },
+            id.clone(),
+        )
+    });
+    ids
+}
+
+pub(crate) fn assistant_binding_conflicts(
+    bindings: &std::collections::HashMap<String, ShortcutBinding>,
+    binding: &ShortcutBinding,
+    implementation: KeyboardImplementation,
+) -> bool {
+    if binding.id == "assistant" {
+        if let Some(other) = binding_conflict(
+            bindings,
+            &binding.id,
+            &binding.current_binding,
+            implementation,
+        ) {
+            warn!("Assistant shortcut conflicts with '{other}'; leaving the existing binding registered");
+            return true;
+        }
+    }
+    false
+}
+
+/// Defaults and user overrides form one conflict domain, even after migration.
+fn effective_bindings(
+    settings: &settings::AppSettings,
+) -> std::collections::HashMap<String, ShortcutBinding> {
+    let mut bindings = settings::get_default_settings().bindings;
+    bindings.extend(settings.bindings.clone());
+    bindings
+}
+
+pub(super) fn configured_bindings(settings: &settings::AppSettings) -> Vec<ShortcutBinding> {
+    let bindings = effective_bindings(settings);
+    ordered_binding_ids(&settings::get_default_settings().bindings)
+        .into_iter()
+        .filter(|id| {
+            id != "cancel"
+                && (id != "transcribe_with_post_process" || settings.post_process_enabled)
+        })
+        .filter_map(|id| {
+            let binding = &bindings[&id];
+            (!assistant_binding_conflicts(&bindings, binding, settings.keyboard_implementation))
+                .then(|| binding.clone())
+        })
+        .collect()
+}
+
 /// Initialize shortcuts using the configured implementation
 pub fn init_shortcuts(app: &AppHandle) {
     let user_settings = settings::load_or_create_app_settings(app);
@@ -60,27 +184,56 @@ pub fn init_shortcuts(app: &AppHandle) {
 /// Written synchronously by start/stop, so it always holds the latest request.
 static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Native edges of cancel registration, substituted by deterministic tests.
+pub(crate) trait CancelShortcutContext {
+    fn register_cancel_fallback(&self);
+    fn unregister_cancel_fallback(&self);
+    fn schedule_cancel_reconcile(&self);
+}
+
+impl CancelShortcutContext for AppHandle {
+    fn register_cancel_fallback(&self) {
+        crate::secure_input::register_cancel_fallback(self);
+    }
+    fn unregister_cancel_fallback(&self) {
+        crate::secure_input::unregister_cancel_fallback(self);
+    }
+    fn schedule_cancel_reconcile(&self) {
+        schedule_cancel_reconcile(self);
+    }
+}
+
 /// Whether the cancel shortcut is actually registered with the backend.
 /// The lock also serializes reconciliation passes.
 #[cfg(not(target_os = "linux"))]
 static CANCEL_REGISTERED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 /// Register the cancel shortcut (called when recording starts)
-pub fn register_cancel_shortcut(app: &AppHandle) {
+pub(crate) fn register_cancel_shortcut(app: &impl CancelShortcutContext) {
     // Track recording lifecycle independently of the current implementation so
     // switching implementations mid-recording cannot leave stale fallback state.
-    crate::secure_input::register_cancel_fallback(app);
+    app.register_cancel_fallback();
 
     CANCEL_REQUESTED.store(true, Ordering::SeqCst);
-    schedule_cancel_reconcile(app);
+    app.schedule_cancel_reconcile();
 }
 
 /// Unregister the cancel shortcut (called when recording stops)
-pub fn unregister_cancel_shortcut(app: &AppHandle) {
-    crate::secure_input::unregister_cancel_fallback(app);
+pub(crate) fn unregister_cancel_shortcut(app: &impl CancelShortcutContext) {
+    // Explicit cancellation still has to await strict commit/abort settlement.
+    // CancelArm clears assistant ownership before its final unregister.
+    if crate::assistant::cancel_armed() {
+        return;
+    }
+    app.unregister_cancel_fallback();
 
     CANCEL_REQUESTED.store(false, Ordering::SeqCst);
-    schedule_cancel_reconcile(app);
+    app.schedule_cancel_reconcile();
+}
+
+#[cfg(test)]
+pub(crate) fn cancel_requested() -> bool {
+    CANCEL_REQUESTED.load(Ordering::SeqCst)
 }
 
 /// Apply the requested cancel state off the calling thread. Start and stop run
@@ -172,6 +325,19 @@ pub fn change_binding(
 
     let mut settings = settings::get_settings(&app);
 
+    if let Some(other) = binding_conflict(
+        &effective_bindings(&settings),
+        &id,
+        &binding,
+        settings.keyboard_implementation,
+    ) {
+        return Ok(BindingResponse {
+            success: false,
+            binding: None,
+            error: Some(format!("Shortcut '{binding}' is already used by '{other}'")),
+        });
+    }
+
     // Get the binding to modify, or create it from defaults if it doesn't exist
     let binding_to_modify = match settings.bindings.get(&id) {
         Some(binding) => binding.clone(),
@@ -216,7 +382,9 @@ pub fn change_binding(
     }
 
     // Unregister the existing binding
-    if let Err(e) = unregister_shortcut(&app, binding_to_modify.clone()) {
+    if let Err(e) = unregister_previous_binding(&settings, &binding_to_modify, |binding| {
+        unregister_shortcut(&app, binding)
+    }) {
         let error_msg = format!("Failed to unregister shortcut: {}", e);
         error!("change_binding error: {}", error_msg);
     }
@@ -225,7 +393,7 @@ pub fn change_binding(
     if let Err(e) = validate_shortcut_for_implementation(&binding, settings.keyboard_implementation)
     {
         warn!("change_binding validation error: {}", e);
-        restore_registration(&app, &binding_to_modify);
+        restore_registration(&app, &settings, &binding_to_modify);
         return Err(e);
     }
 
@@ -237,7 +405,7 @@ pub fn change_binding(
     if let Err(e) = register_shortcut(&app, updated_binding.clone()) {
         let error_msg = format!("Failed to register shortcut: {}", e);
         error!("change_binding error: {}", error_msg);
-        restore_registration(&app, &binding_to_modify);
+        restore_registration(&app, &settings, &binding_to_modify);
         return Ok(BindingResponse {
             success: false,
             binding: None,
@@ -260,15 +428,54 @@ pub fn change_binding(
     })
 }
 
+/// Remove only a binding that startup could have registered.
+fn unregister_previous_binding(
+    settings: &settings::AppSettings,
+    binding: &ShortcutBinding,
+    unregister: impl FnOnce(ShortcutBinding) -> Result<(), String>,
+) -> Result<(), String> {
+    // A conflicting assistant was skipped during startup. Tauri unregisters
+    // by accelerator, so attempting to remove it would remove the other owner.
+    if assistant_binding_conflicts(
+        &effective_bindings(settings),
+        binding,
+        settings.keyboard_implementation,
+    ) {
+        return Ok(());
+    }
+    unregister(binding.clone())
+}
+
 /// Best-effort re-register of the previous binding after a failed change,
 /// so a failure leaves the user's shortcut working exactly as before.
-fn restore_registration(app: &AppHandle, binding: &ShortcutBinding) {
-    if let Err(e) = register_shortcut(app, binding.clone()) {
+fn restore_registration(
+    app: &AppHandle,
+    settings: &settings::AppSettings,
+    binding: &ShortcutBinding,
+) {
+    if let Err(e) =
+        restore_previous_binding(settings, binding, |binding| register_shortcut(app, binding))
+    {
         error!(
             "Failed to restore previous binding '{}' ({}): {}",
             binding.id, binding.current_binding, e
         );
     }
+}
+
+fn restore_previous_binding(
+    settings: &settings::AppSettings,
+    binding: &ShortcutBinding,
+    register: impl FnOnce(ShortcutBinding) -> Result<(), String>,
+) -> Result<(), String> {
+    if assistant_binding_conflicts(
+        &effective_bindings(settings),
+        binding,
+        settings.keyboard_implementation,
+    ) {
+        return Ok(());
+    }
+    register(binding.clone())
 }
 
 #[tauri::command]
@@ -301,14 +508,9 @@ pub fn suspend_all_shortcuts(app: &AppHandle) {
 /// implementations, so this is idempotent and safe on every exit path.
 pub fn resume_all_shortcuts(app: &AppHandle) {
     let settings = get_settings(app);
-    for (id, binding) in &settings.bindings {
-        if id == "cancel" {
-            continue;
-        }
-        if id == "transcribe_with_post_process" && !settings.post_process_enabled {
-            continue;
-        }
-        if let Err(e) = register_shortcut(app, binding.clone()) {
+    for binding in configured_bindings(&settings) {
+        let id = binding.id.clone();
+        if let Err(e) = register_shortcut(app, binding) {
             debug!("resume_all_shortcuts: could not register '{}': {}", id, e);
         }
     }
@@ -486,50 +688,15 @@ fn register_all_shortcuts_for_implementation(
     app: &AppHandle,
     implementation: KeyboardImplementation,
 ) -> Vec<String> {
-    let mut reset_bindings = Vec::new();
-    let default_bindings = settings::get_default_settings().bindings;
     let mut current_settings = settings::get_settings(app);
-
-    for (id, default_binding) in &default_bindings {
-        // Skip cancel shortcut as it's dynamically registered
-        if id == "cancel" {
-            continue;
-        }
-
-        // Skip post-processing shortcut when the feature is disabled
-        if id == "transcribe_with_post_process" && !current_settings.post_process_enabled {
-            continue;
-        }
-
-        let mut binding = current_settings
-            .bindings
-            .get(id)
-            .cloned()
-            .unwrap_or_else(|| default_binding.clone());
-
-        // Validate the shortcut for the target implementation
-        if let Err(e) =
-            validate_shortcut_for_implementation(&binding.current_binding, implementation)
-        {
-            info!(
-                "Shortcut '{}' ({}) is invalid for {:?}: {}. Resetting to default.",
-                id, binding.current_binding, implementation, e
-            );
-
-            // Reset to default
-            binding.current_binding = default_binding.current_binding.clone();
-            current_settings
-                .bindings
-                .insert(id.clone(), binding.clone());
-            reset_bindings.push(id.clone());
-        }
-
-        // Register with the appropriate implementation
+    let (bindings, reset_bindings) =
+        bindings_for_implementation(&mut current_settings, implementation);
+    for binding in bindings {
+        let id = binding.id.clone();
         let result = match implementation {
             KeyboardImplementation::Tauri => tauri_impl::register_shortcut(app, binding),
             KeyboardImplementation::HandyKeys => handy_keys::register_shortcut(app, binding),
         };
-
         if let Err(e) = result {
             error!(
                 "Failed to register shortcut '{}' for {:?}: {}",
@@ -537,13 +704,39 @@ fn register_all_shortcuts_for_implementation(
             );
         }
     }
-
-    // Save settings if any bindings were reset
     if !reset_bindings.is_empty() {
         settings::write_settings(app, current_settings);
     }
-
     reset_bindings
+}
+
+fn bindings_for_implementation(
+    settings: &mut settings::AppSettings,
+    implementation: KeyboardImplementation,
+) -> (Vec<ShortcutBinding>, Vec<String>) {
+    settings.keyboard_implementation = implementation;
+    let defaults = settings::get_default_settings().bindings;
+    let mut reset = Vec::new();
+    for id in ordered_binding_ids(&defaults) {
+        if id == "cancel"
+            || (id == "transcribe_with_post_process" && !settings.post_process_enabled)
+        {
+            continue;
+        }
+        let mut binding = settings.bindings.get(&id).unwrap_or(&defaults[&id]).clone();
+        if let Err(e) =
+            validate_shortcut_for_implementation(&binding.current_binding, implementation)
+        {
+            info!(
+                "Shortcut '{}' ({}) is invalid for {:?}: {}. Resetting to default.",
+                id, binding.current_binding, implementation, e
+            );
+            binding.current_binding = defaults[&id].current_binding.clone();
+            settings.bindings.insert(id.clone(), binding);
+            reset.push(id);
+        }
+    }
+    (configured_bindings(settings), reset)
 }
 
 /// Initialize HandyKeys if not already initialized, with rollback on failure
@@ -1485,6 +1678,300 @@ pub async fn get_available_accelerators(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn failed_change_does_not_restore_startup_skipped_assistant() {
+        let mut settings = super::settings::get_default_settings();
+        settings.keyboard_implementation = super::KeyboardImplementation::Tauri;
+        settings.post_process_enabled = false;
+        for (owner, skipped) in [
+            ("cancel", "esc"),
+            ("transcribe_with_post_process", "ctrl+shift+space"),
+        ] {
+            settings
+                .bindings
+                .get_mut("assistant")
+                .unwrap()
+                .current_binding = skipped.into();
+            assert!(!super::configured_bindings(&settings)
+                .iter()
+                .any(|b| b.id == "assistant"));
+            // Same failed-validation rollback used by change_binding, without native registration.
+            assert!(super::validate_shortcut_for_implementation(
+                "fn",
+                settings.keyboard_implementation
+            )
+            .is_err());
+            super::restore_previous_binding(&settings, &settings.bindings["assistant"], |_| {
+                panic!("startup-skipped assistant must not be registered over {owner}");
+            })
+            .unwrap();
+        }
+        let mut restored = false;
+        super::restore_previous_binding(&settings, &settings.bindings["transcribe"], |binding| {
+            assert_eq!(binding.id, "transcribe");
+            restored = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            restored,
+            "an eligible previous binding must still be restored"
+        );
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn assistant_handy_keys_generic_and_sided_modifiers_overlap_in_both_directions() {
+        let implementation = super::KeyboardImplementation::HandyKeys;
+        for group in ["ctrl", "alt", "shift", "super"] {
+            let mut settings = super::settings::get_default_settings();
+            for side in ["left", "right"] {
+                let generic = format!("{group}+f9");
+                let sided = format!("{group}_{side}+f9");
+                for (existing, candidate) in [(&generic, &sided), (&sided, &generic)] {
+                    settings.bindings.get_mut("cancel").unwrap().current_binding = existing.clone();
+                    assert_eq!(
+                        super::binding_conflict(
+                            &settings.bindings,
+                            "assistant",
+                            candidate,
+                            implementation
+                        ),
+                        Some("cancel".into()),
+                        "{existing} vs {candidate} must conflict"
+                    );
+                }
+            }
+            settings.bindings.get_mut("cancel").unwrap().current_binding =
+                format!("{group}_left+f9");
+            for candidate in [
+                format!("{group}_right+f9"),
+                format!("{group}_left+f10"),
+                format!("fn+{group}_left+f9"),
+                "f9".into(),
+            ] {
+                assert_eq!(
+                    super::binding_conflict(
+                        &settings.bindings,
+                        "assistant",
+                        &candidate,
+                        implementation
+                    ),
+                    None,
+                    "{group}: {candidate}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    use super::{
+        binding_conflict, bindings_for_implementation, configured_bindings, settings,
+        KeyboardImplementation,
+    };
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn assistant_conflict_normalizes_aliases_and_includes_disabled_cleanup_and_cancel() {
+        let mut settings = settings::get_default_settings();
+        settings.post_process_enabled = false;
+        assert_eq!(
+            binding_conflict(
+                &settings.bindings,
+                "assistant",
+                "CONTROL+SPACE",
+                settings.keyboard_implementation
+            ),
+            Some("transcribe".into())
+        );
+        assert_eq!(
+            binding_conflict(
+                &settings.bindings,
+                "assistant",
+                "SHIFT+Control+space",
+                settings.keyboard_implementation
+            ),
+            Some("transcribe_with_post_process".into())
+        );
+        assert_eq!(
+            binding_conflict(
+                &settings.bindings,
+                "assistant",
+                "ESCAPE",
+                settings.keyboard_implementation
+            ),
+            Some("cancel".into())
+        );
+        assert_eq!(
+            binding_conflict(
+                &settings.bindings,
+                "assistant",
+                "ALT+Control+SPACE",
+                settings.keyboard_implementation
+            ),
+            None
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn assistant_conflict_uses_backend_key_aliases_and_modifier_identities() {
+        for implementation in [
+            KeyboardImplementation::Tauri,
+            KeyboardImplementation::HandyKeys,
+        ] {
+            let mut settings = settings::get_default_settings();
+            settings.keyboard_implementation = implementation;
+            for (existing, candidate) in [
+                ("escape", "esc"),
+                ("esc", "escape"),
+                ("ctrl+alt+space", "ALT+CONTROL+SPACE"),
+                ("ctrl+space", "control+space"),
+            ] {
+                settings.bindings.get_mut("cancel").unwrap().current_binding = existing.into();
+                assert_eq!(
+                    binding_conflict(&settings.bindings, "assistant", candidate, implementation),
+                    Some("cancel".into()),
+                    "{implementation:?}: {existing} vs {candidate}"
+                );
+            }
+            settings.bindings.get_mut("cancel").unwrap().current_binding = "escape".into();
+            settings
+                .bindings
+                .get_mut("assistant")
+                .unwrap()
+                .current_binding = "esc".into();
+            assert!(!configured_bindings(&settings)
+                .iter()
+                .any(|b| b.id == "assistant"));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn assistant_handy_keys_side_distinct_modifiers_do_not_conflict() {
+        let mut settings = settings::get_default_settings();
+        let implementation = KeyboardImplementation::HandyKeys;
+        // F9 isolates the two side-specific bindings from default Ctrl+Space,
+        // which correctly overlaps either side after generic overlap checking.
+        settings.bindings.get_mut("cancel").unwrap().current_binding = "ctrl_left+f9".into();
+        assert_eq!(
+            binding_conflict(
+                &settings.bindings,
+                "assistant",
+                "control_left+f9",
+                implementation
+            ),
+            Some("cancel".into())
+        );
+        assert_eq!(
+            binding_conflict(
+                &settings.bindings,
+                "assistant",
+                "ctrl_right+f9",
+                implementation
+            ),
+            None
+        );
+        settings.bindings.get_mut("cancel").unwrap().current_binding = "option_left+f9".into();
+        assert_eq!(
+            binding_conflict(
+                &settings.bindings,
+                "assistant",
+                "alt_right+f9",
+                implementation
+            ),
+            None
+        );
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn changing_startup_skipped_assistant_does_not_unregister_other_owner() {
+        let mut settings = settings::get_default_settings();
+        settings.keyboard_implementation = KeyboardImplementation::Tauri;
+        settings
+            .bindings
+            .get_mut("assistant")
+            .unwrap()
+            .current_binding = "esc".into();
+        super::unregister_previous_binding(&settings, &settings.bindings["assistant"], |_| {
+            panic!("Escape belongs to cancel; the skipped assistant must not unregister it");
+        })
+        .unwrap();
+        let mut called = false;
+        super::unregister_previous_binding(
+            &settings,
+            &settings.bindings["transcribe"],
+            |binding| {
+                assert_eq!(binding.id, "transcribe");
+                called = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(called);
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn assistant_implementation_switch_and_resume_keep_registration_order_and_user_bindings() {
+        let mut settings = settings::get_default_settings();
+        settings.post_process_enabled = true;
+        settings
+            .bindings
+            .get_mut("transcribe")
+            .unwrap()
+            .current_binding = "ctrl+f8".into();
+        settings
+            .bindings
+            .get_mut("assistant")
+            .unwrap()
+            .current_binding = "option_left+space".into();
+        let (handy, reset) =
+            bindings_for_implementation(&mut settings, KeyboardImplementation::HandyKeys);
+        assert!(reset.is_empty());
+        assert_eq!(
+            handy.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+            ["transcribe", "transcribe_with_post_process", "assistant"]
+        );
+        assert_eq!(handy.last().unwrap().current_binding, "option_left+space");
+        let (tauri, reset) =
+            bindings_for_implementation(&mut settings, KeyboardImplementation::Tauri);
+        assert_eq!(reset, ["assistant"]);
+        assert_eq!(tauri.last().unwrap().current_binding, "ctrl+alt+space");
+        assert_eq!(tauri.first().unwrap().current_binding, "ctrl+f8");
+        assert_eq!(
+            serde_json::to_value(configured_bindings(&settings)).unwrap(),
+            serde_json::to_value(&tauri).unwrap()
+        );
+        let (again, reset) =
+            bindings_for_implementation(&mut settings, KeyboardImplementation::HandyKeys);
+        assert!(reset.is_empty());
+        assert_eq!(
+            serde_json::to_value(again).unwrap(),
+            serde_json::to_value(tauri).unwrap()
+        );
+        settings
+            .bindings
+            .get_mut("assistant")
+            .unwrap()
+            .current_binding = "ctrl+f8".into();
+        assert_eq!(
+            configured_bindings(&settings)
+                .iter()
+                .map(|b| b.id.as_str())
+                .collect::<Vec<_>>(),
+            ["transcribe", "transcribe_with_post_process"]
+        );
+        for implementation in [
+            KeyboardImplementation::Tauri,
+            KeyboardImplementation::HandyKeys,
+        ] {
+            let (bindings, _) = bindings_for_implementation(&mut settings, implementation);
+            assert_eq!(
+                bindings.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+                ["transcribe", "transcribe_with_post_process"]
+            );
+        }
+    }
     use handy_keys::Hotkey;
     use tauri_plugin_global_shortcut::Shortcut;
 

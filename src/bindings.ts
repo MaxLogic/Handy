@@ -5,6 +5,25 @@
 
 
 export const commands = {
+async getAssistantRecoveryState() : Promise<AssistantRecoveryState> {
+    return await TAURI_INVOKE("get_assistant_recovery_state");
+},
+async copyAssistantRecoveryText(id: number, part: RecoveryPart) : Promise<Result<null, string>> {
+    try {
+        return { status: "ok", data: await TAURI_INVOKE("copy_assistant_recovery_text", { id, part }) };
+    } catch (e) {
+        if(e instanceof Error) throw e;
+        else return { status: "error", error: e as any };
+    }
+},
+async dismissAssistantRecoveryItem(id: number) : Promise<Result<null, string>> {
+    try {
+        return { status: "ok", data: await TAURI_INVOKE("dismiss_assistant_recovery_item", { id }) };
+    } catch (e) {
+        if(e instanceof Error) throw e;
+        else return { status: "error", error: e as any };
+    }
+},
 async changeBinding(id: string, binding: string) : Promise<Result<BindingResponse, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("change_binding", { id, binding }) };
@@ -951,10 +970,14 @@ async isLaptop() : Promise<Result<boolean, string>> {
 
 
 export const events = __makeEvents__<{
+assistantRecoveryUpdate: AssistantRecoveryUpdate,
+assistantErrorEvent: AssistantErrorEvent,
 historyUpdatePayload: HistoryUpdatePayload,
 streamPhaseEvent: StreamPhaseEvent,
 streamTextEvent: StreamTextEvent
 }>({
+assistantRecoveryUpdate: "assistant-recovery-update",
+assistantErrorEvent: "assistant-error-event",
 historyUpdatePayload: "history-update-payload",
 streamPhaseEvent: "stream-phase-event",
 streamTextEvent: "stream-text-event"
@@ -965,6 +988,22 @@ streamTextEvent: "stream-text-event"
 
 
 /** user-defined types **/
+
+export type AssistantErrorEvent = { stage: AssistantStage; code: string; reason: string | null; detail: string | null }
+
+export type AssistantRecoveryItem = { id: number; created_at: number; target: TargetKind; outcome: RecoveryOutcome; reason: string; detail: string | null; clipboard: string; instruction: string; generated: string }
+
+export type AssistantRecoveryState = { items: AssistantRecoveryItem[]; capacity: number; free_slots: number }
+
+export type AssistantRecoveryUpdate = { action: "added"; item: AssistantRecoveryItem } | { action: "dismissed"; id: number }
+
+export type AssistantStage = "intake" | "capture" | "transcription" | "generation"
+
+export type RecoveryOutcome = "refused" | "failed" | "uncertain"
+
+export type RecoveryPart = "generated" | "instruction"
+
+export type TargetKind = "selected" | "empty"
 
 /**
  * The container-level `serde(default)` (backed by the `Default` impl below)

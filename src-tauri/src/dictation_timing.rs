@@ -184,11 +184,17 @@ pub enum Mode {
     Raw,
     /// Transcription followed by the existing LLM post-processing route.
     Cleanup,
+    Assistant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
+    Committed,
+    CommitRefused,
+    CommitFailed,
+    CommitUncertain,
+    LlmError,
     /// Text was handed to the paste path and it reported success.
     Pasted,
     /// Cleanup failed; unchanged raw text was successfully pasted instead.
@@ -229,6 +235,7 @@ pub enum Stage {
     History,
     MainSched,
     Paste,
+    Commit,
 }
 
 /// Per-stage durations in microseconds; absent when the stage was not reached.
@@ -254,6 +261,8 @@ pub struct Stages {
     pub main_sched_us: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paste_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_us: Option<u64>,
 }
 
 impl Stages {
@@ -269,6 +278,7 @@ impl Stages {
             Stage::History => &mut self.history_us,
             Stage::MainSched => &mut self.main_sched_us,
             Stage::Paste => &mut self.paste_us,
+            Stage::Commit => &mut self.commit_us,
         }
     }
 
@@ -285,6 +295,7 @@ impl Stages {
             self.history_us,
             self.main_sched_us,
             self.paste_us,
+            self.commit_us,
         ]
         .into_iter()
         .flatten()
@@ -317,6 +328,11 @@ pub struct TimingRecord {
     pub audio_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stt_path: Option<SttPath>,
+    /// Keypress-to-capture time, outside the stop-to-output total.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_scalars: Option<u64>,
     pub stages: Stages,
     /// Accepted stop until completion or refusal of the output.
     pub total_us: u64,
@@ -413,6 +429,8 @@ struct Inner {
     holds_active_slot: bool,
     audio_ms: Option<u64>,
     stt_path: Option<SttPath>,
+    capture_us: Option<u64>,
+    selection_scalars: Option<u64>,
     stages: Stages,
     paste_calls: u32,
     engine_pending_at_stt: Option<u32>,
@@ -446,6 +464,8 @@ impl Inner {
             holds_active_slot: false,
             audio_ms: None,
             stt_path: None,
+            capture_us: None,
+            selection_scalars: None,
             stages: Stages::default(),
             paste_calls: 0,
             engine_pending_at_stt: None,
@@ -488,6 +508,8 @@ impl Inner {
             cold: !self.model_resident,
             audio_ms: self.audio_ms,
             stt_path: self.stt_path,
+            capture_us: self.capture_us,
+            selection_scalars: self.selection_scalars,
             stages: self.stages.clone(),
             total_us,
             model_loads_delta: end
@@ -587,6 +609,12 @@ impl OperationTimer {
         self.inner().audio_ms = Some(sample_count as u64 * 1000 / SAMPLE_RATE_HZ);
     }
 
+    pub fn set_capture(&self, duration: Duration) {
+        self.inner().capture_us = Some(micros(duration));
+    }
+    pub fn set_selection_scalars(&self, scalars: u64) {
+        self.inner().selection_scalars = Some(scalars);
+    }
     pub fn set_stt_path(&self, path: SttPath) {
         self.inner().stt_path = Some(path);
     }
@@ -1161,6 +1189,83 @@ pub(super) mod tests {
         assert_eq!(value["mode"], "cleanup");
         assert_eq!(value["outcome"], "cleanup_fallback");
         assert_eq!(value["paste_calls"], 1);
+    }
+
+    #[test]
+    fn assistant_fields_and_terminal_outcomes_serialize_additively_at_schema_one() {
+        for (outcome, expected) in [
+            (Outcome::Committed, "committed"),
+            (Outcome::CommitRefused, "commit_refused"),
+            (Outcome::CommitFailed, "commit_failed"),
+            (Outcome::CommitUncertain, "commit_uncertain"),
+            (Outcome::LlmError, "llm_error"),
+            (Outcome::Cancelled, "cancelled"),
+            (Outcome::EmptyOutput, "empty_output"),
+        ] {
+            let mut op = inner(Mode::Assistant, true);
+            op.capture_us = Some(900_000);
+            op.selection_scalars = Some(0);
+            op.stages.stt_us = Some(10_000);
+            op.stages.llm_us = Some(20_000);
+            op.stages.commit_us = Some(30_000);
+            op.paste_calls = 1;
+            let record = finished_record(&mut op, outcome, 60_000, counters_at(2, 1, 100, 6));
+            let value = serde_json::to_value(&record).unwrap();
+            assert_eq!(value["schema"], 1);
+            assert_eq!(value["mode"], "assistant");
+            assert_eq!(value["outcome"], expected);
+            assert_eq!(value["capture_us"], 900_000);
+            assert_eq!(value["selection_scalars"], 0);
+            assert_eq!(value["paste_calls"], 1);
+            assert_eq!(
+                value["stages"],
+                serde_json::json!({"stt_us": 10_000, "llm_us": 20_000, "commit_us": 30_000})
+            );
+            assert_eq!(record.stages.sum_us(), 60_000);
+            assert!(
+                violations(&record).is_empty(),
+                "capture is outside stop-to-output total"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_commit_contributes_to_stage_sum_and_duplicate_commit_invariants() {
+        let mut op = inner(Mode::Assistant, true);
+        op.capture_us = Some(u64::MAX);
+        op.selection_scalars = Some(20_001);
+        op.stages.stt_us = Some(10_000);
+        op.stages.llm_us = Some(20_000);
+        op.stages.commit_us = Some(30_000);
+        let mut record = finished_record(
+            &mut op,
+            Outcome::Committed,
+            58_999,
+            counters_at(2, 1, 100, 6),
+        );
+        assert_eq!(violations(&record), [Invariant::StageSumExceedsTotal]);
+        record.total_us = 59_000;
+        assert!(violations(&record).is_empty());
+        record.paste_calls = 2;
+        assert_eq!(violations(&record), [Invariant::DuplicatePaste]);
+        record.stages.commit_us = Some(u64::MAX);
+        assert_eq!(record.stages.sum_us(), u64::MAX, "stage sum saturates");
+        record.total_us = u64::MAX;
+        assert_eq!(violations(&record), [Invariant::DuplicatePaste]);
+    }
+
+    #[test]
+    fn assistant_absent_fields_are_omitted_and_ordinary_dictation_layout_is_unchanged() {
+        for mode in [Mode::Raw, Mode::Cleanup, Mode::Assistant] {
+            let mut op = inner(mode, true);
+            let record =
+                finished_record(&mut op, Outcome::Cancelled, 10, counters_at(2, 1, 100, 5));
+            let value = serde_json::to_value(&record).unwrap();
+            assert!(value.get("capture_us").is_none());
+            assert!(value.get("selection_scalars").is_none());
+            assert!(value["stages"].get("commit_us").is_none());
+            assert_eq!(value["stages"], serde_json::json!({}));
+        }
     }
 
     #[test]

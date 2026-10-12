@@ -422,38 +422,42 @@ pub fn validate_shortcut(raw: &str) -> Result<(), String> {
 }
 
 /// Initialize handy-keys shortcuts
-pub fn init_shortcuts(app: &AppHandle) -> Result<(), String> {
-    let state = HandyKeysState::new(app.clone())?;
-
-    let default_bindings = settings::get_default_settings().bindings;
-    let user_settings = settings::load_or_create_app_settings(app);
-
-    // Register all bindings except cancel (which is dynamic)
-    for (id, default_binding) in default_bindings {
-        if id == "cancel" {
-            continue;
-        }
-        // Skip post-processing shortcut when the feature is disabled
-        if id == "transcribe_with_post_process" && !user_settings.post_process_enabled {
-            continue;
-        }
-
-        let binding = user_settings
-            .bindings
-            .get(&id)
-            .cloned()
-            .unwrap_or(default_binding);
-
-        if let Err(e) = state.register(&binding) {
+pub(crate) trait InitContext {
+    type Registration;
+    fn create_registration(&self) -> Result<Self::Registration, String>;
+    fn settings(&self) -> settings::AppSettings;
+    fn register(&self, state: &Self::Registration, binding: &ShortcutBinding)
+        -> Result<(), String>;
+    fn finish(&self, state: Self::Registration);
+}
+impl InitContext for AppHandle {
+    type Registration = HandyKeysState;
+    fn create_registration(&self) -> Result<HandyKeysState, String> {
+        HandyKeysState::new(self.clone())
+    }
+    fn settings(&self) -> settings::AppSettings {
+        settings::load_or_create_app_settings(self)
+    }
+    fn register(&self, state: &HandyKeysState, binding: &ShortcutBinding) -> Result<(), String> {
+        state.register(binding)
+    }
+    fn finish(&self, state: HandyKeysState) {
+        self.manage(state);
+    }
+}
+pub(crate) fn init_shortcuts(app: &impl InitContext) -> Result<(), String> {
+    let state = app.create_registration()?;
+    let user_settings = app.settings();
+    for binding in super::configured_bindings(&user_settings) {
+        if let Err(e) = app.register(&state, &binding) {
             error!(
-                "Failed to register handy-keys shortcut {} during init: {}",
-                id, e
+                "Failed to register shortcut '{}' during init: {}",
+                binding.id, e
             );
         }
     }
-
-    app.manage(state);
-    info!("handy-keys shortcuts initialized");
+    app.finish(state);
+    info!("handy-keys shortcuts initialized successfully");
     Ok(())
 }
 
@@ -526,4 +530,101 @@ pub fn stop_handy_keys_recording(app: AppHandle) -> Result<(), String> {
     let result = state.stop_recording();
     super::resume_all_shortcuts(&app);
     result
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod assistant_registration_tests {
+    use crate::settings;
+    struct FakeInit {
+        settings: settings::AppSettings,
+        registered: std::sync::Mutex<Vec<settings::ShortcutBinding>>,
+    }
+    fn initialized(settings: &settings::AppSettings) -> Vec<settings::ShortcutBinding> {
+        let context = FakeInit {
+            settings: settings.clone(),
+            registered: std::sync::Mutex::new(Vec::new()),
+        };
+        super::init_shortcuts(&context).unwrap();
+        context.registered.into_inner().unwrap()
+    }
+    impl super::InitContext for FakeInit {
+        type Registration = ();
+        fn create_registration(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn settings(&self) -> settings::AppSettings {
+            self.settings.clone()
+        }
+        fn register(&self, _: &(), binding: &settings::ShortcutBinding) -> Result<(), String> {
+            super::validate_shortcut(&binding.current_binding)?;
+            self.registered.lock().unwrap().push(binding.clone());
+            Ok(())
+        }
+        fn finish(&self, _: ()) {}
+    }
+
+    #[test]
+    fn assistant_handy_keys_registration_order_keeps_raw_and_cleanup_first() {
+        let mut settings = settings::get_default_settings();
+        settings.keyboard_implementation = settings::KeyboardImplementation::HandyKeys;
+        settings.post_process_enabled = true;
+        let bindings = initialized(&settings);
+        assert_eq!(
+            bindings.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+            ["transcribe", "transcribe_with_post_process", "assistant"]
+        );
+        for binding in bindings {
+            assert!(super::validate_shortcut(&binding.current_binding).is_ok());
+        }
+        settings.post_process_enabled = false;
+        assert_eq!(
+            initialized(&settings)
+                .iter()
+                .map(|b| b.id.as_str())
+                .collect::<Vec<_>>(),
+            ["transcribe", "assistant"]
+        );
+    }
+
+    #[test]
+    fn assistant_handy_keys_conflict_preserves_existing_binding_and_missing_defaults() {
+        let mut settings = settings::get_default_settings();
+        settings.keyboard_implementation = settings::KeyboardImplementation::HandyKeys;
+        settings.post_process_enabled = true;
+        settings
+            .bindings
+            .get_mut("transcribe")
+            .unwrap()
+            .current_binding = "ctrl+alt+space".into();
+        let before = serde_json::to_value(&settings.bindings).unwrap();
+        assert_eq!(
+            initialized(&settings)
+                .iter()
+                .map(|b| b.id.as_str())
+                .collect::<Vec<_>>(),
+            ["transcribe", "transcribe_with_post_process"]
+        );
+        assert_eq!(serde_json::to_value(&settings.bindings).unwrap(), before);
+        settings.bindings.remove("assistant");
+        assert_eq!(initialized(&settings).len(), 2);
+        settings
+            .bindings
+            .get_mut("transcribe")
+            .unwrap()
+            .current_binding = "ctrl+f8".into();
+        assert_eq!(initialized(&settings).last().unwrap().id, "assistant");
+        settings
+            .bindings
+            .get_mut("transcribe_with_post_process")
+            .unwrap()
+            .current_binding = "ctrl+alt+space".into();
+        settings.post_process_enabled = false;
+        assert_eq!(
+            initialized(&settings)
+                .iter()
+                .map(|b| b.id.as_str())
+                .collect::<Vec<_>>(),
+            ["transcribe"]
+        );
+    }
 }

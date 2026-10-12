@@ -1,7 +1,7 @@
 # Dictation timing measurement
 
 How to capture and summarize production timings for the stop-to-output
-dictation pipeline (raw and LLM-cleanup routes). Agents cannot run the
+dictation pipeline (raw, LLM cleanup, and assistant routes). Agents cannot run the
 real-microphone baseline; follow this procedure yourself.
 
 ## What is recorded
@@ -19,23 +19,25 @@ app log. The pipeline never waits for the file.
 
 Key fields (durations are microseconds from `std::time::Instant`):
 
-| Field                   | Meaning                                                                                                                                      |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `op_id`                 | Operation ID; the same value appears as `op=` in the app log                                                                                 |
-| `session`, `seq`        | Process start (unix ms) and per-process record counter starting at 1; the end marker states the final count, so a lost record is detected    |
-| `label`                 | Workload label from `HANDY_DICTATION_TIMING_LABEL` (for example the spoken language)                                                         |
-| `mode`                  | `raw` (no LLM) or `cleanup` (existing post-processing route)                                                                                 |
-| `outcome`               | `pasted`, `cleanup_fallback`, `empty_output`, `paste_error`, `main_thread_error`, `transcription_error`, `cancelled`, `no_samples`, `empty_audio`, `aborted`     |
-| `cold`                  | Model was not resident when the recording started                                                                                            |
-| `audio_ms`              | Captured audio length after the recorder's VAD (not the spoken length), used to bucket 5/15/60 s workloads                                   |
-| `total_us`              | Accepted stop event until output completed or was refused                                                                                    |
-| `stages`                | `stop_sync`, `task_sched`, `audio_finalize`, `stt`, `wav_wait`, `text_cleanup`, `llm`, `history`, `main_sched`, `paste`                      |
-| `model_loads_delta`     | Model load attempts between recording start and completion                                                                                   |
-| `worker_spawns_delta`   | Worker processes started in that window; `worker_pid_before/after` show PID changes                                                          |
-| `llm_requests`          | LLM requests sent for this operation                                                                                                         |
-| `paste_calls`           | Paste invocations for this operation                                                                                                         |
-| `active_ops`            | Operations in flight when the stop was accepted, including this one                                                                          |
-| `engine_pending_at_stt` | Engine commands outstanding just before STT started (queue depth). Counts transcribe-cpp supervisor commands only; ONNX models always read 0 |
+| Field                   | Meaning                                                                                                                                                                                                                                                           |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `op_id`                 | Operation ID; the same value appears as `op=` in the app log                                                                                                                                                                                                      |
+| `session`, `seq`        | Process start (unix ms) and per-process record counter starting at 1; the end marker states the final count, so a lost record is detected                                                                                                                         |
+| `label`                 | Workload label from `HANDY_DICTATION_TIMING_LABEL` (for example the spoken language)                                                                                                                                                                              |
+| `mode`                  | `raw` (no LLM), `cleanup` (post-processing), or `assistant` (strict selected-text/empty-cursor commit)                                                                                                                                                            |
+| `outcome`               | `pasted`, `cleanup_fallback`, `empty_output`, `paste_error`, `main_thread_error`, `transcription_error`, `cancelled`, `no_samples`, `empty_audio`, `aborted`; assistant also uses `committed`, `commit_refused`, `commit_failed`, `commit_uncertain`, `llm_error` |
+| `cold`                  | Model was not resident when the recording started                                                                                                                                                                                                                 |
+| `audio_ms`              | Captured audio length after the recorder's VAD (not the spoken length), used to bucket 5/15/60 s workloads                                                                                                                                                        |
+| `capture_us`            | Assistant keypress-to-capture duration; outside `stages` and `total_us`                                                                                                                                                                                           |
+| `selection_scalars`     | Assistant source size in Unicode scalars; zero is a verified empty cursor                                                                                                                                                                                         |
+| `total_us`              | Accepted stop event until output completed or was refused                                                                                                                                                                                                         |
+| `stages`                | `stop_sync`, `task_sched`, `audio_finalize`, `stt`, `wav_wait`, `text_cleanup`, `llm`, `history`, `main_sched`, `paste`, `commit`                                                                                                                                 |
+| `model_loads_delta`     | Model load attempts between recording start and completion                                                                                                                                                                                                        |
+| `worker_spawns_delta`   | Worker processes started in that window; `worker_pid_before/after` show PID changes                                                                                                                                                                               |
+| `llm_requests`          | LLM requests sent for this operation                                                                                                                                                                                                                              |
+| `paste_calls`           | Paste invocations for this operation                                                                                                                                                                                                                              |
+| `active_ops`            | Operations in flight when the stop was accepted, including this one                                                                                                                                                                                               |
+| `engine_pending_at_stt` | Engine commands outstanding just before STT started (queue depth). Counts transcribe-cpp supervisor commands only; ONNX models always read 0                                                                                                                      |
 
 Boundaries to keep in mind when reading the numbers:
 
@@ -49,11 +51,40 @@ Boundaries to keep in mind when reading the numbers:
   It is timed separately and excluded from `stt`. `llm` is the LLM step only.
 - `paste` covers `utils::paste`, including its own clipboard settle and restore
   waits. `main_sched` is the delay before the main thread starts the paste.
+- `commit` covers the assistant strict commit and its abort/restore/settlement acknowledgment. `paste_calls` counts strict commit calls too. Assistant runs save no history or WAV.
+- Assistant records appear separately, grouped by empty, <=100, <=2000, <=20000 and >20000 source scalars. Each outcome is counted; committed runs report total median/p95 and capture median. They never supply raw/cleanup `--samples`, cold samples, or baseline comparisons. `--modes` remains `raw|cleanup`.
 - Stages are sequential and disjoint, so their sum must not exceed `total_us`.
 - The last record is written after the paste completes. Quit the app from the
   tray (not by killing it) so it writes the `session_end` marker. A session
   without that marker, or whose marker count differs from the records present,
   fails the summary.
+
+### Assistant records
+
+Assistant fields are additive at schema 1. `capture_us` and
+`selection_scalars` are omitted for ordinary dictation. A zero source size
+means a positively verified empty cursor; whitespace selections count as selected
+text. Capture precedes recording and is outside the stop-to-output clock.
+The `commit_us` stage includes strict commit or abort plus clipboard settlement
+acknowledgment and contributes to the stage sum.
+
+| Outcome            | Meaning                                                                      |
+| ------------------ | ---------------------------------------------------------------------------- |
+| `committed`        | Strict commit acknowledged delivery                                          |
+| `commit_refused`   | Commit refused; generated output remains in memory for recovery              |
+| `commit_failed`    | Commit failed; generated output remains in memory for recovery               |
+| `commit_uncertain` | Delivery or settlement uncertain; retain recovery, never retry automatically |
+| `llm_error`        | Generation failed before mutation; no recovery item                          |
+| `cancelled`        | Explicit cancellation or shutdown discarded uncommitted output               |
+| `empty_output`     | Blank spoken instruction; no generation or commit                            |
+
+These records never count toward raw/cleanup warm or cold samples or baseline
+comparisons. Assistant summaries count all outcomes separately and group
+committed results by source size: empty, up to 100, up to 2000, up to 20000,
+and over 20000 scalars. They report total median/p95 and capture median.
+No assistant history entry or WAV file is saved. Timing contains sizes and
+closed outcome codes; spoken instructions, source selections, generated output,
+and recovery content are excluded.
 
 ### Invariants checked per record
 
@@ -120,8 +151,8 @@ change the configuration between them.
    plus a diff hash (`git diff HEAD | sha256sum`), build configuration, all
    relevant settings, STT model, LLM server version, LLM model and
    quantization, any concurrent GPU workload, and the date.
-10. Assistant mode (later slices) uses selections of empty, 100, 2000 and
-    20000 characters; do not infer an assistant baseline from raw or cleanup.
+10. Assistant mode uses a verified empty cursor or selections of 100, 2000 and
+    20000 Unicode scalar values; do not infer an assistant baseline from raw or cleanup.
 
 ## Summarize
 
