@@ -1216,25 +1216,7 @@ pub fn update_post_process_prompt(
 pub fn delete_post_process_prompt(app: AppHandle, id: String) -> Result<(), String> {
     let mut settings = settings::get_settings(&app);
 
-    // Don't allow deleting the last prompt
-    if settings.post_process_prompts.len() <= 1 {
-        return Err("Cannot delete the last prompt".to_string());
-    }
-
-    // Find and remove the prompt
-    let original_len = settings.post_process_prompts.len();
-    settings.post_process_prompts.retain(|p| p.id != id);
-
-    if settings.post_process_prompts.len() == original_len {
-        return Err(format!("Prompt with id '{}' not found", id));
-    }
-
-    // If the deleted prompt was selected, select the first one or None
-    if settings.post_process_selected_prompt_id.as_ref() == Some(&id) {
-        settings.post_process_selected_prompt_id =
-            settings.post_process_prompts.first().map(|p| p.id.clone());
-    }
-
+    settings::remove_prompt(&mut settings, &id)?;
     settings::write_settings(&app, settings);
     Ok(())
 }
@@ -1281,7 +1263,7 @@ pub async fn fetch_post_process_models(
         ));
     }
 
-    crate::llm_client::fetch_models(provider, api_key).await
+    crate::llm_client::fetch_models(provider, api_key, &settings.post_process_request_options).await
 }
 
 #[tauri::command]
@@ -1295,6 +1277,34 @@ pub fn set_post_process_selected_prompt(app: AppHandle, id: String) -> Result<()
     }
 
     settings.post_process_selected_prompt_id = Some(id);
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn change_post_process_request_options(
+    app: AppHandle,
+    options: settings::LlmRequestOptions,
+) -> Result<(), String> {
+    options.validate()?;
+    let mut settings = settings::get_settings(&app);
+    settings.post_process_request_options = options;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn set_assistant_selected_prompt(app: AppHandle, id: Option<String>) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    if id
+        .as_ref()
+        .is_some_and(|id| !settings.post_process_prompts.iter().any(|p| &p.id == id))
+    {
+        return Err("Prompt not found".into());
+    }
+    settings.assistant_selected_prompt_id = id;
     settings::write_settings(&app, settings);
     Ok(())
 }

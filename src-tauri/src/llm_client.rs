@@ -1,4 +1,4 @@
-use crate::settings::PostProcessProvider;
+use crate::settings::{LlmRequestOptions, PostProcessProvider};
 use log::{debug, error, info};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, REFERER, USER_AGENT};
 use serde::{Deserialize, Serialize};
@@ -6,6 +6,220 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+
+pub enum ConfigError {
+    NoProvider,
+    NoModel,
+    NoPrompt,
+    PromptNotFound,
+    EmptyPrompt,
+    InvalidOptions(String),
+    UnsupportedProvider,
+    InvalidHeader,
+    OptionsRejected { status: u16, detail: String },
+}
+
+#[derive(Debug)]
+pub enum InputError {
+    BlankText,
+    TooLong {
+        field: &'static str,
+        limit: usize,
+        actual: usize,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+pub enum OutputError {
+    MalformedResponse,
+    Empty,
+    ReasoningOnly,
+    Truncated,
+    Filtered,
+    MalformedJson,
+    MissingField,
+    TooLarge,
+}
+
+pub enum LlmError {
+    Config(ConfigError),
+    Input(InputError),
+    Timeout,
+    Transport(String),
+    Provider { status: u16, detail: String },
+    ResponseTooLarge,
+    InvalidOutput(OutputError),
+}
+
+impl std::fmt::Debug for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OptionsRejected { status, .. } => f
+                .debug_struct("OptionsRejected")
+                .field("status", status)
+                .field("detail", &"[REDACTED]")
+                .finish(),
+            Self::InvalidOptions(reason) => f.debug_tuple("InvalidOptions").field(reason).finish(),
+            Self::NoProvider => f.write_str("NoProvider"),
+            Self::NoModel => f.write_str("NoModel"),
+            Self::NoPrompt => f.write_str("NoPrompt"),
+            Self::PromptNotFound => f.write_str("PromptNotFound"),
+            Self::EmptyPrompt => f.write_str("EmptyPrompt"),
+            Self::UnsupportedProvider => f.write_str("UnsupportedProvider"),
+            Self::InvalidHeader => f.write_str("InvalidHeader"),
+        }
+    }
+}
+
+impl std::fmt::Debug for LlmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(error) => f.debug_tuple("Config").field(error).finish(),
+            Self::Input(error) => f.debug_tuple("Input").field(error).finish(),
+            Self::Timeout => f.write_str("Timeout"),
+            Self::Transport(reason) => f.debug_tuple("Transport").field(reason).finish(),
+            Self::Provider { status, .. } => f
+                .debug_struct("Provider")
+                .field("status", status)
+                .field("detail", &"[REDACTED]")
+                .finish(),
+            Self::ResponseTooLarge => f.write_str("ResponseTooLarge"),
+            Self::InvalidOutput(error) => f.debug_tuple("InvalidOutput").field(error).finish(),
+        }
+    }
+}
+
+impl LlmError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Config(_) => "llm_config",
+            Self::Input(_) => "llm_input",
+            Self::Timeout => "llm_timeout",
+            Self::Transport(_) => "llm_transport",
+            Self::Provider { .. } => "llm_provider",
+            Self::ResponseTooLarge => "llm_response_too_large",
+            Self::InvalidOutput(_) => "llm_invalid_output",
+        }
+    }
+
+    /// Provider details are for explicit UI display only, never logging.
+    #[allow(dead_code)] // Recovery UI consumes this in later slices.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Provider { detail, .. }
+            | Self::Config(ConfigError::OptionsRejected { detail, .. }) => Some(detail),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for LlmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.code())?;
+        match self {
+            Self::Provider { status, .. }
+            | Self::Config(ConfigError::OptionsRejected { status, .. }) => {
+                write!(f, " (status: {status})")
+            }
+            Self::Input(InputError::TooLong {
+                field,
+                limit,
+                actual,
+            }) => write!(f, " ({field}: {actual}, limit: {limit})"),
+            Self::InvalidOutput(reason) => write!(f, " ({reason:?})"),
+            Self::Config(ConfigError::InvalidOptions(reason)) => write!(f, " ({reason})"),
+            Self::Transport(reason) => write!(f, " ({reason})"),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl StdError for LlmError {}
+
+pub struct ChatRequest<'a> {
+    pub provider: &'a PostProcessProvider,
+    pub api_key: &'a str,
+    pub model: &'a str,
+    pub system: &'a str,
+    pub user: &'a str,
+    pub schema: Option<(&'static str, Value)>,
+    pub disable_reasoning: bool,
+    pub options: &'a LlmRequestOptions,
+}
+
+pub struct ChatReply {
+    pub content: Option<String>,
+    pub finish_reason: Option<String>,
+    pub had_reasoning: bool,
+}
+
+// Intentionally no Debug/Display: the cache identity contains credentials.
+#[derive(PartialEq)]
+struct ClientKey {
+    provider_id: String,
+    base_url: String,
+    api_key: String,
+    connect_timeout_secs: u32,
+}
+
+#[derive(Default)]
+pub(crate) struct ClientCache(Mutex<Option<(ClientKey, reqwest::Client)>>);
+
+impl ClientCache {
+    fn client(
+        &self,
+        provider: &PostProcessProvider,
+        api_key: &str,
+        options: &LlmRequestOptions,
+    ) -> Result<reqwest::Client, LlmError> {
+        let key = ClientKey {
+            provider_id: provider.id.clone(),
+            base_url: provider.base_url.trim_end_matches('/').into(),
+            api_key: api_key.into(),
+            connect_timeout_secs: options.connect_timeout_secs,
+        };
+        let mut slot = self
+            .0
+            .lock()
+            .map_err(|_| LlmError::Transport("HTTP client cache unavailable".into()))?;
+        if let Some((old, client)) = &*slot {
+            if *old == key {
+                return Ok(client.clone());
+            }
+        }
+        let headers = build_headers(provider, api_key)
+            .map_err(|_| LlmError::Config(ConfigError::InvalidHeader))?;
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .connect_timeout(Duration::from_secs(options.connect_timeout_secs.into()))
+            .build()
+            .map_err(|e| {
+                LlmError::Transport(report_reqwest_error("Failed to build HTTP client", &e))
+            })?;
+        *slot = Some((key, client.clone()));
+        Ok(client)
+    }
+}
+
+static CLIENT_CACHE: ClientCache = ClientCache(Mutex::new(None));
+pub(crate) const MAX_BODY: usize = 4 * 1024 * 1024;
+const MAX_REQUEST: usize = 4 * 1024 * 1024;
+const MAX_ERROR_BODY: usize = 64 * 1024;
+
+pub(crate) struct Limits {
+    pub deadline: Duration,
+    pub max_body: usize,
+}
+
+impl Limits {
+    fn from_options(options: &LlmRequestOptions) -> Self {
+        Self {
+            deadline: Duration::from_secs(options.timeout_secs.into()),
+            max_body: MAX_BODY,
+        }
+    }
+}
 
 #[derive(Debug, Serialize)]
 struct ChatMessage {
@@ -116,6 +330,10 @@ struct ChatCompletionRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
     #[serde(flatten)]
     reasoning: ReasoningParams,
 }
@@ -128,11 +346,14 @@ struct ChatCompletionResponse {
 #[derive(Debug, Deserialize)]
 struct ChatChoice {
     message: ChatMessageResponse,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatMessageResponse {
     content: Option<String>,
+    reasoning_content: Option<Value>,
+    reasoning: Option<Value>,
 }
 
 /// Build headers for API requests based on provider type
@@ -170,15 +391,6 @@ fn build_headers(provider: &PostProcessProvider, api_key: &str) -> Result<Header
     }
 
     Ok(headers)
-}
-
-/// Create an HTTP client with provider-specific headers
-fn create_client(provider: &PostProcessProvider, api_key: &str) -> Result<reqwest::Client, String> {
-    let headers = build_headers(provider, api_key)?;
-    reqwest::Client::builder()
-        .default_headers(headers)
-        .build()
-        .map_err(|e| report_reqwest_error("Failed to build HTTP client", &e))
 }
 
 /// Format a bounded error source chain.
@@ -294,237 +506,372 @@ fn report_reqwest_error(context: &str, error: &reqwest::Error) -> String {
     details
 }
 
-/// Send a chat completion request to an OpenAI-compatible API
-/// Returns Ok(Some(content)) on success, Ok(None) if response has no content,
-/// or Err on actual errors (HTTP, parsing, etc.)
-pub async fn send_chat_completion(
-    provider: &PostProcessProvider,
-    api_key: String,
-    model: &str,
-    prompt: String,
-    disable_reasoning: bool,
-) -> Result<Option<String>, String> {
-    send_chat_completion_with_schema(
-        provider,
-        api_key,
-        model,
-        prompt,
-        None,
-        None,
-        disable_reasoning,
-    )
-    .await
-}
-
-/// Send a chat completion request with structured output support.
-/// When json_schema is provided, uses structured outputs mode.
-/// system_prompt is used as the system message when provided.
-///
-/// When disable_reasoning is set, the request carries the reasoning-disable
-/// fields the endpoint is expected to understand. Not every OpenAI-compatible
-/// endpoint accepts them (DeepSeek, Gemini's compat layer, and some OpenRouter
-/// upstreams reject with 400), so a 400/422 answer to such a request triggers
-/// one retry without the fields, and the rejection is remembered per
-/// (base_url, model) so later requests skip the failing attempt entirely.
-pub async fn send_chat_completion_with_schema(
-    provider: &PostProcessProvider,
-    api_key: String,
-    model: &str,
-    user_content: String,
-    system_prompt: Option<String>,
-    json_schema: Option<Value>,
-    disable_reasoning: bool,
-) -> Result<Option<String>, String> {
-    let base_url = provider.base_url.trim_end_matches('/');
-    let url = format!("{}/chat/completions", base_url);
-
-    debug!(
-        "Sending chat completion request to: {}",
-        sanitized_url_for_log(&url)
-    );
-
-    let client = create_client(provider, &api_key)?;
-
-    // Build messages vector
-    let mut messages = Vec::new();
-
-    // Add system prompt if provided
-    if let Some(system) = system_prompt {
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: system,
-        });
+async fn bounded_body(
+    mut response: reqwest::Response,
+    limit: usize,
+    truncate: bool,
+) -> Result<Vec<u8>, LlmError> {
+    if !truncate && response.content_length().is_some_and(|n| n > limit as u64) {
+        return Err(LlmError::ResponseTooLarge);
     }
-
-    // Add user message
-    messages.push(ChatMessage {
-        role: "user".to_string(),
-        content: user_content,
-    });
-
-    // Build response_format if schema is provided
-    let response_format = json_schema.map(|schema| ResponseFormat {
-        format_type: "json_schema".to_string(),
-        json_schema: JsonSchema {
-            name: "transcription_output".to_string(),
-            strict: true,
-            schema,
-        },
-    });
-
-    let key = endpoint_key(provider, model);
-    let reasoning = if disable_reasoning && !is_known_rejected(&key) {
-        reasoning_disable_params(provider)
-    } else {
-        ReasoningParams::default()
-    };
-
-    let mut request_body = ChatCompletionRequest {
-        model: model.to_string(),
-        messages,
-        stream: false,
-        response_format,
-        reasoning,
-    };
-
-    let mut response = client
-        .post(&url)
-        .json(&request_body)
-        .send()
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| report_reqwest_error("HTTP request failed", &e))?;
-    let mut status = response.status();
-    debug!(
-        "Chat completion response received with status {} over {:?} from {}",
-        status,
-        response.version(),
-        sanitized_url(response.url())
-    );
-
-    // A 400/422 on a request carrying reasoning-disable fields is almost always
-    // the endpoint rejecting those fields — retry once without them.
-    if !status.is_success()
-        && matches!(status.as_u16(), 400 | 422)
-        && !request_body.reasoning.is_empty()
+        .map_err(|e| LlmError::Transport(report_reqwest_error("HTTP body read failed", &e)))?
     {
-        let error_text = response.text().await.unwrap_or_else(|e| {
-            report_reqwest_error("Failed to read reasoning rejection response", &e)
-        });
-        info!(
-            "Endpoint rejected request with reasoning disabled (status {}): {}. Retrying without reasoning fields",
-            status, error_text
-        );
-
-        request_body.reasoning = ReasoningParams::default();
-        response = client
-            .post(&url)
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| report_reqwest_error("HTTP retry failed", &e))?;
-        status = response.status();
-        debug!(
-            "Chat completion retry response received with status {} over {:?} from {}",
-            status,
-            response.version(),
-            sanitized_url(response.url())
-        );
-
-        if status.is_success() {
-            info!(
-                "Retry without reasoning fields succeeded; '{}' (model '{}') will skip them from now on",
-                sanitized_url_for_log(base_url), model
-            );
-            remember_rejection(key);
+        let remaining = limit.saturating_sub(bytes.len());
+        if chunk.len() > remaining {
+            if !truncate {
+                return Err(LlmError::ResponseTooLarge);
+            }
+            bytes.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+        if truncate && bytes.len() == limit {
+            break;
         }
     }
-
-    if !status.is_success() {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|e| report_reqwest_error("Failed to read API error response", &e));
-        return Err(format!(
-            "API request failed with status {}: {}",
-            status, error_text
-        ));
-    }
-
-    let completion: ChatCompletionResponse = response
-        .json()
-        .await
-        .map_err(|e| report_reqwest_error("Failed to parse API response", &e))?;
-
-    Ok(completion
-        .choices
-        .first()
-        .and_then(|choice| choice.message.content.clone()))
+    Ok(bytes)
 }
 
-/// Fetch available models from an OpenAI-compatible API
-/// Returns a list of model IDs
+async fn provider_error(response: reqwest::Response, options_sent: bool) -> LlmError {
+    let status = response.status().as_u16();
+    let detail = match bounded_body(response, MAX_ERROR_BODY, true).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).chars().take(1024).collect(),
+        // The HTTP status is already known; detail is best-effort UI context.
+        Err(_) => String::new(),
+    };
+    if options_sent && matches!(status, 400 | 422) {
+        LlmError::Config(ConfigError::OptionsRejected { status, detail })
+    } else {
+        LlmError::Provider { status, detail }
+    }
+}
+
+/// One generation, with at most one reasoning compatibility retry in the same deadline.
+pub async fn chat_completion(req: ChatRequest<'_>) -> Result<ChatReply, LlmError> {
+    let limits = Limits::from_options(req.options);
+    chat_completion_with_limits(req, &CLIENT_CACHE, limits).await
+}
+
+pub(crate) async fn chat_completion_with_limits(
+    req: ChatRequest<'_>,
+    cache: &ClientCache,
+    limits: Limits,
+) -> Result<ChatReply, LlmError> {
+    req.options
+        .validate()
+        .map_err(|e| LlmError::Config(ConfigError::InvalidOptions(e)))?;
+    let started = std::time::Instant::now();
+    tokio::time::timeout(limits.deadline, async {
+        let client = cache.client(req.provider, req.api_key, req.options)?;
+        let url = format!(
+            "{}/chat/completions",
+            req.provider.base_url.trim_end_matches('/')
+        );
+        let key = endpoint_key(req.provider, req.model);
+        let reasoning = if req.disable_reasoning && !is_known_rejected(&key) {
+            reasoning_disable_params(req.provider)
+        } else {
+            ReasoningParams::default()
+        };
+        let mut body = ChatCompletionRequest {
+            model: req.model.into(),
+            messages: vec![
+                ChatMessage {
+                    role: "system".into(),
+                    content: req.system.into(),
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: req.user.into(),
+                },
+            ],
+            stream: false,
+            temperature: req.options.temperature,
+            max_tokens: req.options.max_output_tokens,
+            response_format: req.schema.map(|(name, schema)| ResponseFormat {
+                format_type: "json_schema".into(),
+                json_schema: JsonSchema {
+                    name: name.into(),
+                    strict: true,
+                    schema,
+                },
+            }),
+            reasoning,
+        };
+        let encode = |body: &ChatCompletionRequest| -> Result<Vec<u8>, LlmError> {
+            let bytes = serde_json::to_vec(body).map_err(|_| {
+                LlmError::Config(ConfigError::InvalidOptions(
+                    "Request encoding failed".into(),
+                ))
+            })?;
+            if bytes.len() > MAX_REQUEST {
+                return Err(LlmError::Input(InputError::TooLong {
+                    field: "request_bytes",
+                    limit: MAX_REQUEST,
+                    actual: bytes.len(),
+                }));
+            }
+            Ok(bytes)
+        };
+        let mut response = client
+            .post(&url)
+            .body(encode(&body)?)
+            .send()
+            .await
+            .map_err(|e| LlmError::Transport(report_reqwest_error("HTTP request failed", &e)))?;
+        if matches!(response.status().as_u16(), 400 | 422) && !body.reasoning.is_empty() {
+            info!(
+                concat!(
+                    "Endpoint rejected reasoning options (status {}, url: {}); ",
+                    "retrying without reasoning fields"
+                ),
+                response.status(),
+                sanitized_url(response.url())
+            );
+            // Drain only a bounded error body. The retry shares the outer deadline.
+            bounded_body(response, MAX_ERROR_BODY, true).await?;
+            body.reasoning = ReasoningParams::default();
+            response = client
+                .post(&url)
+                .body(encode(&body)?)
+                .send()
+                .await
+                .map_err(|e| LlmError::Transport(report_reqwest_error("HTTP retry failed", &e)))?;
+            if response.status().is_success() {
+                remember_rejection(key);
+            }
+        }
+        if !response.status().is_success() {
+            return Err(provider_error(
+                response,
+                body.temperature.is_some() || body.max_tokens.is_some(),
+            )
+            .await);
+        }
+        let bytes = bounded_body(response, limits.max_body, false).await?;
+        let envelope: ChatCompletionResponse = serde_json::from_slice(&bytes)
+            .map_err(|_| LlmError::InvalidOutput(OutputError::MalformedResponse))?;
+        let choice = envelope
+            .choices
+            .into_iter()
+            .next()
+            .ok_or(LlmError::InvalidOutput(OutputError::Empty))?;
+        // Synchronous bounded decoding cannot yield to Tokio's timer. Never return
+        // a successful reply if encoding/decoding exhausted the same budget.
+        if started.elapsed() >= limits.deadline {
+            return Err(LlmError::Timeout);
+        }
+        Ok(ChatReply {
+            content: choice.message.content,
+            finish_reason: choice.finish_reason,
+            had_reasoning: choice
+                .message
+                .reasoning_content
+                .is_some_and(|v| !v.is_null())
+                || choice.message.reasoning.is_some_and(|v| !v.is_null()),
+        })
+    })
+    .await
+    .map_err(|_| LlmError::Timeout)?
+}
+
+/// Model discovery shares the connection cache and bounded response deadline.
 pub async fn fetch_models(
     provider: &PostProcessProvider,
     api_key: String,
+    options: &LlmRequestOptions,
 ) -> Result<Vec<String>, String> {
-    let base_url = provider.base_url.trim_end_matches('/');
-    let url = format!("{}/models", base_url);
+    fetch_models_with_limits(
+        provider,
+        &api_key,
+        options,
+        &CLIENT_CACHE,
+        Limits::from_options(options),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
 
-    debug!("Fetching models from: {}", sanitized_url_for_log(&url));
+pub(crate) async fn fetch_models_with_limits(
+    provider: &PostProcessProvider,
+    api_key: &str,
+    options: &LlmRequestOptions,
+    cache: &ClientCache,
+    limits: Limits,
+) -> Result<Vec<String>, LlmError> {
+    options
+        .validate()
+        .map_err(|e| LlmError::Config(ConfigError::InvalidOptions(e)))?;
+    let started = std::time::Instant::now();
+    tokio::time::timeout(limits.deadline, async {
+        let client = cache.client(provider, api_key, options)?;
+        let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
+        debug!("Fetching models from: {}", sanitized_url_for_log(&url));
+        let response =
+            client.get(&url).send().await.map_err(|e| {
+                LlmError::Transport(report_reqwest_error("Failed to fetch models", &e))
+            })?;
+        if !response.status().is_success() {
+            return Err(provider_error(response, false).await);
+        }
+        let bytes = bounded_body(response, limits.max_body, false).await?;
+        let parsed: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| LlmError::InvalidOutput(OutputError::MalformedResponse))?;
+        let mut models = Vec::new();
+        if let Some(data) = parsed.get("data").and_then(Value::as_array) {
+            for entry in data {
+                if let Some(id) = entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .or_else(|| entry.get("name").and_then(Value::as_str))
+                {
+                    models.push(id.into());
+                }
+            }
+        } else if let Some(array) = parsed.as_array() {
+            models.extend(array.iter().filter_map(Value::as_str).map(String::from));
+        }
+        if started.elapsed() >= limits.deadline {
+            return Err(LlmError::Timeout);
+        }
+        Ok(models)
+    })
+    .await
+    .map_err(|_| LlmError::Timeout)?
+}
 
-    let client = create_client(provider, &api_key)?;
+#[cfg(test)]
+pub(crate) mod test_http {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| report_reqwest_error("Failed to fetch models", &e))?;
-
-    let status = response.status();
-    debug!(
-        "Model list response received with status {} over {:?} from {}",
-        status,
-        response.version(),
-        sanitized_url(response.url())
-    );
-    if !status.is_success() {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|e| report_reqwest_error("Failed to read model list error", &e));
-        return Err(format!(
-            "Model list request failed ({}): {}",
-            status, error_text
-        ));
+    pub enum Step {
+        Respond(u16, String),
+        DelayedRespond(Duration, u16, String),
+        Chunked(String),
+        StallBeforeHeaders,
+        StallMidBody(usize, String),
+        BrokenBody(u16),
     }
 
-    let parsed: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| report_reqwest_error("Failed to parse model list response", &e))?;
+    pub struct FakeServer {
+        pub url: String,
+        pub requests: Arc<Mutex<Vec<Value>>>,
+        pub accepts: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
 
-    let mut models = Vec::new();
+    impl Drop for FakeServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
 
-    // Handle OpenAI format: { data: [ { id: "..." }, ... ] }
-    if let Some(data) = parsed.get("data").and_then(|d| d.as_array()) {
-        for entry in data {
-            if let Some(id) = entry.get("id").and_then(|i| i.as_str()) {
-                models.push(id.to_string());
-            } else if let Some(name) = entry.get("name").and_then(|n| n.as_str()) {
-                models.push(name.to_string());
+    impl FakeServer {
+        pub async fn new(steps: Vec<Step>) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let accepts = Arc::new(AtomicUsize::new(0));
+            let steps = Arc::new(Mutex::new(VecDeque::from(steps)));
+            let recorded = requests.clone();
+            let accepted = accepts.clone();
+            let task = tokio::spawn(async move {
+                let mut workers = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        socket = listener.accept() => {
+                            let (stream, _) = socket.unwrap();
+                            accepted.fetch_add(1, Ordering::SeqCst);
+                            let steps = steps.clone();
+                            let recorded = recorded.clone();
+                            workers.spawn(async move {
+                                let mut stream = BufReader::new(stream);
+                                loop {
+                                    let mut line = String::new();
+                                    if stream.read_line(&mut line).await.unwrap_or(0) == 0 { break; }
+                                    let mut length = 0;
+                                    loop {
+                                        line.clear();
+                                        if stream.read_line(&mut line).await.unwrap_or(0) == 0 { return; }
+                                        if line == "\r\n" { break; }
+                                        if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                                            length = n.trim().parse::<usize>().unwrap();
+                                        }
+                                    }
+                                    let mut body = vec![0; length];
+                                    if stream.read_exact(&mut body).await.is_err() { return; }
+                                    recorded.lock().unwrap().push(if body.is_empty() { Value::Null } else { serde_json::from_slice(&body).unwrap() });
+                                    let step = steps.lock().unwrap().pop_front();
+                                    let Some(step) = step else { return; };
+                                    let (status, body) = match step {
+                                        Step::Respond(status, body) => (status, body),
+                                        Step::DelayedRespond(delay, status, body) => {
+                                            tokio::time::sleep(delay).await;
+                                            (status, body)
+                                        }
+                                        Step::StallBeforeHeaders => {
+                                            std::future::pending::<()>().await;
+                                            return;
+                                        }
+                                        Step::StallMidBody(length, prefix) => {
+                                            let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n{prefix}");
+                                            let _ = stream.get_mut().write_all(header.as_bytes()).await;
+                                            std::future::pending::<()>().await;
+                                            return;
+                                        }
+                                        Step::BrokenBody(status) => {
+                                            let header = format!("HTTP/1.1 {status} Test\r\nContent-Length: 100\r\nConnection: close\r\n\r\nprivate partial detail");
+                                            let _ = stream.get_mut().write_all(header.as_bytes()).await;
+                                            return;
+                                        }
+                                        Step::Chunked(body) => {
+                                            let header = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n", body.len(), body);
+                                            if stream.get_mut().write_all(header.as_bytes()).await.is_err() { return; }
+                                            continue;
+                                        }
+                                    };
+                                    let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}", body.len());
+                                    if stream.get_mut().write_all(response.as_bytes()).await.is_err() { return; }
+                                }
+                            });
+                        }
+                        _ = workers.join_next(), if !workers.is_empty() => {}
+                    }
+                }
+            });
+            Self {
+                url,
+                requests,
+                accepts,
+                task,
             }
         }
     }
-    // Handle array format: [ "model1", "model2", ... ]
-    else if let Some(array) = parsed.as_array() {
-        for entry in array {
-            if let Some(model) = entry.as_str() {
-                models.push(model.to_string());
-            }
+
+    pub fn provider(url: &str) -> PostProcessProvider {
+        PostProcessProvider {
+            id: "custom".into(),
+            label: "Fake".into(),
+            base_url: url.into(),
+            allow_base_url_edit: true,
+            models_endpoint: None,
+            supports_structured_output: true,
         }
     }
 
-    Ok(models)
+    pub fn completion(content: Option<&str>, finish_reason: &str) -> String {
+        serde_json::json!({ "choices": [{ "message": { "content": content }, "finish_reason": finish_reason }] }).to_string()
+    }
 }
 
 #[cfg(test)]
@@ -573,6 +920,8 @@ mod tests {
             }],
             stream: false,
             response_format: None,
+            temperature: None,
+            max_tokens: None,
             reasoning,
         };
         serde_json::to_value(&request).unwrap()
@@ -730,5 +1079,519 @@ mod tests {
         assert!(is_known_rejected(&key));
         // A different model on the same endpoint is tracked separately
         assert!(!is_known_rejected(&endpoint_key(&deepseek, "other-model")));
+    }
+
+    use super::test_http::{completion, FakeServer, Step};
+
+    async fn call(
+        server: &FakeServer,
+        options: &LlmRequestOptions,
+        reasoning: bool,
+        limit: usize,
+        deadline: Duration,
+        cache: &ClientCache,
+    ) -> Result<ChatReply, LlmError> {
+        let provider = test_http::provider(&server.url);
+        chat_completion_with_limits(
+            ChatRequest {
+                provider: &provider,
+                api_key: "",
+                model: "fake-model",
+                system: "trusted",
+                user: "untrusted",
+                schema: None,
+                disable_reasoning: reasoning,
+                options,
+            },
+            cache,
+            Limits {
+                deadline,
+                max_body: limit,
+            },
+        )
+        .await
+    }
+
+    fn test_options() -> LlmRequestOptions {
+        LlmRequestOptions {
+            temperature: None,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn request_sends_system_then_user_and_no_tools() {
+        let server =
+            FakeServer::new(vec![Step::Respond(200, completion(Some("ok"), "stop"))]).await;
+        call(
+            &server,
+            &test_options(),
+            false,
+            MAX_BODY,
+            Duration::from_secs(2),
+            &ClientCache::default(),
+        )
+        .await
+        .unwrap();
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role":"system", "content":"trusted"}, {"role":"user", "content":"untrusted"}
+            ])
+        );
+        for key in [
+            "tools",
+            "tool_choice",
+            "functions",
+            "response_format",
+            "temperature",
+            "max_tokens",
+        ] {
+            assert!(requests[0].get(key).is_none(), "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_temperature_tokens_and_named_strict_schema_are_sent() {
+        let server =
+            FakeServer::new(vec![Step::Respond(200, completion(Some("ok"), "stop"))]).await;
+        let provider = test_http::provider(&server.url);
+        let options = LlmRequestOptions {
+            temperature: Some(0.7),
+            max_output_tokens: Some(2048),
+            ..Default::default()
+        };
+        chat_completion_with_limits(
+            ChatRequest {
+                provider: &provider,
+                api_key: "",
+                model: "fake",
+                system: "system",
+                user: "user",
+                schema: Some(("assistant_output", serde_json::json!({"type": "object"}))),
+                disable_reasoning: false,
+                options: &options,
+            },
+            &ClientCache::default(),
+            Limits {
+                deadline: Duration::from_secs(2),
+                max_body: MAX_BODY,
+            },
+        )
+        .await
+        .unwrap();
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests[0]["temperature"], 0.7);
+        assert_eq!(requests[0]["max_tokens"], 2048);
+        assert_eq!(
+            requests[0]["response_format"]["json_schema"]["name"],
+            "assistant_output"
+        );
+        assert_eq!(
+            requests[0]["response_format"]["json_schema"]["strict"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_covers_stalled_headers_and_body() {
+        for step in [
+            Step::StallBeforeHeaders,
+            Step::StallMidBody(100, "x".into()),
+        ] {
+            let server = FakeServer::new(vec![step]).await;
+            let start = std::time::Instant::now();
+            let result = call(
+                &server,
+                &test_options(),
+                false,
+                MAX_BODY,
+                Duration::from_millis(80),
+                &ClientCache::default(),
+            )
+            .await;
+            assert!(matches!(result, Err(LlmError::Timeout)));
+            assert!(start.elapsed() < Duration::from_millis(500));
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_covers_reasoning_retry() {
+        let server = FakeServer::new(vec![
+            Step::DelayedRespond(Duration::from_millis(150), 400, "rejected".into()),
+            Step::StallBeforeHeaders,
+        ])
+        .await;
+        let start = std::time::Instant::now();
+        let result = call(
+            &server,
+            &test_options(),
+            true,
+            MAX_BODY,
+            Duration::from_millis(250),
+            &ClientCache::default(),
+        )
+        .await;
+        assert!(matches!(result, Err(LlmError::Timeout)));
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        assert!(
+            start.elapsed() < Duration::from_millis(370),
+            "retry received a separate deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_rejection_retries_once_without_fields_and_is_memoized() {
+        let server = FakeServer::new(vec![
+            Step::Respond(422, "private rejection".into()),
+            Step::Respond(200, completion(Some("ok"), "stop")),
+            Step::Respond(200, completion(Some("ok"), "stop")),
+        ])
+        .await;
+        let cache = ClientCache::default();
+        for _ in 0..2 {
+            call(
+                &server,
+                &test_options(),
+                true,
+                MAX_BODY,
+                Duration::from_secs(2),
+                &cache,
+            )
+            .await
+            .unwrap();
+        }
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["reasoning_effort"], "none");
+        assert!(requests[1].get("reasoning_effort").is_none());
+        assert!(requests[2].get("reasoning_effort").is_none());
+    }
+
+    #[tokio::test]
+    async fn options_rejection_is_config_error_and_no_options_is_provider_error() {
+        for status in [400, 422] {
+            for temperature in [None, Some(0.0)] {
+                let server =
+                    FakeServer::new(vec![Step::Respond(status, "private".repeat(20000))]).await;
+                let options = LlmRequestOptions {
+                    temperature,
+                    ..Default::default()
+                };
+                let error = call(
+                    &server,
+                    &options,
+                    false,
+                    MAX_BODY,
+                    Duration::from_secs(2),
+                    &ClientCache::default(),
+                )
+                .await
+                .err()
+                .unwrap();
+                match (&error, temperature) {
+                    (
+                        LlmError::Config(ConfigError::OptionsRejected { status: actual, .. }),
+                        Some(_),
+                    )
+                    | (LlmError::Provider { status: actual, .. }, None) => {
+                        assert_eq!(*actual, status)
+                    }
+                    _ => panic!("unexpected safe error: {error}"),
+                }
+                assert_eq!(error.detail().unwrap().chars().count(), 1024);
+                assert!(!error.to_string().contains("private"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn content_length_and_streamed_body_over_limit_are_rejected() {
+        for step in [
+            Step::Respond(200, "x".repeat(100)),
+            Step::Chunked("x".repeat(100)),
+            Step::StallMidBody(100, "".into()),
+        ] {
+            let server = FakeServer::new(vec![step]).await;
+            let result = call(
+                &server,
+                &test_options(),
+                false,
+                99,
+                Duration::from_secs(2),
+                &ClientCache::default(),
+            )
+            .await;
+            assert!(matches!(result, Err(LlmError::ResponseTooLarge)));
+        }
+    }
+
+    #[tokio::test]
+    async fn body_within_limit_is_accepted_and_finish_reason_is_reported() {
+        let body = completion(Some("ok"), "length");
+        let server = FakeServer::new(vec![Step::Chunked(body.clone())]).await;
+        let reply = call(
+            &server,
+            &test_options(),
+            false,
+            body.len(),
+            Duration::from_secs(2),
+            &ClientCache::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.content.as_deref(), Some("ok"));
+        assert_eq!(reply.finish_reason.as_deref(), Some("length"));
+    }
+
+    #[tokio::test]
+    async fn malformed_envelope_and_empty_choices_are_invalid_without_echo() {
+        for (body, expected) in [
+            (r#"{"choices":"PRIVATE"}"#, OutputError::MalformedResponse),
+            (r#"{"choices":[]}"#, OutputError::Empty),
+        ] {
+            let server = FakeServer::new(vec![Step::Respond(200, body.into())]).await;
+            let error = call(
+                &server,
+                &test_options(),
+                false,
+                MAX_BODY,
+                Duration::from_secs(2),
+                &ClientCache::default(),
+            )
+            .await
+            .err()
+            .unwrap();
+            assert!(matches!(&error, LlmError::InvalidOutput(e) if *e == expected));
+            assert!(!error.to_string().contains("PRIVATE"));
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_fields_are_never_returned() {
+        for field in ["reasoning_content", "reasoning"] {
+            let body = serde_json::json!({"choices":[{"message":{"content":null, (field):"PRIVATE REASONING"}, "finish_reason":"stop"}]}).to_string();
+            let server = FakeServer::new(vec![Step::Respond(200, body)]).await;
+            let reply = call(
+                &server,
+                &test_options(),
+                false,
+                MAX_BODY,
+                Duration::from_secs(2),
+                &ClientCache::default(),
+            )
+            .await
+            .unwrap();
+            assert!(reply.had_reasoning);
+            assert!(reply.content.is_none());
+        }
+    }
+
+    #[test]
+    fn error_debug_redacts_provider_detail() {
+        let private = "PRIVATE provider detail with credential";
+        let config = ConfigError::OptionsRejected {
+            status: 422,
+            detail: private.into(),
+        };
+        let config_debug = format!("{config:?}");
+        assert!(config_debug.contains("OptionsRejected"));
+        assert!(config_debug.contains("422"));
+        assert!(!config_debug.contains(private));
+        for error in [
+            LlmError::Config(config),
+            LlmError::Provider {
+                status: 503,
+                detail: private.into(),
+            },
+        ] {
+            let debug = format!("{error:?}");
+            assert!(
+                !debug.contains(private),
+                "provider detail leaked through Debug"
+            );
+            assert_eq!(error.detail(), Some(private));
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_provider_body_preserves_status_classification() {
+        for status in [400, 422, 503] {
+            for options_sent in [false, true] {
+                let server = FakeServer::new(vec![Step::BrokenBody(status)]).await;
+                let mut options = test_options();
+                options.temperature = options_sent.then_some(0.0);
+                options.max_output_tokens = None;
+                let error = call(
+                    &server,
+                    &options,
+                    false,
+                    MAX_BODY,
+                    Duration::from_secs(2),
+                    &ClientCache::default(),
+                )
+                .await
+                .err()
+                .unwrap();
+                match &error {
+                    LlmError::Config(ConfigError::OptionsRejected { status: actual, .. })
+                        if options_sent && matches!(status, 400 | 422) =>
+                    {
+                        assert_eq!(*actual, status)
+                    }
+                    LlmError::Provider { status: actual, .. } if !options_sent || status == 503 => {
+                        assert_eq!(*actual, status)
+                    }
+                    _ => panic!("HTTP classification lost: {error}"),
+                }
+                assert_eq!(error.detail(), Some(""));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn client_reuse_and_invalidation_cover_key_url_provider_and_connect_timeout() {
+        use std::sync::atomic::Ordering;
+        let server = FakeServer::new(
+            (0..6)
+                .map(|_| Step::Respond(200, completion(Some("ok"), "stop")))
+                .collect(),
+        )
+        .await;
+        let cache = ClientCache::default();
+        let mut provider = test_http::provider(&server.url);
+        let mut options = test_options();
+        for (index, key) in [
+            "secret", "secret", "changed", "changed", "changed", "changed",
+        ]
+        .iter()
+        .enumerate()
+        {
+            if index == 3 {
+                provider.id = "different".into();
+            }
+            if index == 4 {
+                options.connect_timeout_secs = 6;
+            }
+            if index == 5 {
+                provider.base_url.push_str("/v1");
+            }
+            chat_completion_with_limits(
+                ChatRequest {
+                    provider: &provider,
+                    api_key: key,
+                    model: "fake",
+                    system: "sys",
+                    user: "usr",
+                    schema: None,
+                    disable_reasoning: false,
+                    options: &options,
+                },
+                &cache,
+                Limits {
+                    deadline: Duration::from_secs(2),
+                    max_body: MAX_BODY,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(server.accepts.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn model_discovery_uses_deadline_body_limit_and_shared_cache() {
+        use std::sync::atomic::Ordering;
+        let server = FakeServer::new(vec![
+            Step::Respond(200, r#"{"data":[{"id":"one"},{"name":"two"}]}"#.into()),
+            Step::Respond(200, completion(Some("ok"), "stop")),
+        ])
+        .await;
+        let cache = ClientCache::default();
+        let provider = test_http::provider(&server.url);
+        let result = fetch_models_with_limits(
+            &provider,
+            "",
+            &test_options(),
+            &cache,
+            Limits {
+                deadline: Duration::from_secs(2),
+                max_body: MAX_BODY,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, ["one", "two"]);
+        call(
+            &server,
+            &test_options(),
+            false,
+            MAX_BODY,
+            Duration::from_secs(2),
+            &cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(server.accepts.load(Ordering::SeqCst), 1);
+        let server = FakeServer::new(vec![Step::StallBeforeHeaders]).await;
+        let result = fetch_models_with_limits(
+            &test_http::provider(&server.url),
+            "",
+            &test_options(),
+            &ClientCache::default(),
+            Limits {
+                deadline: Duration::from_millis(80),
+                max_body: MAX_BODY,
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(LlmError::Timeout)));
+        let server = FakeServer::new(vec![Step::Chunked("x".repeat(100))]).await;
+        let result = fetch_models_with_limits(
+            &test_http::provider(&server.url),
+            "",
+            &test_options(),
+            &ClientCache::default(),
+            Limits {
+                deadline: Duration::from_secs(2),
+                max_body: 99,
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(LlmError::ResponseTooLarge)));
+    }
+
+    #[tokio::test]
+    async fn oversized_request_is_rejected_before_network_io() {
+        let server = FakeServer::new(vec![]).await;
+        let provider = test_http::provider(&server.url);
+        let user = "x".repeat(MAX_REQUEST);
+        let result = chat_completion_with_limits(
+            ChatRequest {
+                provider: &provider,
+                api_key: "",
+                model: "fake",
+                system: "sys",
+                user: &user,
+                schema: None,
+                disable_reasoning: false,
+                options: &test_options(),
+            },
+            &ClientCache::default(),
+            Limits {
+                deadline: Duration::from_secs(2),
+                max_body: MAX_BODY,
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(LlmError::Input(InputError::TooLong {
+                field: "request_bytes",
+                ..
+            }))
+        ));
+        assert!(server.requests.lock().unwrap().is_empty());
     }
 }
