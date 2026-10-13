@@ -8,7 +8,7 @@ use crate::engine_supervisor::{
     StreamProgress, Unloading,
 };
 use crate::managers::audio::AudioRecordingManager;
-use crate::managers::model::{EngineType, ModelManager};
+use crate::managers::model::{EngineType, ModelInfo, ModelManager};
 use crate::settings::{
     get_settings, AppSettings, ChineseScript, ModelUnloadTimeout, OrtAcceleratorSetting,
     TranscribeAcceleratorSetting,
@@ -843,7 +843,10 @@ impl TranscriptionManager {
     /// model can't stream, the worker idles until finalize/cancel and reports
     /// `None` so the caller falls back to batch transcription. Frames sent
     /// before the stream begins queue on the channel and are not lost.
-    pub fn start_stream(&self) {
+    ///
+    /// `language` is a profile speech language, applied to this stream's
+    /// settings copy only.
+    pub fn start_stream_with_language(&self, language: Option<String>) {
         if self.router.is_open() || self.active_stream_worker.load(Ordering::Acquire) != 0 {
             warn!("start_stream called while a stream worker is already active");
             return;
@@ -861,10 +864,15 @@ impl TranscriptionManager {
         self.stream_active.store(false, Ordering::Release);
 
         let manager = self.clone();
-        thread::spawn(move || manager.run_stream_worker(rx, worker_id));
+        thread::spawn(move || manager.run_stream_worker(rx, worker_id, language));
     }
 
-    fn run_stream_worker(&self, rx: mpsc::Receiver<StreamCmd>, worker_id: u64) {
+    fn run_stream_worker(
+        &self,
+        rx: mpsc::Receiver<StreamCmd>,
+        worker_id: u64,
+        language: Option<String>,
+    ) {
         let _worker = StreamWorkerGuard {
             worker_id,
             active_stream_worker: Arc::clone(&self.active_stream_worker),
@@ -915,9 +923,11 @@ impl TranscriptionManager {
 
         // Build run options mirroring the offline transcribe-cpp path: task +
         // language gated against what the model actually advertises.
-        let settings = get_settings(&self.app_handle);
-        let effective_language =
-            effective_language_for_model(&settings, self.model_manager.as_ref(), &model_id);
+        let (settings, effective_language) = run_settings_and_language(
+            get_settings(&self.app_handle),
+            language.as_deref(),
+            self.model_manager.get_model_info(&model_id).as_ref(),
+        );
         let run_plan = transcribe_cpp_run_plan(
             settings.translate_to_english,
             &effective_language,
@@ -1140,6 +1150,16 @@ impl TranscriptionManager {
         &self,
         audio: Vec<f32>,
     ) -> Result<(String, OutputLanguageEvidence)> {
+        self.transcribe_with_language_for(audio, None)
+    }
+
+    /// Like [`Self::transcribe_with_language`], with a profile speech language
+    /// applied to this run's settings copy only.
+    pub fn transcribe_with_language_for(
+        &self,
+        audio: Vec<f32>,
+        language: Option<&str>,
+    ) -> Result<(String, OutputLanguageEvidence)> {
         #[cfg(debug_assertions)]
         if std::env::var("HANDY_FORCE_TRANSCRIPTION_FAILURE").is_ok() {
             return Err(anyhow::anyhow!(
@@ -1174,8 +1194,9 @@ impl TranscriptionManager {
             }
         }
 
-        // Get current settings for configuration
-        let settings = get_settings(&self.app_handle);
+        // Get current settings for configuration; the session's language is
+        // applied below.
+        let global = get_settings(&self.app_handle);
 
         // Validate selected language against the model's supported languages.
         // If the language isn't supported, fall back to "auto" to prevent errors.
@@ -1185,13 +1206,16 @@ impl TranscriptionManager {
         // selection.
         let active_model = self
             .get_current_model()
-            .unwrap_or_else(|| settings.selected_model.clone());
+            .unwrap_or_else(|| global.selected_model.clone());
         // Resolve the persisted language *intent* into the language this model
         // will actually use. The coercion is capability-aware (a must-pick model
         // never receives "auto") and computed fresh here — it is never written
         // back to settings, so the intent survives switching models and back.
-        let validated_language =
-            effective_language_for_model(&settings, self.model_manager.as_ref(), &active_model);
+        let (settings, validated_language) = run_settings_and_language(
+            global,
+            language,
+            self.model_manager.get_model_info(&active_model).as_ref(),
+        );
         if validated_language != settings.selected_language {
             debug!(
                 "Language intent '{}' resolved to '{}' for model '{}'",
@@ -1662,14 +1686,32 @@ fn real_time_factor(audio_secs: f64, compute_secs: f64) -> f64 {
     }
 }
 
+/// The settings one STT run uses: a profile's speech language replaces the
+/// global language in this copy only. Persisted settings are never written.
+fn settings_for_run(mut settings: AppSettings, language: Option<&str>) -> AppSettings {
+    if let Some(language) = language {
+        settings.selected_language = language.to_string();
+    }
+    settings
+}
+
+/// The settings and model language of one STT run. The stream worker and
+/// batch transcription both resolve here, so a profile speech language reaches
+/// the engine.
+fn run_settings_and_language(
+    global: AppSettings,
+    language: Option<&str>,
+    model: Option<&ModelInfo>,
+) -> (AppSettings, String) {
+    let settings = settings_for_run(global, language);
+    let language = effective_language_for_model(&settings, model);
+    (settings, language)
+}
+
 /// Resolve the persisted language intent into the language a specific model can
 /// use without writing the coerced value back to settings.
-fn effective_language_for_model(
-    settings: &AppSettings,
-    model_manager: &ModelManager,
-    model_id: &str,
-) -> String {
-    match model_manager.get_model_info(model_id) {
+fn effective_language_for_model(settings: &AppSettings, model: Option<&ModelInfo>) -> String {
+    match model {
         Some(info) => crate::managers::model::effective_language(
             &settings.selected_language,
             &info.supported_languages,
@@ -2159,6 +2201,87 @@ mod tests {
 
     fn languages(codes: &[&str]) -> Vec<String> {
         codes.iter().map(|code| (*code).to_string()).collect()
+    }
+
+    #[test]
+    fn handy008_profile_language_override_is_run_local_user_selected_evidence() {
+        let mut global = crate::settings::get_default_settings();
+        global.selected_language = "auto".into();
+        let before = serde_json::to_value(&global).unwrap();
+        // The stream worker and batch transcription both resolve here.
+        let (run, language) = run_settings_and_language(global.clone(), Some("pl"), None);
+        assert_eq!(language, "pl");
+        assert_eq!(run.selected_language, "pl");
+        assert_eq!(
+            resolve_output_language_evidence(&run, Some("pl"), &languages(&["en", "pl"]), false),
+            OutputLanguageEvidence::UserSelected("pl".into())
+        );
+        // Without the override the same engine hint is only model-constrained.
+        assert_eq!(
+            resolve_output_language_evidence(&global, Some("pl"), &languages(&["en", "pl"]), false),
+            OutputLanguageEvidence::ModelConstrained("pl".into())
+        );
+        assert_eq!(serde_json::to_value(&global).unwrap(), before);
+        let (unchanged, language) = run_settings_and_language(global.clone(), None, None);
+        assert_eq!(language, "auto");
+        assert_eq!(serde_json::to_value(&unchanged).unwrap(), before);
+    }
+
+    fn model_with_languages(codes: &[&str], supports_language_detection: bool) -> ModelInfo {
+        ModelInfo {
+            id: "test".into(),
+            name: "Test".into(),
+            description: String::new(),
+            filename: "test.bin".into(),
+            source: crate::managers::model::ModelSource::Local,
+            size_mb: 0,
+            is_downloaded: true,
+            is_downloading: false,
+            partial_size: 0,
+            is_directory: false,
+            engine_type: crate::managers::model::EngineType::TranscribeCpp,
+            accuracy_score: 0.0,
+            speed_score: 0.0,
+            supports_translation: false,
+            is_recommended: false,
+            supported_languages: languages(codes),
+            supports_language_selection: true,
+            is_custom: false,
+            supports_streaming: false,
+            supports_language_detection,
+        }
+    }
+
+    #[test]
+    fn handy008_profile_language_is_coerced_to_what_the_run_model_supports() {
+        let mut global = crate::settings::get_default_settings();
+        global.selected_language = "auto".into();
+
+        // A supported profile hint reaches the engine unchanged.
+        let model = model_with_languages(&["en", "pl"], false);
+        let (_, language) = run_settings_and_language(global.clone(), Some("pl"), Some(&model));
+        assert_eq!(language, "pl");
+
+        // An unsupported hint falls back to auto when the model can detect.
+        let model = model_with_languages(&["en", "de"], true);
+        let (run, language) = run_settings_and_language(global.clone(), Some("pl"), Some(&model));
+        assert_eq!(language, "auto");
+        assert_eq!(run.selected_language, "pl");
+
+        // Without detection it falls back to a concrete language, which is
+        // model-constrained evidence rather than the user's selection.
+        let model = model_with_languages(&["en", "de"], false);
+        let (run, language) = run_settings_and_language(global, Some("pl"), Some(&model));
+        assert_eq!(language, "en");
+        assert_eq!(
+            resolve_output_language_evidence(
+                &run,
+                Some(&language),
+                &model.supported_languages,
+                false
+            ),
+            OutputLanguageEvidence::ModelConstrained("en".into())
+        );
     }
 
     #[test]

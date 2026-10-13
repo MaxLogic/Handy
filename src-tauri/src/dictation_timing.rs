@@ -216,6 +216,18 @@ pub enum Outcome {
     Aborted,
 }
 
+/// Which model a cleanup or assistant request went to (HANDY-008).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmRoute {
+    /// The global default provider and model.
+    Default,
+    /// The English cleanup model, chosen for English speech.
+    EnglishModel,
+    /// The profile's own model override.
+    ProfileModel,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SttPath {
@@ -335,6 +347,11 @@ pub struct TimingRecord {
     pub capture_us: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_scalars: Option<u64>,
+    /// Custom processing profile id; built-in profiles leave it unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_route: Option<LlmRoute>,
     pub stages: Stages,
     /// Accepted stop until completion or refusal of the output.
     pub total_us: u64,
@@ -433,6 +450,8 @@ struct Inner {
     stt_path: Option<SttPath>,
     capture_us: Option<u64>,
     selection_scalars: Option<u64>,
+    profile: Option<String>,
+    llm_route: Option<LlmRoute>,
     stages: Stages,
     paste_calls: u32,
     engine_pending_at_stt: Option<u32>,
@@ -468,6 +487,8 @@ impl Inner {
             stt_path: None,
             capture_us: None,
             selection_scalars: None,
+            profile: None,
+            llm_route: None,
             stages: Stages::default(),
             paste_calls: 0,
             engine_pending_at_stt: None,
@@ -512,6 +533,8 @@ impl Inner {
             stt_path: self.stt_path,
             capture_us: self.capture_us,
             selection_scalars: self.selection_scalars,
+            profile: self.profile.clone(),
+            llm_route: self.llm_route,
             stages: self.stages.clone(),
             total_us,
             model_loads_delta: end
@@ -619,6 +642,18 @@ impl OperationTimer {
     }
     pub fn set_stt_path(&self, path: SttPath) {
         self.inner().stt_path = Some(path);
+    }
+    pub fn set_profile(&self, profile_id: String) {
+        self.inner().profile = Some(profile_id);
+    }
+    pub fn set_llm_route(&self, route: LlmRoute) {
+        self.inner().llm_route = Some(route);
+    }
+
+    /// The record this timer would emit now, without finishing it.
+    #[cfg(test)]
+    pub(crate) fn record_for_test(&self) -> TimingRecord {
+        self.inner().build_record(0, counters())
     }
 
     /// Samples the engine queue just before STT begins.
@@ -1267,6 +1302,29 @@ pub(super) mod tests {
             assert!(value.get("selection_scalars").is_none());
             assert!(value["stages"].get("commit_us").is_none());
             assert_eq!(value["stages"], serde_json::json!({}));
+        }
+    }
+
+    #[test]
+    fn handy008_profile_and_route_serialize_additively_at_schema_one() {
+        let mut op = inner(Mode::Cleanup, true);
+        let plain = finished_record(&mut op, Outcome::Pasted, 10, counters_at(2, 1, 100, 5));
+        let value = serde_json::to_value(&plain).unwrap();
+        assert!(value.get("profile").is_none());
+        assert!(value.get("llm_route").is_none());
+        let mut op = inner(Mode::Cleanup, true);
+        op.profile = Some("p1700000000000".into());
+        op.llm_route = Some(LlmRoute::EnglishModel);
+        let routed = finished_record(&mut op, Outcome::Pasted, 10, counters_at(2, 1, 100, 5));
+        let value = serde_json::to_value(&routed).unwrap();
+        assert_eq!(value["schema"], 1);
+        assert_eq!(value["profile"], "p1700000000000");
+        assert_eq!(value["llm_route"], "english_model");
+        for (route, text) in [
+            (LlmRoute::Default, "default"),
+            (LlmRoute::ProfileModel, "profile_model"),
+        ] {
+            assert_eq!(serde_json::to_value(route).unwrap(), text);
         }
     }
 

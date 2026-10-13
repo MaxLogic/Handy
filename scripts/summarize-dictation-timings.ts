@@ -95,6 +95,25 @@ export interface TimingRecord {
   engine_pending_at_stt?: number;
   dropped_records: number;
   synthetic?: boolean;
+  /** Custom processing profile id (HANDY-008); built-in profiles omit it. */
+  profile?: string;
+  llm_route?: LlmRoute;
+}
+
+export const LLM_ROUTES = [
+  "default",
+  "english_model",
+  "profile_model",
+] as const;
+export type LlmRoute = (typeof LLM_ROUTES)[number];
+
+/**
+ * A record from a custom profile or a non-default model. Routed records never
+ * count toward workloads, samples, language checks or the baseline, so the
+ * HANDY-001 comparison stays like for like.
+ */
+export function isRouted(r: TimingRecord): boolean {
+  return r.profile !== undefined || (r.llm_route ?? "default") !== "default";
 }
 
 export type InvariantName =
@@ -212,6 +231,19 @@ export function validateRecord(v: unknown): string | null {
   for (const field of ["capture_us", "selection_scalars"]) {
     if (o[field] !== undefined && !isCount(o[field]))
       return `${field} must be a non-negative integer`;
+  }
+  if (
+    o.profile !== undefined &&
+    (typeof o.profile !== "string" || o.profile === "")
+  ) {
+    return "profile must be a non-empty string";
+  }
+  if (o.llm_route !== undefined) {
+    if (!(LLM_ROUTES as readonly unknown[]).includes(o.llm_route))
+      return "unknown llm_route";
+    if (o.mode === "raw") return "llm_route is invalid for raw mode";
+    if (o.llm_route === "english_model" && o.mode !== "cleanup")
+      return "english_model requires cleanup mode";
   }
   if (typeof o.language !== "string" || o.language === "") {
     return "language must be a non-empty string";
@@ -410,9 +442,47 @@ function assistantSummary(records: TimingRecord[]): AssistantSummary {
   };
 }
 
+export interface RoutedGroup {
+  /** `${profile ?? "built-in"}|${llm_route ?? "none"}` */
+  key: string;
+  count: number;
+  outcomes: Partial<Record<Outcome, number>>;
+  /** Over warm `pasted` records. */
+  total: Stats | null;
+  llmMedianUs: number | null;
+}
+
+function routedSummary(records: TimingRecord[]): RoutedGroup[] {
+  const groups = new Map<string, TimingRecord[]>();
+  for (const record of records) {
+    if (!isRouted(record)) continue;
+    const key = `${record.profile ?? "built-in"}|${record.llm_route ?? "none"}`;
+    const list = groups.get(key) ?? [];
+    list.push(record);
+    groups.set(key, list);
+  }
+  return [...groups.keys()].sort().map((key) => {
+    const list = groups.get(key)!;
+    const outcomes: Partial<Record<Outcome, number>> = {};
+    for (const r of list) outcomes[r.outcome] = (outcomes[r.outcome] ?? 0) + 1;
+    const warm = list.filter((r) => r.outcome === "pasted" && !r.cold);
+    const llm = warm
+      .map((r) => r.stages.llm_us)
+      .filter((n): n is number => n !== undefined);
+    return {
+      key,
+      count: list.length,
+      outcomes,
+      total: warm.length ? stats(warm.map((r) => r.total_us)) : null,
+      llmMedianUs: llm.length ? stats(llm).median : null,
+    };
+  });
+}
+
 export interface Summary {
   recordCount: number;
   assistant: AssistantSummary;
+  routed: RoutedGroup[];
   synthetic: boolean;
   workloads: WorkloadSummary[];
   cold: { count: number; totalsUs: number[] };
@@ -510,7 +580,9 @@ export function summarize(
       "synthetic records are not measurements (pass --allow-synthetic to summarize test data)",
     );
   }
-  const dictation = records.filter((r) => r.mode !== "assistant");
+  const dictation = records.filter(
+    (r) => r.mode !== "assistant" && !isRouted(r),
+  );
   const ambiguous = dictation.filter(
     (r) => r.label === undefined && r.language === "auto",
   ).length;
@@ -625,6 +697,7 @@ export function summarize(
   return {
     recordCount: records.length,
     assistant: assistantSummary(records),
+    routed: routedSummary(records),
     synthetic: records.some((r) => r.synthetic === true),
     workloads,
     cold: { count: cold.length, totalsUs: cold },
@@ -751,6 +824,25 @@ export function formatSummary(
             ? ` committed=${group.total.n} total median=${ms(group.total.median)} p95=${ms(group.total.p95)}`
             : " committed=0") +
           (group.capture ? ` capture median=${ms(group.capture.median)}` : ""),
+      );
+    }
+  }
+  if (s.routed.length > 0) {
+    out.push(
+      "routed (profiles and non-default models; excluded from samples and baseline):",
+    );
+    for (const group of s.routed) {
+      const outcomes = Object.entries(group.outcomes)
+        .map(([outcome, count]) => `${outcome}=${count}`)
+        .join(", ");
+      out.push(
+        `  ${group.key}: n=${group.count} outcomes: ${outcomes}` +
+          (group.total
+            ? ` warm pasted=${group.total.n} total median=${ms(group.total.median)} p95=${ms(group.total.p95)}`
+            : " warm pasted=0") +
+          (group.llmMedianUs !== null
+            ? ` llm median=${ms(group.llmMedianUs)}`
+            : ""),
       );
     }
   }

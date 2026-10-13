@@ -23,7 +23,8 @@ pub(crate) fn session(
     store: &Arc<RecoveryStore>,
 ) -> (AssistantSession, Arc<AtomicUsize>) {
     let settings = configured_settings(url);
-    let admission = admit(false, &settings, store).unwrap_or_else(|_| panic!("valid admission"));
+    let admission = admit_binding(false, &settings, "assistant", store)
+        .unwrap_or_else(|_| panic!("valid admission"));
     let released = Arc::new(AtomicUsize::new(0));
     let probe = Arc::clone(&released);
     let token = TargetToken::new(
@@ -141,7 +142,12 @@ fn new_store_is_empty_no_replay() {
 fn admission_rejects_shutdown_without_reserving() {
     let store = RecoveryStore::new(8);
     assert!(matches!(
-        admit(true, &configured_settings("http://unused.invalid"), &store),
+        admit_binding(
+            true,
+            &configured_settings("http://unused.invalid"),
+            "assistant",
+            &store
+        ),
         Err(IntakeRejection::ShuttingDown)
     ));
     assert_eq!(store.free_slots(), 8);
@@ -158,7 +164,7 @@ fn admission_rejects_missing_provider_model_or_prompt_before_capture() {
         let store = RecoveryStore::new(8);
         assert!(
             matches!(
-                admit(false, &settings, &store),
+                admit_binding(false, &settings, "assistant", &store),
                 Err(IntakeRejection::Config(_))
             ),
             "{missing}"
@@ -171,7 +177,12 @@ fn admission_rejects_full_capacity() {
     let store = RecoveryStore::new(8);
     let reserved: Vec<_> = (0..8).map(|_| store.reserve().unwrap()).collect();
     assert!(matches!(
-        admit(false, &configured_settings("http://unused.invalid"), &store),
+        admit_binding(
+            false,
+            &configured_settings("http://unused.invalid"),
+            "assistant",
+            &store
+        ),
         Err(IntakeRejection::RecoveryFull)
     ));
     assert_eq!(store.free_slots(), 0);
@@ -181,7 +192,8 @@ fn admission_rejects_full_capacity() {
 fn admission_snapshots_request_and_clipboard_policy() {
     let mut settings = configured_settings("http://unused.invalid");
     let store = RecoveryStore::new(8);
-    let admitted = admit(false, &settings, &store).unwrap_or_else(|_| panic!());
+    let admitted =
+        admit_binding(false, &settings, "assistant", &store).unwrap_or_else(|_| panic!());
     settings.post_process_models.clear();
     settings.assistant_selected_prompt_id = None;
     settings.clipboard_handling = ClipboardHandling::CopyToClipboard;

@@ -30,8 +30,28 @@ use crate::tray;
 
 // Note: Commands are accessed via shortcut::handy_keys:: in lib.rs
 
+/// Whether two accelerators can match the same key press. HandyKeys generic
+/// modifiers overlap either side; Tauri uses accelerator identity.
+pub(crate) fn bindings_overlap(a: &str, b: &str, implementation: KeyboardImplementation) -> bool {
+    match implementation {
+        KeyboardImplementation::Tauri => match (
+            a.parse::<tauri_plugin_global_shortcut::Shortcut>(),
+            b.parse::<tauri_plugin_global_shortcut::Shortcut>(),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        },
+        KeyboardImplementation::HandyKeys => match (
+            a.parse::<::handy_keys::Hotkey>(),
+            b.parse::<::handy_keys::Hotkey>(),
+        ) {
+            (Ok(a), Ok(b)) => handy_keys_bindings_overlap(a, b),
+            _ => false,
+        },
+    }
+}
+
 /// Compare backend key identities, including inactive and cancel bindings.
-/// HandyKeys generic modifiers overlap either side; Tauri uses accelerator identity.
 pub(crate) fn binding_conflict(
     bindings: &std::collections::HashMap<String, ShortcutBinding>,
     id: &str,
@@ -45,31 +65,23 @@ pub(crate) fn binding_conflict(
     ids.sort();
     ids.into_iter()
         .find(|other| {
-            let existing = &bindings[*other].current_binding;
-            match implementation {
-                KeyboardImplementation::Tauri => {
-                    match (
-                        candidate.parse::<tauri_plugin_global_shortcut::Shortcut>(),
-                        existing.parse::<tauri_plugin_global_shortcut::Shortcut>(),
-                    ) {
-                        (Ok(candidate), Ok(existing)) => candidate == existing,
-                        _ => false,
-                    }
-                }
-                KeyboardImplementation::HandyKeys => {
-                    match (
-                        candidate.parse::<::handy_keys::Hotkey>(),
-                        existing.parse::<::handy_keys::Hotkey>(),
-                    ) {
-                        (Ok(candidate), Ok(existing)) => {
-                            handy_keys_bindings_overlap(candidate, existing)
-                        }
-                        _ => false,
-                    }
-                }
-            }
+            bindings_overlap(candidate, &bindings[*other].current_binding, implementation)
         })
         .cloned()
+}
+
+/// The user-facing owner of a conflicting binding: its name, so a profile
+/// conflict is announced by profile name.
+fn conflict_owner_name(
+    bindings: &std::collections::HashMap<String, ShortcutBinding>,
+    owner: &str,
+) -> String {
+    bindings
+        .get(owner)
+        .map(|binding| binding.name.trim())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(owner)
+        .to_string()
 }
 
 fn handy_keys_bindings_overlap(a: ::handy_keys::Hotkey, b: ::handy_keys::Hotkey) -> bool {
@@ -110,25 +122,6 @@ pub(crate) fn ordered_binding_ids(
     ids
 }
 
-pub(crate) fn assistant_binding_conflicts(
-    bindings: &std::collections::HashMap<String, ShortcutBinding>,
-    binding: &ShortcutBinding,
-    implementation: KeyboardImplementation,
-) -> bool {
-    if binding.id == "assistant" {
-        if let Some(other) = binding_conflict(
-            bindings,
-            &binding.id,
-            &binding.current_binding,
-            implementation,
-        ) {
-            warn!("Assistant shortcut conflicts with '{other}'; leaving the existing binding registered");
-            return true;
-        }
-    }
-    false
-}
-
 /// Defaults and user overrides form one conflict domain, even after migration.
 fn effective_bindings(
     settings: &settings::AppSettings,
@@ -138,20 +131,160 @@ fn effective_bindings(
     bindings
 }
 
-pub(super) fn configured_bindings(settings: &settings::AppSettings) -> Vec<ShortcutBinding> {
+/// Every binding in registration rank: the default ids (transcribe, cleanup,
+/// the rest, then assistant), then the bindings of existing custom profiles in
+/// profile order. Selection-command profiles are Windows-only. Earlier entries
+/// win accelerator conflicts.
+pub(crate) fn registration_order(settings: &settings::AppSettings) -> Vec<ShortcutBinding> {
     let bindings = effective_bindings(settings);
-    ordered_binding_ids(&settings::get_default_settings().bindings)
-        .into_iter()
-        .filter(|id| {
-            id != "cancel"
-                && (id != "transcribe_with_post_process" || settings.post_process_enabled)
+    let mut order: Vec<ShortcutBinding> =
+        ordered_binding_ids(&settings::get_default_settings().bindings)
+            .into_iter()
+            .map(|id| bindings[&id].clone())
+            .collect();
+    for profile in settings
+        .processing_profiles
+        .iter()
+        .filter(|p| !p.is_builtin())
+    {
+        if profile.kind == settings::ProfileKind::SelectionCommand && !cfg!(target_os = "windows") {
+            continue;
+        }
+        if let Some(binding) = settings.bindings.get(&profile.binding_id()) {
+            order.push(binding.clone());
+        }
+    }
+    order
+}
+
+/// The earlier binding that keeps the accelerator when `order[index]` would
+/// collide with it, including cancel and a disabled cleanup binding. Only the
+/// assistant and custom profile bindings can be skipped, so the user's older
+/// binding always wins.
+pub(crate) fn registration_skip_owner(
+    order: &[ShortcutBinding],
+    index: usize,
+    implementation: KeyboardImplementation,
+) -> Option<String> {
+    let binding = &order[index];
+    if binding.id != "assistant" && settings::parse_profile_binding_id(&binding.id).is_none() {
+        return None;
+    }
+    order[..index]
+        .iter()
+        .find(|earlier| {
+            bindings_overlap(
+                &binding.current_binding,
+                &earlier.current_binding,
+                implementation,
+            )
         })
-        .filter_map(|id| {
-            let binding = &bindings[&id];
-            (!assistant_binding_conflicts(&bindings, binding, settings.keyboard_implementation))
-                .then(|| binding.clone())
+        .map(|earlier| earlier.id.clone())
+}
+
+/// Whether registration skips this binding, and for which owner. A skipped
+/// binding must never be unregistered or restored: Tauri unregisters by
+/// accelerator and would remove the other owner.
+pub(crate) fn registration_skipped(settings: &settings::AppSettings, id: &str) -> Option<String> {
+    let order = registration_order(settings);
+    let index = order.iter().position(|binding| binding.id == id)?;
+    registration_skip_owner(&order, index, settings.keyboard_implementation)
+}
+
+/// Whether registration leaves this binding unregistered: skipped for an
+/// earlier owner, or not in the registration order at all (an orphan, or a
+/// selection command off Windows). Such a binding must never be unregistered
+/// or restored: Tauri unregisters by accelerator and would remove another
+/// owner.
+pub(crate) fn registration_unused(settings: &settings::AppSettings, id: &str) -> bool {
+    let order = registration_order(settings);
+    match order.iter().position(|binding| binding.id == id) {
+        Some(index) => {
+            registration_skip_owner(&order, index, settings.keyboard_implementation).is_some()
+        }
+        None => true,
+    }
+}
+
+/// Bindings the macOS Secure Input fallback must not shadow-register: skipped
+/// bindings, and profile bindings registration would not use (orphans, or
+/// selection commands off Windows).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn fallback_excluded(settings: &settings::AppSettings, id: &str) -> bool {
+    if registration_skipped(settings, id).is_some() {
+        return true;
+    }
+    settings::parse_profile_binding_id(id).is_some()
+        && !registration_order(settings)
+            .iter()
+            .any(|binding| binding.id == id)
+}
+
+pub(super) fn configured_bindings(settings: &settings::AppSettings) -> Vec<ShortcutBinding> {
+    let order = registration_order(settings);
+    (0..order.len())
+        .filter_map(|index| {
+            let binding = &order[index];
+            if binding.id == "cancel"
+                || (binding.id == "transcribe_with_post_process" && !settings.post_process_enabled)
+            {
+                return None;
+            }
+            if let Some(owner) =
+                registration_skip_owner(&order, index, settings.keyboard_implementation)
+            {
+                warn!(
+                    "Shortcut '{}' conflicts with '{owner}'; leaving the existing binding registered",
+                    binding.id
+                );
+                return None;
+            }
+            Some(binding.clone())
         })
         .collect()
+}
+
+/// The stored binding to change. `Ok(None)` means a new hotkey for an
+/// existing custom profile.
+pub(crate) fn binding_to_modify(
+    settings: &settings::AppSettings,
+    id: &str,
+) -> Result<Option<ShortcutBinding>, String> {
+    if let Some(binding) = settings.bindings.get(id) {
+        return Ok(Some(binding.clone()));
+    }
+    if settings::parse_profile_binding_id(id).is_some() {
+        return match settings::custom_profile_for_binding(settings, id) {
+            Some(_) => Ok(None),
+            None => Err("Profile not found".into()),
+        };
+    }
+    match settings::get_default_settings().bindings.get(id) {
+        Some(default_binding) => {
+            warn!(
+                "Binding '{}' not found in settings, creating from defaults",
+                id
+            );
+            Ok(Some(default_binding.clone()))
+        }
+        None => Err(format!("Binding with id '{}' not found in defaults", id)),
+    }
+}
+
+/// A custom profile's new hotkey entry, named after the profile.
+fn new_profile_binding(
+    settings: &settings::AppSettings,
+    id: &str,
+    accelerator: &str,
+) -> Option<ShortcutBinding> {
+    let profile = settings::custom_profile_for_binding(settings, id)?;
+    Some(ShortcutBinding {
+        id: id.into(),
+        name: profile.name.clone(),
+        description: String::new(),
+        default_binding: String::new(),
+        current_binding: accelerator.into(),
+    })
 }
 
 /// Initialize shortcuts using the configured implementation
@@ -327,43 +460,28 @@ pub fn change_binding(
 
     validate_binding_input(&id, &binding, settings.keyboard_implementation)?;
 
-    if let Some(other) = binding_conflict(
-        &effective_bindings(&settings),
-        &id,
-        &binding,
-        settings.keyboard_implementation,
-    ) {
+    let bindings = effective_bindings(&settings);
+    if let Some(other) =
+        binding_conflict(&bindings, &id, &binding, settings.keyboard_implementation)
+    {
+        let owner = conflict_owner_name(&bindings, &other);
         return Ok(BindingResponse {
             success: false,
             binding: None,
-            error: Some(format!("Shortcut '{binding}' is already used by '{other}'")),
+            error: Some(format!("Shortcut '{binding}' is already used by '{owner}'")),
         });
     }
 
-    // Get the binding to modify, or create it from defaults if it doesn't exist
-    let binding_to_modify = match settings.bindings.get(&id) {
-        Some(binding) => binding.clone(),
-        None => {
-            // Try to get the default binding for this id
-            let default_settings = settings::get_default_settings();
-            match default_settings.bindings.get(&id) {
-                Some(default_binding) => {
-                    warn!(
-                        "Binding '{}' not found in settings, creating from defaults",
-                        id
-                    );
-                    default_binding.clone()
-                }
-                None => {
-                    let error_msg = format!("Binding with id '{}' not found in defaults", id);
-                    warn!("change_binding error: {}", error_msg);
-                    return Ok(BindingResponse {
-                        success: false,
-                        binding: None,
-                        error: Some(error_msg),
-                    });
-                }
-            }
+    // The stored binding, a default one, or none yet for a profile hotkey.
+    let previous = match binding_to_modify(&settings, &id) {
+        Ok(previous) => previous,
+        Err(error_msg) => {
+            warn!("change_binding error: {}", error_msg);
+            return Ok(BindingResponse {
+                success: false,
+                binding: None,
+                error: Some(error_msg),
+            });
         }
     };
 
@@ -383,31 +501,41 @@ pub fn change_binding(
         }
     }
 
-    // Unregister the existing binding
-    if let Err(e) = unregister_previous_binding(&settings, &binding_to_modify, |binding| {
-        unregister_shortcut(&app, binding)
-    }) {
-        let error_msg = format!("Failed to unregister shortcut: {}", e);
-        error!("change_binding error: {}", error_msg);
+    // Unregister the existing binding. A new profile hotkey has none, and its
+    // empty value must never reach backend parsing.
+    if let Some(previous) = &previous {
+        if let Err(e) = unregister_previous_binding(&settings, previous, |binding| {
+            unregister_shortcut(&app, binding)
+        }) {
+            let error_msg = format!("Failed to unregister shortcut: {}", e);
+            error!("change_binding error: {}", error_msg);
+        }
     }
 
     // Validate the new shortcut for the current keyboard implementation
     if let Err(e) = validate_shortcut_for_implementation(&binding, settings.keyboard_implementation)
     {
         warn!("change_binding validation error: {}", e);
-        restore_registration(&app, &settings, &binding_to_modify);
+        if let Some(previous) = &previous {
+            restore_registration(&app, &settings, previous);
+        }
         return Err(e);
     }
 
     // Create an updated binding
-    let mut updated_binding = binding_to_modify.clone();
+    let mut updated_binding = match &previous {
+        Some(previous) => previous.clone(),
+        None => new_profile_binding(&settings, &id, "").ok_or("Profile not found")?,
+    };
     updated_binding.current_binding = binding;
 
     // Register the new binding
     if let Err(e) = register_shortcut(&app, updated_binding.clone()) {
         let error_msg = format!("Failed to register shortcut: {}", e);
         error!("change_binding error: {}", error_msg);
-        restore_registration(&app, &settings, &binding_to_modify);
+        if let Some(previous) = &previous {
+            restore_registration(&app, &settings, previous);
+        }
         return Ok(BindingResponse {
             success: false,
             binding: None,
@@ -436,13 +564,10 @@ fn unregister_previous_binding(
     binding: &ShortcutBinding,
     unregister: impl FnOnce(ShortcutBinding) -> Result<(), String>,
 ) -> Result<(), String> {
-    // A conflicting assistant was skipped during startup. Tauri unregisters
-    // by accelerator, so attempting to remove it would remove the other owner.
-    if assistant_binding_conflicts(
-        &effective_bindings(settings),
-        binding,
-        settings.keyboard_implementation,
-    ) {
+    // A conflicting assistant or profile was skipped during startup, or the
+    // binding was never registered. Tauri unregisters by accelerator, so
+    // removing it would remove another owner.
+    if registration_unused(settings, &binding.id) {
         return Ok(());
     }
     unregister(binding.clone())
@@ -470,11 +595,7 @@ fn restore_previous_binding(
     binding: &ShortcutBinding,
     register: impl FnOnce(ShortcutBinding) -> Result<(), String>,
 ) -> Result<(), String> {
-    if assistant_binding_conflicts(
-        &effective_bindings(settings),
-        binding,
-        settings.keyboard_implementation,
-    ) {
+    if registration_unused(settings, &binding.id) {
         return Ok(());
     }
     register(binding.clone())
@@ -483,8 +604,16 @@ fn restore_previous_binding(
 #[tauri::command]
 #[specta::specta]
 pub fn reset_binding(app: AppHandle, id: String) -> Result<BindingResponse, String> {
-    let binding = settings::get_stored_binding(&settings::get_settings(&app), &id)?;
-    change_binding(app, id, binding.default_binding)
+    let default_binding = reset_target(&settings::get_settings(&app), &id)?;
+    change_binding(app, id, default_binding)
+}
+
+/// Built-in bindings return to their default; profile hotkeys have none.
+fn reset_target(settings: &settings::AppSettings, id: &str) -> Result<String, String> {
+    if settings::parse_profile_binding_id(id).is_some() {
+        return Err("Profile hotkeys have no default".into());
+    }
+    Ok(settings::get_stored_binding(settings, id)?.default_binding)
 }
 
 /// Unregister every binding while the user is recording a new shortcut in
@@ -753,6 +882,28 @@ fn bindings_for_implementation(
             );
             binding.current_binding = defaults[&id].current_binding.clone();
             settings.bindings.insert(id.clone(), binding);
+            reset.push(id);
+        }
+    }
+    // Profile hotkeys have no default: an invalid one becomes unset.
+    let profile_ids: Vec<String> = settings
+        .processing_profiles
+        .iter()
+        .filter(|p| !p.is_builtin())
+        .map(|p| p.binding_id())
+        .collect();
+    for id in profile_ids {
+        let Some(binding) = settings.bindings.get(&id) else {
+            continue;
+        };
+        if let Err(e) =
+            validate_shortcut_for_implementation(&binding.current_binding, implementation)
+        {
+            info!(
+                "Profile shortcut '{}' ({}) is invalid for {:?}: {}. Removing it.",
+                id, binding.current_binding, implementation, e
+            );
+            settings.bindings.remove(&id);
             reset.push(id);
         }
     }
@@ -2053,6 +2204,484 @@ mod tests {
             );
         }
     }
+    // -----------------------------------------------------------------------
+    // HANDY-008: profile hotkeys
+    // -----------------------------------------------------------------------
+
+    use super::settings::{ProcessingProfile, ProfileKind};
+
+    fn profile(id: &str, kind: ProfileKind) -> ProcessingProfile {
+        ProcessingProfile {
+            id: id.into(),
+            name: format!("Profile {id}"),
+            kind,
+            prompt_id: Some("default_improve_transcriptions".into()),
+            model: None,
+            speech_language: None,
+            english_cleanup: None,
+        }
+    }
+
+    /// Default settings plus custom profiles with optional hotkeys.
+    fn with_profiles(
+        implementation: super::KeyboardImplementation,
+        profiles: &[(&str, ProfileKind, Option<&str>)],
+    ) -> super::settings::AppSettings {
+        let mut settings = super::settings::get_default_settings();
+        settings.keyboard_implementation = implementation;
+        for (id, kind, accelerator) in profiles {
+            let profile = profile(id, *kind);
+            if let Some(accelerator) = accelerator {
+                settings.bindings.insert(
+                    profile.binding_id(),
+                    super::ShortcutBinding {
+                        id: profile.binding_id(),
+                        name: profile.name.clone(),
+                        description: String::new(),
+                        default_binding: String::new(),
+                        current_binding: (*accelerator).into(),
+                    },
+                );
+            }
+            settings.processing_profiles.push(profile);
+        }
+        settings
+    }
+
+    fn ids(bindings: &[super::ShortcutBinding]) -> Vec<String> {
+        bindings.iter().map(|b| b.id.clone()).collect()
+    }
+
+    fn default_order() -> Vec<String> {
+        super::ordered_binding_ids(&super::settings::get_default_settings().bindings)
+    }
+
+    fn accelerator(id: &str) -> String {
+        super::settings::get_default_settings().bindings[id]
+            .current_binding
+            .clone()
+    }
+
+    #[test]
+    fn handy008_registration_order_appends_custom_profiles_after_defaults() {
+        let mut settings = with_profiles(
+            super::KeyboardImplementation::Tauri,
+            &[
+                ("pd2", ProfileKind::Dictation, Some("ctrl+f9")),
+                ("pc", ProfileKind::SelectionCommand, Some("ctrl+f10")),
+                ("unbound", ProfileKind::Dictation, None),
+                ("pd1", ProfileKind::Dictation, Some("ctrl+f11")),
+            ],
+        );
+        // An orphan binding (un-normalized settings) is never registered.
+        let mut orphan = settings.bindings["dictation_profile_pd1"].clone();
+        orphan.id = "dictation_profile_gone".into();
+        orphan.current_binding = "ctrl+f12".into();
+        settings.bindings.insert(orphan.id.clone(), orphan);
+        let mut expected = default_order();
+        expected.push("dictation_profile_pd2".into());
+        if cfg!(target_os = "windows") {
+            expected.push("command_profile_pc".into());
+        }
+        expected.push("dictation_profile_pd1".into());
+        assert_eq!(ids(&super::registration_order(&settings)), expected);
+        // The built-in records add nothing: without custom profiles the order
+        // is today's default order.
+        let plain = super::settings::get_default_settings();
+        assert_eq!(plain.processing_profiles.len(), 2);
+        assert_eq!(ids(&super::registration_order(&plain)), default_order());
+        let configured = ids(&super::configured_bindings(&settings));
+        assert!(configured.contains(&"dictation_profile_pd1".to_string()));
+        assert!(!configured.contains(&"dictation_profile_gone".to_string()));
+        assert!(!configured.contains(&"cancel".to_string()));
+    }
+
+    #[test]
+    fn handy008_overlapping_profile_is_skipped_and_the_earlier_owner_kept() {
+        for implementation in [
+            super::KeyboardImplementation::Tauri,
+            super::KeyboardImplementation::HandyKeys,
+        ] {
+            let mut owners = vec![
+                ("cancel", accelerator("cancel")),
+                (
+                    "transcribe_with_post_process",
+                    accelerator("transcribe_with_post_process"),
+                ),
+                ("transcribe", accelerator("transcribe")),
+                ("dictation_profile_first", "ctrl+f9".to_string()),
+            ];
+            if cfg!(target_os = "windows") {
+                owners.push(("assistant", accelerator("assistant")));
+            }
+            for (owner, taken) in owners {
+                let mut settings = with_profiles(
+                    implementation,
+                    &[
+                        ("first", ProfileKind::Dictation, Some("ctrl+f9")),
+                        ("late", ProfileKind::Dictation, Some(&taken)),
+                    ],
+                );
+                // Cleanup off: its accelerator is still reserved (N1).
+                settings.post_process_enabled = false;
+                let label = format!("{implementation:?}: {owner}");
+                assert_eq!(
+                    super::registration_skipped(&settings, "dictation_profile_late"),
+                    Some(owner.to_string()),
+                    "{label}"
+                );
+                let configured = ids(&super::configured_bindings(&settings));
+                assert!(
+                    !configured.contains(&"dictation_profile_late".to_string()),
+                    "{label}"
+                );
+                if !matches!(owner, "cancel" | "transcribe_with_post_process") {
+                    assert!(configured.contains(&owner.to_string()), "{label}");
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn handy008_profile_conflicting_with_assistant_is_skipped_not_the_assistant() {
+        let settings = with_profiles(
+            super::KeyboardImplementation::HandyKeys,
+            &[("p", ProfileKind::SelectionCommand, Some("ctrl+alt+space"))],
+        );
+        let configured = ids(&super::configured_bindings(&settings));
+        assert!(configured.contains(&"assistant".to_string()));
+        assert!(!configured.contains(&"command_profile_p".to_string()));
+        assert_eq!(super::registration_skipped(&settings, "assistant"), None);
+    }
+
+    #[test]
+    fn handy008_profile_conflicts_follow_each_backend_overlap_semantics() {
+        let handy = with_profiles(
+            super::KeyboardImplementation::HandyKeys,
+            &[("p", ProfileKind::Dictation, Some("ctrl+f9"))],
+        );
+        // HandyKeys: a generic modifier overlaps either side.
+        for candidate in ["ctrl_left+f9", "control_right+f9", "CTRL+F9"] {
+            assert_eq!(
+                super::binding_conflict(
+                    &handy.bindings,
+                    "dictation_profile_q",
+                    candidate,
+                    super::KeyboardImplementation::HandyKeys
+                ),
+                Some("dictation_profile_p".into()),
+                "{candidate}"
+            );
+        }
+        // Tauri: identity of parsed accelerators; sided names do not parse.
+        assert_eq!(
+            super::binding_conflict(
+                &handy.bindings,
+                "dictation_profile_q",
+                "ctrl_left+f9",
+                super::KeyboardImplementation::Tauri
+            ),
+            None
+        );
+        assert_eq!(
+            super::binding_conflict(
+                &handy.bindings,
+                "dictation_profile_q",
+                "control+F9",
+                super::KeyboardImplementation::Tauri
+            ),
+            Some("dictation_profile_p".into())
+        );
+        // A profile can keep its own accelerator.
+        assert_eq!(
+            super::binding_conflict(
+                &handy.bindings,
+                "dictation_profile_p",
+                "ctrl+f9",
+                super::KeyboardImplementation::Tauri
+            ),
+            None
+        );
+        assert!(super::bindings_overlap(
+            "ctrl+f9",
+            "ctrl_right+f9",
+            super::KeyboardImplementation::HandyKeys
+        ));
+        assert!(!super::bindings_overlap(
+            "ctrl_left+f9",
+            "ctrl_right+f9",
+            super::KeyboardImplementation::HandyKeys
+        ));
+    }
+
+    #[test]
+    fn handy008_n2_never_unregisters_or_restores_a_skipped_profile_binding() {
+        let settings = with_profiles(
+            super::KeyboardImplementation::Tauri,
+            &[
+                (
+                    "skipped",
+                    ProfileKind::Dictation,
+                    Some(&accelerator("transcribe")),
+                ),
+                ("fine", ProfileKind::Dictation, Some("ctrl+f9")),
+            ],
+        );
+        let skipped = &settings.bindings["dictation_profile_skipped"];
+        super::unregister_previous_binding(&settings, skipped, |_| {
+            panic!("Tauri unregisters by accelerator; this would remove Transcribe")
+        })
+        .unwrap();
+        super::restore_previous_binding(&settings, skipped, |_| {
+            panic!("a skipped profile binding must not be registered over Transcribe")
+        })
+        .unwrap();
+        let fine = &settings.bindings["dictation_profile_fine"];
+        let mut calls = 0;
+        super::unregister_previous_binding(&settings, fine, |binding| {
+            assert_eq!(binding.id, "dictation_profile_fine");
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        super::restore_previous_binding(&settings, fine, |_| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn handy008_never_unregisters_or_restores_a_binding_registration_does_not_use() {
+        let mut settings = with_profiles(
+            super::KeyboardImplementation::Tauri,
+            &[
+                ("command", ProfileKind::SelectionCommand, Some("ctrl+f9")),
+                ("orphan", ProfileKind::Dictation, Some("ctrl+f10")),
+            ],
+        );
+        // The orphan binding outlived its profile.
+        settings.processing_profiles.retain(|p| p.id != "orphan");
+        let mut unused = vec![settings.bindings["dictation_profile_orphan"].clone()];
+        let command = settings.bindings["command_profile_command"].clone();
+        if cfg!(target_os = "windows") {
+            let mut calls = 0;
+            super::unregister_previous_binding(&settings, &command, |_| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(calls, 1, "selection commands register on Windows");
+        } else {
+            unused.push(command);
+        }
+        for binding in &unused {
+            super::unregister_previous_binding(&settings, binding, |_| {
+                panic!("Tauri unregisters by accelerator; this binding was never registered")
+            })
+            .unwrap();
+            super::restore_previous_binding(&settings, binding, |_| {
+                panic!("a binding registration does not use must not be registered")
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn handy008_binding_to_modify_handles_new_missing_and_existing_bindings() {
+        let mut settings = with_profiles(
+            super::KeyboardImplementation::Tauri,
+            &[
+                ("bound", ProfileKind::Dictation, Some("ctrl+f9")),
+                ("unbound", ProfileKind::Dictation, None),
+            ],
+        );
+        assert_eq!(
+            super::binding_to_modify(&settings, "dictation_profile_bound")
+                .unwrap()
+                .unwrap()
+                .current_binding,
+            "ctrl+f9"
+        );
+        assert!(
+            super::binding_to_modify(&settings, "dictation_profile_unbound")
+                .unwrap()
+                .is_none()
+        );
+        let new =
+            super::new_profile_binding(&settings, "dictation_profile_unbound", "ctrl+f10").unwrap();
+        assert_eq!(
+            (
+                new.name.as_str(),
+                new.default_binding.as_str(),
+                new.current_binding.as_str()
+            ),
+            ("Profile unbound", "", "ctrl+f10")
+        );
+        for missing in ["dictation_profile_gone", "command_profile_unbound"] {
+            assert_eq!(
+                super::binding_to_modify(&settings, missing).unwrap_err(),
+                "Profile not found",
+                "{missing}"
+            );
+        }
+        settings.bindings.remove("transcribe");
+        assert_eq!(
+            super::binding_to_modify(&settings, "transcribe")
+                .unwrap()
+                .unwrap()
+                .current_binding,
+            accelerator("transcribe")
+        );
+        assert!(super::binding_to_modify(&settings, "unknown").is_err());
+    }
+
+    #[test]
+    fn handy008_bare_navigation_keys_are_rejected_for_profile_hotkeys() {
+        for implementation in [
+            super::KeyboardImplementation::Tauri,
+            super::KeyboardImplementation::HandyKeys,
+        ] {
+            for id in ["dictation_profile_p", "command_profile_p"] {
+                for key in ["enter", "escape", "esc", "tab"] {
+                    assert!(
+                        super::validate_binding_input(id, key, implementation).is_err(),
+                        "{implementation:?} {id} {key}"
+                    );
+                }
+                assert!(super::validate_binding_input(id, "ctrl+f9", implementation).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn handy008_implementation_switch_unsets_an_invalid_profile_hotkey() {
+        let mut settings = with_profiles(
+            super::KeyboardImplementation::HandyKeys,
+            &[
+                ("sided", ProfileKind::Dictation, Some("ctrl_left+f9")),
+                ("plain", ProfileKind::Dictation, Some("ctrl+f10")),
+            ],
+        );
+        let (bindings, reset) = super::bindings_for_implementation(
+            &mut settings,
+            super::KeyboardImplementation::HandyKeys,
+        );
+        assert!(reset.is_empty());
+        assert!(ids(&bindings).contains(&"dictation_profile_sided".to_string()));
+        let (bindings, reset) =
+            super::bindings_for_implementation(&mut settings, super::KeyboardImplementation::Tauri);
+        assert_eq!(reset, ["dictation_profile_sided"]);
+        assert!(!settings.bindings.contains_key("dictation_profile_sided"));
+        assert!(!ids(&bindings).contains(&"dictation_profile_sided".to_string()));
+        assert!(ids(&bindings).contains(&"dictation_profile_plain".to_string()));
+    }
+
+    #[test]
+    fn handy008_conflict_message_names_the_owner() {
+        let settings = with_profiles(
+            super::KeyboardImplementation::Tauri,
+            &[("p", ProfileKind::Dictation, Some("ctrl+f9"))],
+        );
+        let bindings = super::effective_bindings(&settings);
+        assert_eq!(
+            super::conflict_owner_name(&bindings, "dictation_profile_p"),
+            "Profile p"
+        );
+        assert_eq!(
+            super::conflict_owner_name(&bindings, "transcribe"),
+            "Transcribe"
+        );
+        assert_eq!(super::conflict_owner_name(&bindings, "unknown"), "unknown");
+    }
+
+    #[test]
+    fn handy008_post_process_toggle_governs_only_the_cleanup_hotkey() {
+        let mut settings = with_profiles(
+            super::KeyboardImplementation::Tauri,
+            &[("p", ProfileKind::Dictation, Some("ctrl+f9"))],
+        );
+        settings.post_process_enabled = false;
+        let configured = ids(&super::configured_bindings(&settings));
+        assert!(!configured.contains(&"transcribe_with_post_process".to_string()));
+        assert!(configured.contains(&"dictation_profile_p".to_string()));
+        // The disabled Cleanup accelerator stays reserved (N1).
+        assert_eq!(
+            super::binding_conflict(
+                &super::effective_bindings(&settings),
+                "dictation_profile_p",
+                &accelerator("transcribe_with_post_process"),
+                settings.keyboard_implementation
+            ),
+            Some("transcribe_with_post_process".into())
+        );
+        settings.post_process_enabled = true;
+        assert!(ids(&super::configured_bindings(&settings))
+            .contains(&"transcribe_with_post_process".to_string()));
+    }
+
+    #[test]
+    fn handy008_fallback_excludes_skipped_and_orphan_profile_bindings() {
+        let mut settings = with_profiles(
+            super::KeyboardImplementation::HandyKeys,
+            &[
+                (
+                    "skipped",
+                    ProfileKind::Dictation,
+                    Some(&accelerator("cancel")),
+                ),
+                ("fine", ProfileKind::Dictation, Some("ctrl+f9")),
+                ("command", ProfileKind::SelectionCommand, Some("ctrl+f10")),
+            ],
+        );
+        let mut orphan = settings.bindings["dictation_profile_fine"].clone();
+        orphan.id = "dictation_profile_gone".into();
+        settings.bindings.insert(orphan.id.clone(), orphan);
+        assert!(super::fallback_excluded(
+            &settings,
+            "dictation_profile_skipped"
+        ));
+        assert!(super::fallback_excluded(
+            &settings,
+            "dictation_profile_gone"
+        ));
+        assert!(!super::fallback_excluded(
+            &settings,
+            "dictation_profile_fine"
+        ));
+        for builtin in ["transcribe", "transcribe_with_post_process", "cancel"] {
+            assert!(!super::fallback_excluded(&settings, builtin), "{builtin}");
+        }
+        assert_eq!(
+            super::fallback_excluded(&settings, "command_profile_command"),
+            !cfg!(target_os = "windows"),
+            "selection commands register only on Windows"
+        );
+    }
+
+    #[test]
+    fn handy008_reset_returns_builtins_to_default_and_refuses_profiles() {
+        let mut settings = with_profiles(
+            super::KeyboardImplementation::Tauri,
+            &[("p", ProfileKind::Dictation, Some("ctrl+f9"))],
+        );
+        settings
+            .bindings
+            .get_mut("transcribe_with_post_process")
+            .unwrap()
+            .current_binding = "ctrl+f8".into();
+        assert_eq!(
+            super::reset_target(&settings, "transcribe_with_post_process").unwrap(),
+            accelerator("transcribe_with_post_process")
+        );
+        assert_eq!(
+            super::reset_target(&settings, "dictation_profile_p").unwrap_err(),
+            "Profile hotkeys have no default"
+        );
+    }
+
     use handy_keys::Hotkey;
     use tauri_plugin_global_shortcut::Shortcut;
 

@@ -33,6 +33,13 @@ static MIGRATIONS: &[M] = &[
     M::up("ALTER TABLE transcription_history ADD COLUMN post_process_requested BOOLEAN NOT NULL DEFAULT 0;"),
 ];
 
+/// Nullable columns added outside [`MIGRATIONS`] so user_version stays at the
+/// last released value and an older build still starts: rusqlite_migration
+/// refuses a database ahead of its list. Older builds name their columns in
+/// every SELECT and INSERT, so they never see these, and a deleted row takes
+/// its profile with it. A future migration must not add these names.
+const PROFILE_COLUMNS: [&str; 2] = ["profile_id", "profile_name"];
+
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
 pub struct PaginatedHistory {
     pub entries: Vec<HistoryEntry>,
@@ -63,6 +70,25 @@ pub struct HistoryEntry {
     pub post_processed_text: Option<String>,
     pub post_process_prompt: Option<String>,
     pub post_process_requested: bool,
+    /// The processing profile that produced this entry; None for raw
+    /// dictation and for entries older than HANDY-008.
+    pub profile_id: Option<String>,
+    /// The profile name when the entry was saved; None for an unnamed built-in.
+    pub profile_name: Option<String>,
+}
+
+/// The profile columns of a new entry. The name is a snapshot that survives
+/// renames and deletes; an unnamed built-in stores NULL so its entries look as
+/// before.
+fn profile_columns(
+    profile: Option<&crate::settings::ProfileRef>,
+) -> (Option<String>, Option<String>) {
+    (
+        profile.map(|p| p.id.clone()),
+        profile
+            .map(|p| p.name.clone())
+            .filter(|name| !name.is_empty()),
+    )
 }
 
 pub struct HistoryManager {
@@ -105,6 +131,10 @@ impl HistoryManager {
         // tauri-plugin-sql used _sqlx_migrations table, rusqlite_migration uses user_version pragma
         self.migrate_from_tauri_plugin_sql(&conn)?;
 
+        Self::prepare_schema(&mut conn)
+    }
+
+    fn prepare_schema(conn: &mut Connection) -> Result<()> {
         // Create migrations object and run to latest version
         let migrations = Migrations::new(MIGRATIONS.to_vec());
 
@@ -118,7 +148,7 @@ impl HistoryManager {
         debug!("Database version before migration: {}", version_before);
 
         // Apply any pending migrations
-        migrations.to_latest(&mut conn)?;
+        migrations.to_latest(conn)?;
 
         // Get version after migration
         let version_after: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -132,6 +162,25 @@ impl HistoryManager {
             debug!("Database already at latest version {}", version_after);
         }
 
+        Self::ensure_profile_columns(conn)
+    }
+
+    /// Add the missing [`PROFILE_COLUMNS`]; idempotent and leaves user_version
+    /// alone.
+    fn ensure_profile_columns(conn: &Connection) -> Result<()> {
+        let mut stmt =
+            conn.prepare("SELECT name FROM pragma_table_info('transcription_history')")?;
+        let existing = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for column in PROFILE_COLUMNS {
+            if !existing.iter().any(|name| name == column) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE transcription_history ADD COLUMN {column} TEXT;"
+                ))?;
+                info!("Added history column {column}");
+            }
+        }
         Ok(())
     }
 
@@ -207,6 +256,8 @@ impl HistoryManager {
             post_processed_text: row.get("post_processed_text")?,
             post_process_prompt: row.get("post_process_prompt")?,
             post_process_requested: row.get("post_process_requested")?,
+            profile_id: row.get("profile_id")?,
+            profile_name: row.get("profile_name")?,
         })
     }
 
@@ -223,45 +274,29 @@ impl HistoryManager {
         post_process_requested: bool,
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
+        profile: Option<&crate::settings::ProfileRef>,
     ) -> Result<HistoryEntry> {
         let timestamp = Utc::now().timestamp();
         let title = self.format_timestamp_title(timestamp);
 
         let conn = self.get_connection()?;
-        conn.execute(
-            "INSERT INTO transcription_history (
+        let (profile_id, profile_name) = profile_columns(profile);
+        let entry = Self::insert_entry_with_conn(
+            &conn,
+            HistoryEntry {
+                id: 0,
                 file_name,
                 timestamp,
-                saved,
+                saved: false,
                 title,
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
-                post_process_requested
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                &file_name,
-                timestamp,
-                false,
-                &title,
-                &transcription_text,
-                &post_processed_text,
-                &post_process_prompt,
                 post_process_requested,
-            ],
+                profile_id,
+                profile_name,
+            },
         )?;
-
-        let entry = HistoryEntry {
-            id: conn.last_insert_rowid(),
-            file_name,
-            timestamp,
-            saved: false,
-            title,
-            transcription_text,
-            post_processed_text,
-            post_process_prompt,
-            post_process_requested,
-        };
 
         debug!("Saved history entry with id {}", entry.id);
 
@@ -279,7 +314,39 @@ impl HistoryManager {
         Ok(entry)
     }
 
-    /// Update an existing history entry with new transcription results (used by retry).
+    fn insert_entry_with_conn(conn: &Connection, mut entry: HistoryEntry) -> Result<HistoryEntry> {
+        conn.execute(
+            "INSERT INTO transcription_history (
+                file_name,
+                timestamp,
+                saved,
+                title,
+                transcription_text,
+                post_processed_text,
+                post_process_prompt,
+                post_process_requested,
+                profile_id,
+                profile_name
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                &entry.file_name,
+                entry.timestamp,
+                entry.saved,
+                &entry.title,
+                &entry.transcription_text,
+                &entry.post_processed_text,
+                &entry.post_process_prompt,
+                entry.post_process_requested,
+                &entry.profile_id,
+                &entry.profile_name,
+            ],
+        )?;
+        entry.id = conn.last_insert_rowid();
+        Ok(entry)
+    }
+
+    /// Update an existing history entry with new transcription results (used by
+    /// retry). The profile columns are left untouched.
     pub fn update_transcription(
         &self,
         id: i64,
@@ -308,7 +375,7 @@ impl HistoryManager {
 
         let entry = conn
             .query_row(
-                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
+                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, profile_id, profile_name
                  FROM transcription_history WHERE id = ?1",
                 params![id],
                 Self::map_history_entry,
@@ -459,7 +526,7 @@ impl HistoryManager {
             (Some(cursor_id), Some(lim)) => {
                 let fetch_count = (lim + 1) as i64;
                 let mut stmt = conn.prepare(
-                    "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
+                    "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, profile_id, profile_name
                      FROM transcription_history
                      WHERE id < ?1
                      ORDER BY id DESC
@@ -473,7 +540,7 @@ impl HistoryManager {
             (None, Some(lim)) => {
                 let fetch_count = (lim + 1) as i64;
                 let mut stmt = conn.prepare(
-                    "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
+                    "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, profile_id, profile_name
                      FROM transcription_history
                      ORDER BY id DESC
                      LIMIT ?1",
@@ -485,7 +552,7 @@ impl HistoryManager {
             }
             (_, None) => {
                 let mut stmt = conn.prepare(
-                    "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
+                    "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, profile_id, profile_name
                      FROM transcription_history
                      ORDER BY id DESC",
                 )?;
@@ -516,7 +583,9 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
-                post_process_requested
+                post_process_requested,
+                profile_id,
+                profile_name
              FROM transcription_history
              ORDER BY timestamp DESC
              LIMIT 1",
@@ -543,7 +612,9 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
-                post_process_requested
+                post_process_requested,
+                profile_id,
+                profile_name
              FROM transcription_history
              WHERE transcription_text != ''
              ORDER BY timestamp DESC
@@ -597,7 +668,9 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
-                post_process_requested
+                post_process_requested,
+                profile_id,
+                profile_name
              FROM transcription_history
              WHERE id = ?1",
         )?;
@@ -655,22 +728,164 @@ mod tests {
     use rusqlite::{params, Connection};
 
     fn setup_conn() -> Connection {
-        let conn = Connection::open_in_memory().expect("open in-memory db");
-        conn.execute_batch(
-            "CREATE TABLE transcription_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_name TEXT NOT NULL,
-                timestamp INTEGER NOT NULL,
-                saved BOOLEAN NOT NULL DEFAULT 0,
-                title TEXT NOT NULL,
-                transcription_text TEXT NOT NULL,
-                post_processed_text TEXT,
-                post_process_prompt TEXT,
-                post_process_requested BOOLEAN NOT NULL DEFAULT 0
-            );",
-        )
-        .expect("create transcription_history table");
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        HistoryManager::prepare_schema(&mut conn).expect("prepare history schema");
         conn
+    }
+
+    /// The migration count of the last build before HANDY-008 (42b4630). An
+    /// older build runs this list at startup and fails on a higher
+    /// user_version.
+    const RELEASED_MIGRATIONS: usize = 4;
+
+    fn user_version(conn: &Connection) -> i32 {
+        conn.pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read user_version")
+    }
+
+    fn released_build_init(conn: &mut Connection) {
+        Migrations::new(MIGRATIONS[..RELEASED_MIGRATIONS].to_vec())
+            .to_latest(conn)
+            .expect("an older build initializes this database");
+    }
+
+    fn insert_profile_entry(conn: &Connection, timestamp: i64, profile_id: &str) -> HistoryEntry {
+        HistoryManager::insert_entry_with_conn(
+            conn,
+            HistoryEntry {
+                id: 0,
+                file_name: format!("handy-{timestamp}.wav"),
+                timestamp,
+                saved: false,
+                title: "Recording".into(),
+                transcription_text: "text".into(),
+                post_processed_text: Some("cleaned".into()),
+                post_process_prompt: None,
+                post_process_requested: true,
+                profile_id: Some(profile_id.into()),
+                profile_name: Some("Profile".into()),
+            },
+        )
+        .expect("insert profile entry")
+    }
+
+    fn profile_rows(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM transcription_history WHERE profile_id IS NOT NULL OR profile_name IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count profile rows")
+    }
+
+    #[test]
+    fn handy008_new_database_still_opens_in_an_older_build() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        HistoryManager::prepare_schema(&mut conn).expect("prepare schema");
+        insert_profile_entry(&conn, 100, "p1");
+        released_build_init(&mut conn);
+        assert_eq!(user_version(&conn), RELEASED_MIGRATIONS as i32);
+    }
+
+    #[test]
+    fn handy008_older_database_gains_profile_columns_and_old_rows_read_none() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        released_build_init(&mut conn);
+        insert_entry(&conn, 100, "old row", Some("cleaned"));
+        HistoryManager::prepare_schema(&mut conn).expect("upgrade schema");
+        assert_eq!(user_version(&conn), RELEASED_MIGRATIONS as i32);
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch latest entry")
+            .expect("entry exists");
+        assert_eq!(entry.transcription_text, "old row");
+        assert_eq!(entry.profile_id, None);
+        assert_eq!(entry.profile_name, None);
+    }
+
+    #[test]
+    fn handy008_round_trip_through_an_older_build_keeps_no_stale_profile() {
+        let mut conn = setup_conn();
+        let tagged = insert_profile_entry(&conn, 100, "p1");
+
+        // The older build starts, deletes the tagged entry the way its delete
+        // and retention paths do, and saves an entry with its own INSERT.
+        released_build_init(&mut conn);
+        conn.execute(
+            "DELETE FROM transcription_history WHERE id = ?1",
+            params![tagged.id],
+        )
+        .expect("older build deletes the entry");
+        assert_eq!(profile_rows(&conn), 0, "the profile left with its row");
+        insert_entry(&conn, 200, "older build", None);
+
+        // The newer build starts again: idempotent, still at the released version.
+        HistoryManager::prepare_schema(&mut conn).expect("reopen schema");
+        assert_eq!(user_version(&conn), RELEASED_MIGRATIONS as i32);
+        let older = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch latest entry")
+            .expect("entry exists");
+        assert_eq!(older.transcription_text, "older build");
+        assert_eq!((older.profile_id, older.profile_name), (None, None));
+
+        let newer = insert_profile_entry(&conn, 300, "p2");
+        let loaded = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch latest entry")
+            .expect("entry exists");
+        assert_eq!(loaded.id, newer.id);
+        assert_eq!(loaded.profile_id.as_deref(), Some("p2"));
+        assert_eq!(profile_rows(&conn), 1);
+    }
+
+    #[test]
+    fn handy008_profile_columns_round_trip_and_unnamed_builtin_stores_null() {
+        use crate::settings::ProfileRef;
+        let conn = setup_conn();
+        let custom = ProfileRef {
+            id: "p1700000000000".into(),
+            name: "Polish to English".into(),
+            builtin: false,
+        };
+        let builtin = ProfileRef {
+            id: "builtin_cleanup".into(),
+            name: String::new(),
+            builtin: true,
+        };
+        for (timestamp, profile, expected) in [
+            (
+                100,
+                Some(&custom),
+                (Some("p1700000000000"), Some("Polish to English")),
+            ),
+            (200, Some(&builtin), (Some("builtin_cleanup"), None)),
+            (300, None, (None, None)),
+        ] {
+            let (profile_id, profile_name) = profile_columns(profile);
+            let saved = HistoryManager::insert_entry_with_conn(
+                &conn,
+                HistoryEntry {
+                    id: 0,
+                    file_name: format!("handy-{timestamp}.wav"),
+                    timestamp,
+                    saved: false,
+                    title: "Recording".into(),
+                    transcription_text: "text".into(),
+                    post_processed_text: None,
+                    post_process_prompt: None,
+                    post_process_requested: profile.is_some(),
+                    profile_id,
+                    profile_name,
+                },
+            )
+            .expect("insert entry");
+            let loaded = HistoryManager::get_latest_entry_with_conn(&conn)
+                .expect("fetch latest entry")
+                .expect("entry exists");
+            assert_eq!(loaded.id, saved.id);
+            assert_eq!(
+                (loaded.profile_id.as_deref(), loaded.profile_name.as_deref()),
+                expected
+            );
+        }
     }
 
     fn insert_entry(conn: &Connection, timestamp: i64, text: &str, post_processed: Option<&str>) {

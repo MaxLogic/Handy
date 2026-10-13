@@ -339,6 +339,56 @@ async changePostProcessRequestOptions(options: LlmRequestOptions) : Promise<Resu
     else return { status: "error", error: e  as any };
 }
 },
+async addProcessingProfile(input: ProcessingProfileInput) : Promise<Result<ProcessingProfile, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_processing_profile", { input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Kind is immutable. A built-in writes its legacy prompt selector in the same
+ * change. Registration is not touched.
+ */
+async updateProcessingProfile(id: string, input: ProcessingProfileInput) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_processing_profile", { id, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Custom profiles only; built-ins return `builtin_profile`.
+ */
+async deleteProcessingProfile(id: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_processing_profile", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Custom profiles only; built-in hotkeys can be changed or reset, not removed.
+ */
+async clearProfileHotkey(id: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("clear_profile_hotkey", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async changeEnglishCleanupSettings(value: EnglishCleanupSettings) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_english_cleanup_settings", { value }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async updateCustomWords(words: string[]) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("update_custom_words", { words }) };
@@ -1072,7 +1122,12 @@ vad_backend?: VadBackend;
  * not gated on this — that follows model capability. Migrated from the old
  * `overlay_position` (position `none` → style `None`).
  */
-overlay_style?: OverlayStyle }
+overlay_style?: OverlayStyle;
+/**
+ * Built-in and custom processing profiles. A missing key loads empty (not
+ * the defaults) so `normalize_profiles` is the only seeding path.
+ */
+processing_profiles?: ProcessingProfile[]; english_cleanup?: EnglishCleanupSettings }
 export type AudioDevice = { index: string; name: string; is_default: boolean }
 export type AutoSubmitKey = "enter" | "ctrl_enter" | "cmd_enter"
 export type AvailableAccelerators = { transcribe: string[]; ort: string[]; gpu_devices: GpuDeviceOption[] }
@@ -1095,8 +1150,26 @@ export type EngineType =
  * the file, so this one variant covers the whole transcribe-cpp family.
  */
 "TranscribeCpp" | "Parakeet" | "Moonshine" | "MoonshineStreaming" | "SenseVoice" | "GigaAM" | "Canary" | "Cohere"
+export type EnglishCleanupSettings = { enabled: boolean;
+/**
+ * For example `http://127.0.0.1:8082/v1`; uses the Custom provider's key.
+ */
+base_url: string;
+/**
+ * For example `S1-mini`.
+ */
+model: string }
 export type GpuDeviceOption = { id: string; name: string; total_vram_mb: number }
-export type HistoryEntry = { id: number; file_name: string; timestamp: number; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; post_process_requested: boolean }
+export type HistoryEntry = { id: number; file_name: string; timestamp: number; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; post_process_requested: boolean;
+/**
+ * The processing profile that produced this entry; None for raw
+ * dictation and for entries older than HANDY-008.
+ */
+profile_id: string | null;
+/**
+ * The profile name when the entry was saved; None for an unnamed built-in.
+ */
+profile_name: string | null }
 export type HistoryUpdatePayload = { action: "added"; entry: HistoryEntry } | { action: "updated"; entry: HistoryEntry } | { action: "deleted"; id: number } | { action: "toggled"; id: number }
 /**
  * Result of changing keyboard implementation
@@ -1113,6 +1186,15 @@ export type KeyboardDiagnosticReport = { secure_input_enabled: boolean; culprit_
 key_down: number; key_up: number; flags_changed: number; mouse: number; duration_ms: number }
 export type KeyboardImplementation = "tauri" | "handy_keys"
 export type LLMPrompt = { id: string; name: string; prompt: string }
+export type LlmEndpoint = {
+/**
+ * Must exist in `post_process_providers`.
+ */
+provider_id: string;
+/**
+ * Only for provider "custom"; None uses the provider's URL.
+ */
+base_url?: string | null; model: string }
 /**
  * Options shared by cleanup, assistant, and model discovery requests.
  */
@@ -1158,7 +1240,44 @@ export type PaginatedHistory = { entries: HistoryEntry[]; has_more: boolean }
 export type PasteMethod = "ctrl_v" | "direct" | "none" | "shift_insert" | "ctrl_shift_v" | "external_script"
 export type PermissionAccess = "allowed" | "denied" | "unknown"
 export type PostProcessProvider = { id: string; label: string; base_url: string; allow_base_url_edit?: boolean; models_endpoint?: string | null; supports_structured_output?: boolean }
+export type ProcessingProfile = {
+/**
+ * A reserved built-in id, or a server-assigned `[a-z0-9_]{1,40}`.
+ */
+id: string;
+/**
+ * Trimmed; `""` only on built-ins, meaning the localized default name.
+ */
+name: string; kind: ProfileKind;
+/**
+ * Built-ins: a synced copy of the legacy selector. None only on built-ins.
+ */
+prompt_id: string | null;
+/**
+ * Override of the default model; None uses the default model and routing.
+ */
+model?: LlmEndpoint | null;
+/**
+ * None uses the global `selected_language`.
+ */
+speech_language?: string | null;
+/**
+ * Dictation only. Some means English speech may use the English model.
+ */
+english_cleanup?: S1Controls | null }
+/**
+ * Add and update payload; ids are never chosen by the client.
+ */
+export type ProcessingProfileInput = { name: string; kind: ProfileKind; prompt_id: string | null; model: LlmEndpoint | null; speech_language: string | null; english_cleanup: S1Controls | null }
+/**
+ * Immutable after creation; custom profiles encode it in their binding id.
+ */
+export type ProfileKind = "dictation" | "selection_command"
 export type RecordingRetentionPeriod = "never" | "preserve_limit" | "days_3" | "weeks_2" | "months_3"
+/**
+ * S1-mini control line values.
+ */
+export type S1Controls = { styling: string; structure: string; context: string }
 export type SecretMap = Partial<{ [key in string]: string }>
 export type SecureInputStatus = { 
 /**

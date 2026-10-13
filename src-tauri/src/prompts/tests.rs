@@ -1,5 +1,6 @@
 use super::*;
 use crate::llm_client::test_http::{completion, FakeServer, Step};
+use crate::settings::{spec_for_profile, BUILTIN_ASSISTANT_PROFILE_ID, BUILTIN_CLEANUP_PROFILE_ID};
 
 mod cleanup_eval;
 
@@ -12,8 +13,17 @@ async fn cleanup(req: &CleanupRequest, transcript: &str) -> Result<String, LlmEr
     )
     .await?
     {
-        CleanupOutcome::Cleaned(text) => Ok(text),
+        CleanupOutcome::Cleaned { text, .. } => Ok(text),
         CleanupOutcome::Skipped(reason) => panic!("unexpected skip in cleanup fixture: {reason:?}"),
+    }
+}
+
+/// An S1-named default model cleaned the text with its fixed format.
+fn s1_default(text: &str) -> CleanupOutcome {
+    CleanupOutcome::Cleaned {
+        text: text.into(),
+        route: LlmRoute::Default,
+        prompt_sent: false,
     }
 }
 
@@ -82,7 +92,7 @@ async fn handy009_r2_translation_to_english_reaches_s1() {
         )
         .await
         .unwrap(),
-        CleanupOutcome::Cleaned("Yes, thanks.".into())
+        s1_default("Yes, thanks.")
     );
     assert_eq!(server.requests.lock().unwrap().len(), 1);
 }
@@ -107,7 +117,7 @@ async fn handy009_r2_auto_detected_english_reaches_s1() {
     )
     .await
     .unwrap();
-    assert_eq!(result, CleanupOutcome::Cleaned("Sounds good.".into()));
+    assert_eq!(result, s1_default("Sounds good."));
     assert_eq!(server.requests.lock().unwrap().len(), 1);
 }
 
@@ -163,7 +173,7 @@ async fn handy009_r3_s1_routes_only_from_utterance_evidence() {
                 .unwrap();
                 let expected = match expected_skip {
                     Some(reason) => CleanupOutcome::Skipped(reason),
-                    None => CleanupOutcome::Cleaned("Sounds good.".into()),
+                    None => s1_default("Sounds good."),
                 };
                 assert_eq!(
                     outcome, expected,
@@ -860,4 +870,440 @@ fn content_without_think_block_is_unchanged() {
         strip_think_block("<think>never closed"),
         "<think>never closed"
     );
+}
+
+// ---------------------------------------------------------------------------
+// HANDY-008: profile requests and routing
+// ---------------------------------------------------------------------------
+
+/// A profile in the D4 matrix: its English opt-in and model override.
+#[derive(Clone, Copy, Debug)]
+enum MatrixSpec {
+    BuiltinSeeded,
+    BuiltinNoEnglish,
+    BuiltinOverride,
+    CustomEligible,
+    CustomIneligible,
+    CustomOverride,
+    CustomS1Override,
+}
+
+const CUSTOM_CONTROLS: (&str, &str, &str) = ("casual", "lists", "email");
+
+fn custom_controls() -> S1Controls {
+    S1Controls {
+        styling: CUSTOM_CONTROLS.0.into(),
+        structure: CUSTOM_CONTROLS.1.into(),
+        context: CUSTOM_CONTROLS.2.into(),
+    }
+}
+
+fn matrix_settings(default_url: &str, english_url: &str, routing: bool) -> AppSettings {
+    let mut settings = configured_settings(default_url);
+    settings
+        .post_process_models
+        .insert("custom".into(), "qwen-default".into());
+    settings.english_cleanup = crate::settings::EnglishCleanupSettings {
+        enabled: routing,
+        base_url: format!("{english_url}/v1"),
+        model: "S1-mini".into(),
+    };
+    settings
+}
+
+fn matrix_spec(settings: &mut AppSettings, spec: MatrixSpec, english_url: &str) -> ProfileSpec {
+    use crate::settings::ProcessingProfile;
+    let override_model = |model: &str, url: Option<&str>| LlmEndpoint {
+        provider_id: "custom".into(),
+        base_url: url.map(|u| format!("{u}/v1")),
+        model: model.into(),
+    };
+    fn builtin(settings: &mut AppSettings) -> &mut ProcessingProfile {
+        settings
+            .processing_profiles
+            .iter_mut()
+            .find(|p| p.id == BUILTIN_CLEANUP_PROFILE_ID)
+            .unwrap()
+    }
+    let custom = |english: Option<S1Controls>, model: Option<LlmEndpoint>| ProcessingProfile {
+        id: "p1".into(),
+        name: "Custom".into(),
+        kind: ProfileKind::Dictation,
+        prompt_id: Some("default_improve_transcriptions".into()),
+        model,
+        speech_language: None,
+        english_cleanup: english,
+    };
+    let id = match spec {
+        MatrixSpec::BuiltinSeeded => BUILTIN_CLEANUP_PROFILE_ID,
+        MatrixSpec::BuiltinNoEnglish => {
+            builtin(settings).english_cleanup = None;
+            BUILTIN_CLEANUP_PROFILE_ID
+        }
+        MatrixSpec::BuiltinOverride => {
+            builtin(settings).model = Some(override_model("qwen-override", None));
+            BUILTIN_CLEANUP_PROFILE_ID
+        }
+        MatrixSpec::CustomEligible => {
+            let profile = custom(Some(custom_controls()), None);
+            settings.processing_profiles.push(profile);
+            "p1"
+        }
+        MatrixSpec::CustomIneligible => {
+            settings.processing_profiles.push(custom(None, None));
+            "p1"
+        }
+        MatrixSpec::CustomOverride => {
+            let profile = custom(
+                Some(custom_controls()),
+                Some(override_model("qwen-override", None)),
+            );
+            settings.processing_profiles.push(profile);
+            "p1"
+        }
+        MatrixSpec::CustomS1Override => {
+            let profile = custom(
+                Some(custom_controls()),
+                Some(override_model("S1-mini", Some(english_url))),
+            );
+            settings.processing_profiles.push(profile);
+            "p1"
+        }
+    };
+    spec_for_profile(settings, id).unwrap()
+}
+
+#[tokio::test]
+async fn handy008_route_matrix() {
+    use MatrixSpec::*;
+    let english_evidence = [
+        OutputLanguageEvidence::UserSelected("en".into()),
+        OutputLanguageEvidence::ModelDetected("en".into()),
+        OutputLanguageEvidence::TranslatedToEnglish,
+    ];
+    let other_evidence = [
+        OutputLanguageEvidence::UserSelected("pl".into()),
+        OutputLanguageEvidence::Unknown,
+    ];
+    let mut cases = 0;
+    for routing in [false, true] {
+        for spec in [
+            BuiltinSeeded,
+            BuiltinNoEnglish,
+            BuiltinOverride,
+            CustomEligible,
+            CustomIneligible,
+            CustomOverride,
+            CustomS1Override,
+        ] {
+            for evidence in english_evidence.iter().chain(other_evidence.iter()) {
+                let english_speech = evidence.language().is_some_and(|language| language == "en");
+                let default = FakeServer::new(vec![Step::Respond(
+                    200,
+                    completion(Some(r#"{"transcription":"Default."}"#), "stop"),
+                )])
+                .await;
+                let english = FakeServer::new(vec![Step::Respond(
+                    200,
+                    completion(Some("English."), "stop"),
+                )])
+                .await;
+                let mut settings = matrix_settings(&default.url, &english.url, routing);
+                let profile = matrix_spec(&mut settings, spec, &english.url);
+                let request = CleanupRequest::from_spec(&settings, &profile).unwrap();
+                let outcome = super::cleanup(&request, "raw words", evidence)
+                    .await
+                    .unwrap();
+
+                let opted_in = matches!(spec, BuiltinSeeded | CustomEligible);
+                let controls = match spec {
+                    BuiltinSeeded => S1Controls::default(),
+                    _ => custom_controls(),
+                };
+                let label = format!("routing={routing} spec={spec:?} evidence={evidence:?}");
+                // (server hit, route, prompt sent); None = skipped before HTTP.
+                let expected: Option<(&FakeServer, LlmRoute, bool)> =
+                    if routing && opted_in && english_speech {
+                        Some((&english, LlmRoute::EnglishModel, false))
+                    } else if matches!(spec, CustomS1Override) {
+                        english_speech.then_some((&english, LlmRoute::ProfileModel, false))
+                    } else if matches!(spec, BuiltinOverride | CustomOverride) {
+                        Some((&default, LlmRoute::ProfileModel, true))
+                    } else {
+                        Some((&default, LlmRoute::Default, true))
+                    };
+                let default_requests = default.requests.lock().unwrap().clone();
+                let english_requests = english.requests.lock().unwrap().clone();
+                match expected {
+                    None => {
+                        assert!(
+                            matches!(outcome, CleanupOutcome::Skipped(_)),
+                            "{label}: {outcome:?}"
+                        );
+                        assert!(default_requests.is_empty(), "{label}");
+                        assert!(english_requests.is_empty(), "{label}");
+                    }
+                    Some((server, route, prompt_sent)) => {
+                        let to_english = std::ptr::eq(server, &english);
+                        assert_eq!(
+                            outcome,
+                            CleanupOutcome::Cleaned {
+                                text: if to_english { "English." } else { "Default." }.into(),
+                                route,
+                                prompt_sent
+                            },
+                            "{label}"
+                        );
+                        let (hit, missed) = if to_english {
+                            (&english_requests, &default_requests)
+                        } else {
+                            (&default_requests, &english_requests)
+                        };
+                        assert_eq!(hit.len(), 1, "{label}");
+                        assert!(missed.is_empty(), "{label}");
+                        let body = &hit[0];
+                        let user = body["messages"][1]["content"].as_str().unwrap();
+                        if prompt_sent {
+                            assert!(user.starts_with("<transcript>"), "{label}");
+                            let model = match spec {
+                                BuiltinOverride | CustomOverride => "qwen-override",
+                                _ => "qwen-default",
+                            };
+                            assert_eq!(body["model"], model, "{label}");
+                        } else {
+                            assert_eq!(
+                                user,
+                                format!(
+                                    "[Styling: {}] [Structure: {}] [Context: {}]\nraw words",
+                                    controls.styling, controls.structure, controls.context
+                                ),
+                                "{label}"
+                            );
+                            assert_eq!(body["model"], "S1-mini", "{label}");
+                            assert!(body.get("response_format").is_none(), "{label}");
+                        }
+                    }
+                }
+                cases += 1;
+            }
+        }
+    }
+    assert_eq!(cases, 70);
+}
+
+#[tokio::test]
+async fn handy008_english_route_transport_failure_is_error_without_fallback() {
+    let default = FakeServer::new(vec![Step::Respond(
+        200,
+        completion(Some(r#"{"transcription":"Default."}"#), "stop"),
+    )])
+    .await;
+    // Bind then drop: nothing listens on the English port.
+    let closed = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let mut settings = matrix_settings(&default.url, &closed, true);
+    settings.post_process_request_options.connect_timeout_secs = 1;
+    settings.post_process_request_options.timeout_secs = 2;
+    let spec = spec_for_profile(&settings, BUILTIN_CLEANUP_PROFILE_ID).unwrap();
+    let request = CleanupRequest::from_spec(&settings, &spec).unwrap();
+    let evidence = OutputLanguageEvidence::UserSelected("en".into());
+    assert_eq!(plan_cleanup(&request, &evidence), CleanupPlan::EnglishModel);
+    let error = super::cleanup(&request, "raw words", &evidence)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, LlmError::Transport(_) | LlmError::Timeout),
+        "{error:?}"
+    );
+    assert!(default.requests.lock().unwrap().is_empty(), "no fallback");
+    assert_eq!(default.accepts.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn handy008_invalid_enabled_english_settings_fail_the_snapshot_visibly() {
+    let mut settings = matrix_settings("http://127.0.0.1:1", "http://127.0.0.1:2", true);
+    settings.english_cleanup.base_url = "not a url".into();
+    let spec = spec_for_profile(&settings, BUILTIN_CLEANUP_PROFILE_ID).unwrap();
+    assert!(matches!(
+        CleanupRequest::from_spec(&settings, &spec),
+        Err(LlmError::Config(ConfigError::InvalidOptions(_)))
+    ));
+    // The same settings are irrelevant to a profile without the opt-in.
+    settings
+        .processing_profiles
+        .iter_mut()
+        .find(|p| p.id == BUILTIN_CLEANUP_PROFILE_ID)
+        .unwrap()
+        .english_cleanup = None;
+    let spec = spec_for_profile(&settings, BUILTIN_CLEANUP_PROFILE_ID).unwrap();
+    assert!(CleanupRequest::from_spec(&settings, &spec).is_ok());
+}
+
+#[tokio::test]
+async fn handy008_s1_named_override_on_selection_command_uses_assistant_body() {
+    let server = FakeServer::new(vec![Step::Respond(
+        200,
+        completion(Some(r#"{"replacement":"Done."}"#), "stop"),
+    )])
+    .await;
+    let mut settings = matrix_settings("http://127.0.0.1:1", "http://127.0.0.1:2", true);
+    settings
+        .processing_profiles
+        .push(crate::settings::ProcessingProfile {
+            id: "p2".into(),
+            name: "Fix".into(),
+            kind: ProfileKind::SelectionCommand,
+            prompt_id: Some(crate::settings::BUILTIN_ASSISTANT_ID.into()),
+            model: Some(LlmEndpoint {
+                provider_id: "custom".into(),
+                base_url: Some(server.url.clone()),
+                model: "S1-mini".into(),
+            }),
+            speech_language: None,
+            english_cleanup: None,
+        });
+    let spec = spec_for_profile(&settings, "p2").unwrap();
+    let request = AssistantRequest::from_spec(&settings, &spec).unwrap();
+    assert_eq!(request.route, LlmRoute::ProfileModel);
+    assert_eq!(assist(&request, "Fix it", "source").await.unwrap(), "Done.");
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["model"], "S1-mini");
+    assert_eq!(
+        requests[0]["response_format"]["json_schema"]["name"],
+        "assistant_output"
+    );
+    assert!(requests[0]["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with(&request.prompt));
+}
+
+#[test]
+fn handy008_from_endpoint_rejects_base_url_on_other_providers_and_blank_model() {
+    let settings = configured_settings("http://localhost");
+    let mut endpoint = LlmEndpoint {
+        provider_id: "openai".into(),
+        base_url: Some("http://127.0.0.1:8081/v1".into()),
+        model: "gpt".into(),
+    };
+    assert!(matches!(
+        LlmTarget::from_endpoint(&settings, &endpoint),
+        Err(LlmError::Config(ConfigError::NoProvider))
+    ));
+    let mut with_openai = settings.clone();
+    with_openai
+        .post_process_providers
+        .extend(crate::settings::get_default_settings().post_process_providers);
+    assert!(matches!(
+        LlmTarget::from_endpoint(&with_openai, &endpoint),
+        Err(LlmError::Config(ConfigError::UnsupportedProvider))
+    ));
+    endpoint.base_url = None;
+    let target = LlmTarget::from_endpoint(&with_openai, &endpoint).unwrap();
+    assert_eq!(target.provider.base_url, "https://api.openai.com/v1");
+    endpoint.provider_id = "custom".into();
+    endpoint.base_url = Some("http://127.0.0.1:8081/v1".into());
+    endpoint.model = "  ".into();
+    assert!(matches!(
+        LlmTarget::from_endpoint(&settings, &endpoint),
+        Err(LlmError::Config(ConfigError::NoModel))
+    ));
+    endpoint.model = "qwen3.5:4b".into();
+    let target = LlmTarget::from_endpoint(&settings, &endpoint).unwrap();
+    assert_eq!(target.provider.base_url, "http://127.0.0.1:8081/v1");
+    assert_eq!(target.model, "qwen3.5:4b");
+}
+
+#[test]
+fn handy008_from_settings_equals_builtin_from_spec() {
+    let mut settings = matrix_settings("http://127.0.0.1:1", "http://127.0.0.1:2", true);
+    settings
+        .post_process_api_keys
+        .insert("custom".into(), "key".into());
+    let cleanup_spec = spec_for_profile(&settings, BUILTIN_CLEANUP_PROFILE_ID).unwrap();
+    let a = CleanupRequest::from_settings(&settings).unwrap();
+    let b = CleanupRequest::from_spec(&settings, &cleanup_spec).unwrap();
+    assert_eq!(
+        (&a.target.model, &a.target.provider.base_url, &a.prompt),
+        (&b.target.model, &b.target.provider.base_url, &b.prompt)
+    );
+    assert_eq!((a.target_route, &a.controls), (b.target_route, &b.controls));
+    assert_eq!(
+        a.english
+            .as_ref()
+            .map(|t| (&t.model, &t.provider.base_url, &t.api_key)),
+        b.english
+            .as_ref()
+            .map(|t| (&t.model, &t.provider.base_url, &t.api_key))
+    );
+    assert!(a.english.is_some(), "seeded built-in Cleanup opts in");
+    let assistant_spec = spec_for_profile(&settings, BUILTIN_ASSISTANT_PROFILE_ID).unwrap();
+    let a = AssistantRequest::from_settings(&settings).unwrap();
+    let b = AssistantRequest::from_spec(&settings, &assistant_spec).unwrap();
+    assert_eq!(
+        (&a.target.model, &a.prompt, a.route),
+        (&b.target.model, &b.prompt, b.route)
+    );
+}
+
+/// Live HANDY-008 route probe against local llama.cpp servers. Ignored: run
+/// manually, for example with HANDY008_DEFAULT_MODEL=qwen3.5:9b
+/// `cargo test --lib handy008_manual_live_route_probe -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "manual live probe; needs local default and S1-mini servers"]
+async fn handy008_manual_live_route_probe() {
+    let default_url = std::env::var("HANDY008_DEFAULT_ENDPOINT")
+        .unwrap_or_else(|_| "http://127.0.0.1:8080/v1".into());
+    let default_model =
+        std::env::var("HANDY008_DEFAULT_MODEL").expect("Set HANDY008_DEFAULT_MODEL");
+    let english_url = std::env::var("HANDY008_ENGLISH_ENDPOINT")
+        .unwrap_or_else(|_| "http://127.0.0.1:8082/v1".into());
+    let english_model =
+        std::env::var("HANDY008_ENGLISH_MODEL").unwrap_or_else(|_| "S1-mini".into());
+    for url in [&default_url, &english_url] {
+        let parsed = reqwest::Url::parse(url).unwrap();
+        assert_eq!(parsed.host_str(), Some("127.0.0.1"), "localhost only");
+    }
+    let mut settings = configured_settings(&default_url);
+    settings.post_process_providers[0].supports_structured_output = false;
+    settings
+        .post_process_models
+        .insert("custom".into(), default_model);
+    settings.post_process_request_options.timeout_secs = 60;
+    settings.english_cleanup = crate::settings::EnglishCleanupSettings {
+        enabled: true,
+        base_url: english_url,
+        model: english_model,
+    };
+    let spec = spec_for_profile(&settings, BUILTIN_CLEANUP_PROFILE_ID).unwrap();
+    let request = CleanupRequest::from_spec(&settings, &spec).unwrap();
+    for (transcript, evidence, route) in [
+        (
+            "um send the report tomorrow period",
+            OutputLanguageEvidence::UserSelected("en".into()),
+            LlmRoute::EnglishModel,
+        ),
+        (
+            "yyy wyślij raport jutro kropka",
+            OutputLanguageEvidence::UserSelected("pl".into()),
+            LlmRoute::Default,
+        ),
+    ] {
+        let outcome = super::cleanup(&request, transcript, &evidence).await;
+        println!("<probe route=\"{route:?}\" input=\"{transcript}\">{outcome:?}</probe>");
+        match outcome {
+            Ok(CleanupOutcome::Cleaned {
+                route: actual,
+                prompt_sent,
+                ..
+            }) => {
+                assert_eq!(actual, route);
+                assert_eq!(prompt_sent, route == LlmRoute::Default);
+            }
+            other => panic!("unexpected live outcome: {other:?}"),
+        }
+    }
 }

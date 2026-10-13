@@ -17,7 +17,12 @@ pub enum ConfigError {
     InvalidOptions(String),
     UnsupportedProvider,
     InvalidHeader,
-    OptionsRejected { status: u16, detail: String },
+    OptionsRejected {
+        status: u16,
+        detail: String,
+    },
+    /// A profile binding whose profile no longer exists.
+    ProfileNotFound,
 }
 
 #[derive(Debug)]
@@ -69,6 +74,7 @@ impl std::fmt::Debug for ConfigError {
             Self::EmptyPrompt => f.write_str("EmptyPrompt"),
             Self::UnsupportedProvider => f.write_str("UnsupportedProvider"),
             Self::InvalidHeader => f.write_str("InvalidHeader"),
+            Self::ProfileNotFound => f.write_str("ProfileNotFound"),
         }
     }
 }
@@ -106,6 +112,7 @@ impl LlmError {
                 ConfigError::UnsupportedProvider => "unsupported_provider",
                 ConfigError::InvalidHeader => "invalid_header",
                 ConfigError::OptionsRejected { .. } => "options_rejected",
+                ConfigError::ProfileNotFound => "profile_not_found",
             },
             Self::Input(InputError::BlankText) => "blank_text",
             Self::Input(InputError::TooLong { .. }) => "too_long",

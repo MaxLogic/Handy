@@ -33,11 +33,12 @@ pub fn handle_shortcut_event(
 ) {
     let settings = get_settings(app);
 
-    // Transcribe bindings are handled by the coordinator.
-    if let Some(workflow) = WorkflowMode::from_binding_id(binding_id) {
+    // Workflow bindings (built-ins and profiles) are handled by the
+    // coordinator, which resolves the profile when it admits the press.
+    if WorkflowMode::from_binding_id(binding_id).is_some() {
         if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
             coordinator.send_input(
-                workflow,
+                binding_id,
                 hotkey_string,
                 is_pressed,
                 settings.shortcut_activation,

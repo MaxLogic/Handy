@@ -30,6 +30,8 @@ Key fields (durations are microseconds from `std::time::Instant`):
 | `audio_ms`              | Captured audio length after the recorder's VAD (not the spoken length), used to bucket 5/15/60 s workloads                                                                                                                                                                           |
 | `capture_us`            | Assistant keypress-to-capture duration; outside `stages` and `total_us`                                                                                                                                                                                                              |
 | `selection_scalars`     | Assistant source size in Unicode scalars; zero is a verified empty cursor                                                                                                                                                                                                            |
+| `profile`               | Custom processing profile id (HANDY-008); omitted for raw dictation and the built-in Cleanup and assistant profiles                                                                                                                                                                  |
+| `llm_route`             | Where the cleanup or assistant request went: `default`, `english_model` (the English cleanup model; cleanup only) or `profile_model` (the profile's own model); omitted for raw dictation                                                                                            |
 | `total_us`              | Accepted stop event until output completed or was refused                                                                                                                                                                                                                            |
 | `stages`                | `stop_sync`, `task_sched`, `audio_finalize`, `stt`, `wav_wait`, `text_cleanup`, `llm`, `history`, `main_sched`, `paste`, `commit`                                                                                                                                                    |
 | `model_loads_delta`     | Model load attempts between recording start and completion                                                                                                                                                                                                                           |
@@ -85,6 +87,22 @@ and over 20000 scalars. They report total median/p95 and capture median.
 No assistant history entry or WAV file is saved. Timing contains sizes and
 closed outcome codes; spoken instructions, source selections, generated output,
 and recovery content are excluded.
+
+### Profile and routed records
+
+`profile` and `llm_route` are additive at schema 1. Built-in profiles keep
+today's record shape (no `profile`), so built-in Cleanup stays comparable with
+the HANDY-001 baseline; a profile speech language shows only in `language`.
+A cleanup failure records the route that was tried; a skip records the
+profile's own route.
+
+A record is **routed** when it has a `profile`, or an `llm_route` other than
+`default`. Routed records never count toward workloads, `--samples`, language
+checks, cold starts or baseline comparisons. The summary lists them in a
+separate `routed` section grouped by `profile|llm_route` (`built-in` when there
+is no profile), with outcome counts, total median/p95 and the median `llm`
+stage over warm `pasted` records. Validation rejects `llm_route` on `raw`,
+`english_model` outside `cleanup`, and a non-string or empty `profile`.
 
 ### Invariants checked per record
 

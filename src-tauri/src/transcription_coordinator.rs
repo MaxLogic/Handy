@@ -2,6 +2,7 @@ use crate::actions::{DictationSession, TranscribeAction, WorkflowMode};
 use crate::managers::audio::AudioRecordingManager;
 use crate::settings::{get_settings, ShortcutActivation};
 use log::{debug, error, warn};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
@@ -275,7 +276,9 @@ struct CoordinatorState {
     session: Option<DictationSession>,
     capture: Option<PendingCapture>,
     next_assistant_session: u64,
-    assistant_rejected_held: bool,
+    /// Selection-command bindings whose busy press was rejected; each one's
+    /// own release clears it, and its own repeats are ignored until then.
+    assistant_rejected_held: BTreeSet<String>,
     cancels: CancelRequests,
     cancels_handled: u64,
 }
@@ -291,7 +294,7 @@ impl CoordinatorState {
             session: None,
             capture: None,
             next_assistant_session: 1,
-            assistant_rejected_held: false,
+            assistant_rejected_held: BTreeSet::new(),
             cancels: CancelRequests::default(),
             cancels_handled: 0,
         }
@@ -317,9 +320,9 @@ impl CoordinatorState {
     fn on_input(&mut self, input: InputEvent, now: Instant) -> Option<Effect> {
         let assistant =
             WorkflowMode::from_binding_id(&input.binding_id) == Some(WorkflowMode::Assistant);
-        if assistant && self.assistant_rejected_held {
+        if assistant && self.assistant_rejected_held.contains(&input.binding_id) {
             if !input.is_pressed {
-                self.assistant_rejected_held = false;
+                self.assistant_rejected_held.remove(&input.binding_id);
             }
             return None;
         }
@@ -378,7 +381,8 @@ impl CoordinatorState {
             && (matches!(self.stage, Stage::Processing)
                 || matches!(&self.stage, Stage::Recording(id) if id != &input.binding_id))
         {
-            self.assistant_rejected_held = true;
+            self.assistant_rejected_held
+                .insert(input.binding_id.clone());
             return Some(Effect::RejectAssistant);
         }
         if let Stage::Capturing(id) = &self.stage {
@@ -651,7 +655,7 @@ impl CoordinatorState {
         if self.cancel_queued() {
             self.cancels_handled += 1;
         }
-        self.assistant_rejected_held = false;
+        self.assistant_rejected_held.clear();
         let effect = self.cancel_capture();
         self.session = None;
         self.pending_release = None;
@@ -784,18 +788,19 @@ impl TranscriptionCoordinator {
         Self { tx, cancels }
     }
 
-    /// Send a keyboard input event for a transcribe binding. `hold_threshold`
-    /// only matters for [`ShortcutActivation::HoldOrToggle`].
+    /// Send a keyboard input event for a workflow binding (built-in or
+    /// profile). `hold_threshold` only matters for
+    /// [`ShortcutActivation::HoldOrToggle`].
     pub(crate) fn send_input(
         &self,
-        workflow: WorkflowMode,
+        binding_id: &str,
         hotkey_string: &str,
         is_pressed: bool,
         mode: ShortcutActivation,
         hold_threshold: Duration,
     ) {
         self.send(
-            workflow,
+            binding_id.to_string(),
             hotkey_string,
             is_pressed,
             mode,
@@ -808,7 +813,7 @@ impl TranscriptionCoordinator {
     /// always exempt from debounce — see [`InputEvent::external`].
     pub(crate) fn send_external_input(&self, workflow: WorkflowMode, source: &str) {
         self.send(
-            workflow,
+            workflow.binding_id().to_string(),
             source,
             true,
             ShortcutActivation::Toggle,
@@ -819,7 +824,7 @@ impl TranscriptionCoordinator {
 
     fn send(
         &self,
-        workflow: WorkflowMode,
+        binding_id: String,
         hotkey_string: &str,
         is_pressed: bool,
         mode: ShortcutActivation,
@@ -829,7 +834,7 @@ impl TranscriptionCoordinator {
         if self
             .tx
             .send(Command::Input(InputEvent {
-                binding_id: workflow.binding_id().to_string(),
+                binding_id,
                 hotkey_string: hotkey_string.to_string(),
                 is_pressed,
                 mode,
@@ -871,14 +876,24 @@ struct Executor<C = AppHandle> {
 }
 /// Native action/audio boundary, substituted by deterministic runtime tests.
 trait RecordingStartContext {
-    fn start_action(&self, binding_id: &str, settings: &crate::settings::AppSettings);
+    fn start_action(
+        &self,
+        binding_id: &str,
+        settings: &crate::settings::AppSettings,
+        stt_language: Option<&str>,
+    );
     fn is_recording(&self) -> bool;
     fn cancel_operation(&self) -> bool;
     fn capture_error(&self, error: crate::assistant::AssistantError);
 }
 impl RecordingStartContext for AppHandle {
-    fn start_action(&self, binding_id: &str, settings: &crate::settings::AppSettings) {
-        TranscribeAction::start(self, binding_id, settings);
+    fn start_action(
+        &self,
+        binding_id: &str,
+        settings: &crate::settings::AppSettings,
+        stt_language: Option<&str>,
+    ) {
+        TranscribeAction::start(self, binding_id, settings, stt_language);
     }
     fn is_recording(&self) -> bool {
         self.try_state::<Arc<AudioRecordingManager>>()
@@ -942,8 +957,11 @@ impl<C: RecordingStartContext> Executor<C> {
                         capture: intake.started.elapsed(),
                         cancel_arm: intake.cancel_arm,
                     };
-                    let snapshot =
-                        DictationSession::assistant(&intake.admission.settings, assistant);
+                    let snapshot = DictationSession::assistant(
+                        &intake.admission.settings,
+                        &intake.admission.spec,
+                        assistant,
+                    );
                     let snapshot =
                         start_session(&self.app, &binding_id, &intake.admission.settings, snapshot);
                     state.on_start_result(&binding_id, snapshot);
@@ -999,13 +1017,18 @@ fn run_effect(executor: &mut Executor, state: &mut CoordinatorState, effect: Eff
     let app = &executor.app;
     match effect {
         Effect::BeginCapture {
-            binding_id: _,
+            binding_id,
             hotkey_string: _,
             session,
         } => {
             let settings = get_settings(app);
             let store = app.state::<Arc<crate::assistant::recovery::RecoveryStore>>();
-            match crate::assistant::admit(crate::assistant::is_shutting_down(), &settings, &store) {
+            match crate::assistant::admit_binding(
+                crate::assistant::is_shutting_down(),
+                &settings,
+                &binding_id,
+                &store,
+            ) {
                 Err(error) => {
                     state.on_capture_rejected(session);
                     error.error().emit(app);
@@ -1062,21 +1085,30 @@ fn run_effect(executor: &mut Executor, state: &mut CoordinatorState, effect: Eff
 /// Return the recording-start snapshot only when audio actually began. The
 /// state machine rolls back its optimistic transition on failure.
 fn start(app: &AppHandle, binding_id: &str, _hotkey_string: &str) -> Option<DictationSession> {
-    let Some(mode) = WorkflowMode::from_binding_id(binding_id) else {
-        warn!("No dictation workflow for '{binding_id}'");
+    start_with_settings(app, binding_id, &get_settings(app))
+}
+
+/// The profile is resolved here, inside the coordinator step that admitted
+/// the press, so later edits never affect this session.
+fn start_with_settings(
+    app: &impl RecordingStartContext,
+    binding_id: &str,
+    settings: &crate::settings::AppSettings,
+) -> Option<DictationSession> {
+    let Some(session) = DictationSession::for_binding(binding_id, settings) else {
+        warn!("No dictation workflow or profile for '{binding_id}'");
         return None;
     };
-    let settings = get_settings(app);
-    let session = DictationSession::snapshot(mode, &settings)?;
-    start_session(app, binding_id, &settings, session)
+    start_session(app, binding_id, settings, session)
 }
+
 fn start_session(
     app: &impl RecordingStartContext,
     binding_id: &str,
     settings: &crate::settings::AppSettings,
     session: DictationSession,
 ) -> Option<DictationSession> {
-    app.start_action(binding_id, settings);
+    app.start_action(binding_id, settings, session.stt_language.as_deref());
     let recording = app.is_recording();
     if !recording {
         debug!("Start for '{binding_id}' did not begin recording; staying idle");
@@ -1106,6 +1138,7 @@ pub(crate) mod tests {
         stt_kills: Vec<u64>,
         calls: Vec<(thread::ThreadId, &'static str)>,
         fallback: bool,
+        stt_languages: Vec<Option<String>>,
     }
 
     impl Runtime {
@@ -1168,8 +1201,14 @@ pub(crate) mod tests {
     }
 
     impl RecordingStartContext for FakeRuntime {
-        fn start_action(&self, _: &str, _: &crate::settings::AppSettings) {
+        fn start_action(
+            &self,
+            _: &str,
+            _: &crate::settings::AppSettings,
+            stt_language: Option<&str>,
+        ) {
             let mut r = self.runtime.lock().unwrap();
+            r.stt_languages.push(stt_language.map(str::to_string));
             r.starts += 1;
             r.mic = Some(r.starts);
             r.stream = r.mic;
@@ -1193,6 +1232,8 @@ pub(crate) mod tests {
         rx: mpsc::Receiver<Command>,
         store: Arc<crate::assistant::recovery::RecoveryStore>,
         effects: Vec<Effect>,
+        /// What the coordinator step reads at admission.
+        settings: crate::settings::AppSettings,
     }
 
     impl Harness {
@@ -1218,10 +1259,12 @@ pub(crate) mod tests {
                 rx,
                 store: crate::assistant::recovery::RecoveryStore::new(8),
                 effects: Vec::new(),
+                settings: crate::assistant::tests::configured_settings("http://127.0.0.1:1"),
             }
         }
         fn drive(&mut self, cmd: Command) {
             let store = self.store.clone();
+            let settings = self.settings.clone();
             let effects = &mut self.effects;
             handle_command(
                 &mut self.executor,
@@ -1229,22 +1272,25 @@ pub(crate) mod tests {
                 cmd,
                 &mut |ex, state, effect| match effect {
                     Effect::Start { binding_id, .. } => {
-                        let settings =
-                            crate::assistant::tests::configured_settings("http://127.0.0.1:1");
-                        let mode = WorkflowMode::from_binding_id(&binding_id).unwrap();
-                        let snapshot = DictationSession::snapshot(mode, &settings).unwrap();
-                        let snapshot = start_session(&ex.app, &binding_id, &settings, snapshot);
+                        let snapshot = start_with_settings(&ex.app, &binding_id, &settings);
                         state.on_start_result(&binding_id, snapshot);
                     }
-                    Effect::BeginCapture { session, .. } => {
-                        let settings =
-                            crate::assistant::tests::configured_settings("http://127.0.0.1:1");
+                    Effect::BeginCapture {
+                        session,
+                        binding_id,
+                        ..
+                    } => {
                         ex.accept_intake(Intake {
                             session,
                             ticket: crate::selection::CaptureTicket::test_pending(),
-                            admission: crate::assistant::admit(false, &settings, &store)
-                                .ok()
-                                .unwrap(),
+                            admission: crate::assistant::admit_binding(
+                                false,
+                                &settings,
+                                &binding_id,
+                                &store,
+                            )
+                            .ok()
+                            .unwrap(),
                             cancel_arm: crate::assistant::CancelArm::arm(&ex.app),
                             started: Instant::now(),
                         });
@@ -1684,7 +1730,7 @@ pub(crate) mod tests {
     }
 
     impl RecordingStartContext for CancelTestContext {
-        fn start_action(&self, _: &str, _: &crate::settings::AppSettings) {
+        fn start_action(&self, _: &str, _: &crate::settings::AppSettings, _: Option<&str>) {
             panic!("unexpected start")
         }
         fn is_recording(&self) -> bool {
@@ -2072,9 +2118,10 @@ pub(crate) mod tests {
         let now = Instant::now();
         let id = capture(&mut state, ShortcutActivation::Toggle, now);
         assert!(matches!(
-            crate::assistant::admit(
+            crate::assistant::admit_binding(
                 false,
                 &crate::assistant::tests::configured_settings("http://unused.invalid"),
+                "assistant",
                 &store
             ),
             Err(crate::assistant::IntakeRejection::RecoveryFull)
@@ -2116,6 +2163,7 @@ pub(crate) mod tests {
         let server = FakeServer::new(vec![step]).await;
         let store = crate::assistant::recovery::RecoveryStore::new(8);
         let settings = crate::assistant::tests::configured_settings(&server.url);
+        let spec = crate::settings::spec_for_binding(&settings, "assistant").unwrap();
         let (session, released) = crate::assistant::tests::session(&server.url, text, &store);
         let mut state = CoordinatorState::new();
         state.next_assistant_session = session.id.0;
@@ -2140,6 +2188,7 @@ pub(crate) mod tests {
                 reservation: session.reservation,
                 clipboard_handling: session.clipboard_handling,
                 settings,
+                spec,
             },
             cancel_arm: session.cancel_arm,
             started: now,
@@ -2589,6 +2638,279 @@ pub(crate) mod tests {
             assert!(state.session.is_none());
             assert_eq!(state.stage, Stage::Idle);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // HANDY-008: profile bindings
+    // -----------------------------------------------------------------------
+
+    const DICTATION_A: &str = "dictation_profile_pa";
+    const DICTATION_B: &str = "dictation_profile_pb";
+    const COMMAND_X: &str = "command_profile_px";
+    const COMMAND_Y: &str = "command_profile_py";
+
+    fn input_for(binding_id: &str, mode: ShortcutActivation, is_pressed: bool) -> InputEvent {
+        InputEvent {
+            binding_id: binding_id.into(),
+            hotkey_string: binding_id.into(),
+            is_pressed,
+            mode,
+            hold_threshold: Duration::from_millis(300),
+            external: false,
+        }
+    }
+
+    fn profile(
+        id: &str,
+        kind: crate::settings::ProfileKind,
+        speech_language: Option<&str>,
+    ) -> crate::settings::ProcessingProfile {
+        crate::settings::ProcessingProfile {
+            id: id.into(),
+            name: format!("Profile {id}"),
+            kind,
+            prompt_id: Some(crate::settings::BUILTIN_ASSISTANT_ID.into()),
+            model: None,
+            speech_language: speech_language.map(Into::into),
+            english_cleanup: None,
+        }
+    }
+
+    #[test]
+    fn handy008_second_dictation_profile_is_ignored_while_first_records() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        assert!(matches!(
+            state.on_input(toggle_input_for(DICTATION_A, false), now),
+            Some(Effect::Start { binding_id, .. }) if binding_id == DICTATION_A
+        ));
+        assert!(state
+            .on_input(
+                toggle_input_for(DICTATION_B, false),
+                now + Duration::from_millis(100)
+            )
+            .is_none());
+        assert_eq!(state.stage, Stage::Recording(DICTATION_A.into()));
+        assert!(matches!(
+            state.on_input(
+                toggle_input_for(DICTATION_A, false),
+                now + Duration::from_millis(200)
+            ),
+            Some(Effect::Stop { binding_id, .. }) if binding_id == DICTATION_A
+        ));
+    }
+
+    #[test]
+    fn handy008_dictation_profile_press_during_processing_starts_at_drain() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        drive_into_processing(&mut state, now);
+        assert!(state
+            .on_input(
+                toggle_input_for(DICTATION_A, false),
+                now + Duration::from_millis(200)
+            )
+            .is_none());
+        assert_eq!(
+            state.pending_press.as_ref().unwrap().binding_id,
+            DICTATION_A
+        );
+        assert!(matches!(
+            state.on_processing_finished(),
+            Some(Effect::Start { binding_id, .. }) if binding_id == DICTATION_A
+        ));
+        assert_eq!(state.stage, Stage::Recording(DICTATION_A.into()));
+    }
+
+    #[test]
+    fn handy008_command_profile_rejections_are_held_per_binding() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        let ms = |n: u64| now + Duration::from_millis(n);
+        // A command press while raw records is rejected, never remembered.
+        assert!(matches!(
+            state.on_input(ptt_input(true), now),
+            Some(Effect::Start { .. })
+        ));
+        assert_eq!(
+            state.on_input(
+                input_for(COMMAND_X, ShortcutActivation::PushToTalk, true),
+                ms(100)
+            ),
+            Some(Effect::RejectAssistant)
+        );
+        assert!(state.pending_press.is_none());
+        assert_eq!(
+            state.on_input(
+                input_for("assistant", ShortcutActivation::PushToTalk, true),
+                ms(200)
+            ),
+            Some(Effect::RejectAssistant)
+        );
+        assert_eq!(
+            state.assistant_rejected_held,
+            BTreeSet::from([COMMAND_X.to_string(), "assistant".to_string()])
+        );
+        // Its own repeat is ignored while held.
+        assert!(state
+            .on_input(
+                input_for(COMMAND_X, ShortcutActivation::PushToTalk, true),
+                ms(300)
+            )
+            .is_none());
+        // The rejected binding's release clears only its own entry.
+        assert!(state
+            .on_input(
+                input_for(COMMAND_X, ShortcutActivation::PushToTalk, false),
+                ms(400)
+            )
+            .is_none());
+        assert_eq!(
+            state.assistant_rejected_held,
+            BTreeSet::from(["assistant".to_string()])
+        );
+        // Stop raw (a held push-to-talk release resolves after the grace).
+        state.on_input(ptt_input(false), ms(500));
+        assert!(matches!(
+            state.on_grace_expired(),
+            Some(Effect::Stop { .. })
+        ));
+        assert!(state.on_processing_finished().is_none());
+        // A different command binding pressed after Processing ends captures.
+        assert!(matches!(
+            state.on_input(input_for(COMMAND_Y, ShortcutActivation::Toggle, true), ms(700)),
+            Some(Effect::BeginCapture { binding_id, .. }) if binding_id == COMMAND_Y
+        ));
+        // The still-held assistant binding stays consumed until its release.
+        assert_eq!(
+            state.assistant_rejected_held,
+            BTreeSet::from(["assistant".to_string()])
+        );
+        assert!(matches!(
+            state.on_cancel(false),
+            Some(Effect::CancelCapture { .. })
+        ));
+        assert!(
+            state.assistant_rejected_held.is_empty(),
+            "cancel clears all"
+        );
+    }
+
+    #[test]
+    fn handy008_cancel_queued_vetoes_profile_press_and_command_capture_done() {
+        let (tx, _rx) = mpsc::channel();
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        assert!(state.cancels.request(&tx));
+        assert!(state
+            .on_input(toggle_input_for(DICTATION_A, false), now)
+            .is_none());
+        assert!(state
+            .on_input(
+                input_for(COMMAND_X, ShortcutActivation::Toggle, true),
+                now + Duration::from_millis(100)
+            )
+            .is_none());
+        assert_eq!(state.stage, Stage::Idle);
+        state.on_cancel(false);
+        let Some(Effect::BeginCapture { session, .. }) = state.on_input(
+            input_for(COMMAND_X, ShortcutActivation::Toggle, true),
+            now + Duration::from_millis(200),
+        ) else {
+            panic!("capture expected")
+        };
+        assert!(state.cancels.request(&tx));
+        assert_eq!(
+            state.on_capture_done(session, true),
+            CaptureResolution::Discard
+        );
+        assert_eq!(state.stage, Stage::Idle);
+    }
+
+    #[test]
+    fn handy008_executor_passes_profile_speech_language_to_recording_start() {
+        use crate::settings::ProfileKind;
+        let _guard = CANCEL_RUNTIME_TEST.blocking_lock();
+        let mut h = Harness::new();
+        h.settings
+            .processing_profiles
+            .iter_mut()
+            .find(|p| p.id == crate::settings::BUILTIN_CLEANUP_PROFILE_ID)
+            .unwrap()
+            .speech_language = Some("pl".into());
+        h.settings
+            .processing_profiles
+            .push(profile("pa", ProfileKind::Dictation, Some("de")));
+        for binding in [
+            WorkflowMode::Cleanup.binding_id(),
+            DICTATION_A,
+            WorkflowMode::Raw.binding_id(),
+        ] {
+            h.drive(Command::Input(toggle_input_for(binding, true)));
+            assert_eq!(h.state.stage, Stage::Recording(binding.into()));
+            let session = h.state.session.as_ref().unwrap();
+            assert_eq!(
+                session.profile.as_ref().map(|p| p.id.as_str()),
+                match binding {
+                    "transcribe" => None,
+                    "transcribe_with_post_process" => {
+                        Some(crate::settings::BUILTIN_CLEANUP_PROFILE_ID)
+                    }
+                    _ => Some("pa"),
+                }
+            );
+            h.request();
+            h.next();
+            h.assert_idle();
+        }
+        assert_eq!(
+            h.executor.app.runtime.lock().unwrap().stt_languages,
+            [Some("pl".to_string()), Some("de".to_string()), None]
+        );
+        // A deleted custom profile never starts recording.
+        h.drive(Command::Input(toggle_input_for(DICTATION_B, true)));
+        h.assert_idle();
+        assert_eq!(h.executor.app.runtime.lock().unwrap().starts, 3);
+    }
+
+    #[test]
+    fn handy008_command_profile_is_admitted_and_snapshotted_at_press() {
+        use crate::settings::ProfileKind;
+        let _guard = CANCEL_RUNTIME_TEST.blocking_lock();
+        let mut h = Harness::new();
+        h.settings.processing_profiles.push(profile(
+            "px",
+            ProfileKind::SelectionCommand,
+            Some("pl"),
+        ));
+        h.drive(Command::Input(toggle_input_for(COMMAND_X, true)));
+        assert_eq!(h.state.stage, Stage::Capturing(COMMAND_X.into()));
+        // Edits after admission do not reach this session.
+        h.settings.processing_profiles.retain(|p| p.id != "px");
+        let (done, released, _) = h.captured();
+        h.drive(done);
+        assert_eq!(h.state.stage, Stage::Recording(COMMAND_X.into()));
+        let session = h.state.session.as_ref().unwrap();
+        assert_eq!(session.profile.as_ref().unwrap().id, "px");
+        assert_eq!(session.stt_language.as_deref(), Some("pl"));
+        assert_eq!(
+            h.executor.app.runtime.lock().unwrap().stt_languages,
+            [Some("pl".to_string())]
+        );
+        h.request();
+        h.next();
+        h.assert_idle();
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        // A missing profile is a configuration rejection, before capacity.
+        let store = crate::assistant::recovery::RecoveryStore::new(1);
+        let _slot = store.reserve().unwrap();
+        let Err(rejection) = crate::assistant::admit_binding(false, &h.settings, COMMAND_X, &store)
+        else {
+            panic!("missing profile must be rejected")
+        };
+        let error = rejection.error();
+        assert_eq!(error.code, "llm_config");
+        assert_eq!(error.reason, Some("profile_not_found"));
     }
 
     #[test]

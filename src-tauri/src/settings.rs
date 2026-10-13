@@ -8,6 +8,9 @@ use std::fmt;
 use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
 
+mod profiles;
+pub use profiles::*;
+
 pub const APPLE_INTELLIGENCE_PROVIDER_ID: &str = "apple_intelligence";
 pub const APPLE_INTELLIGENCE_DEFAULT_MODEL_ID: &str = "Apple Intelligence";
 
@@ -534,13 +537,19 @@ pub struct AppSettings {
     /// `overlay_position` (position `none` → style `None`).
     #[serde(default = "default_overlay_style")]
     pub overlay_style: OverlayStyle,
+    /// Built-in and custom processing profiles. A missing key loads empty (not
+    /// the defaults) so `normalize_profiles` is the only seeding path.
+    #[serde(default, deserialize_with = "profiles::deserialize_profiles")]
+    pub processing_profiles: Vec<ProcessingProfile>,
+    #[serde(default)]
+    pub english_cleanup: EnglishCleanupSettings,
 }
 
 fn default_model() -> String {
     "".to_string()
 }
 
-const CURRENT_SETTINGS_SCHEMA_VERSION: u32 = 4;
+const CURRENT_SETTINGS_SCHEMA_VERSION: u32 = 5;
 
 fn default_settings_schema_version() -> u32 {
     CURRENT_SETTINGS_SCHEMA_VERSION
@@ -860,7 +869,8 @@ fn builtin_prompts() -> Vec<LLMPrompt> {
     ]
 }
 
-/// Remove a shared prompt and clear an assistant selection without choosing another.
+/// Remove a shared prompt. A prompt any profile uses is refused, so deleting
+/// a prompt never silently changes what a hotkey does.
 pub fn remove_prompt(settings: &mut AppSettings, id: &str) -> Result<(), String> {
     if settings.post_process_prompts.len() <= 1 {
         return Err("Cannot delete the last prompt".into());
@@ -868,14 +878,10 @@ pub fn remove_prompt(settings: &mut AppSettings, id: &str) -> Result<(), String>
     if !settings.post_process_prompts.iter().any(|p| p.id == id) {
         return Err("Prompt not found".into());
     }
+    if prompt_in_use(settings, id) {
+        return Err("prompt_in_use".into());
+    }
     settings.post_process_prompts.retain(|p| p.id != id);
-    if settings.post_process_selected_prompt_id.as_deref() == Some(id) {
-        settings.post_process_selected_prompt_id =
-            settings.post_process_prompts.first().map(|p| p.id.clone());
-    }
-    if settings.assistant_selected_prompt_id.as_deref() == Some(id) {
-        settings.assistant_selected_prompt_id = None;
-    }
     Ok(())
 }
 
@@ -1031,7 +1037,7 @@ pub fn get_default_settings() -> AppSettings {
         default_binding: "ctrl+alt+space".into(), current_binding: "ctrl+alt+space".into(),
     });
 
-    AppSettings {
+    let mut settings = AppSettings {
         settings_schema_version: default_settings_schema_version(),
         bindings,
         shortcut_activation: ShortcutActivation::default(),
@@ -1097,7 +1103,14 @@ pub fn get_default_settings() -> AppSettings {
         vad_enabled: default_vad_enabled(),
         vad_backend: VadBackend::default(),
         overlay_style: default_overlay_style(),
-    }
+        processing_profiles: Vec::new(),
+        english_cleanup: EnglishCleanupSettings::default(),
+    };
+    settings.processing_profiles = [BUILTIN_CLEANUP_PROFILE_ID, BUILTIN_ASSISTANT_PROFILE_ID]
+        .into_iter()
+        .filter_map(|id| builtin_seed(&settings, id))
+        .collect();
+    settings
 }
 
 impl Default for AppSettings {
@@ -1145,37 +1158,37 @@ pub fn get_settings(app: &AppHandle) -> AppSettings {
 
     // Settings reads also persist one-time migrations. Migration helpers are
     // idempotent, so this converges after the first read of an older store.
-    let mut settings = if let Some(settings_value) = store.get("settings") {
-        let (mut settings, mut updated) =
-            match serde_json::from_value::<AppSettings>(settings_value.clone()) {
-                Ok(settings) => (settings, false),
-                Err(e) => {
-                    warn!("Failed to parse stored settings ({e}); salvaging valid fields");
-                    (salvage_settings(&settings_value), true)
-                }
-            };
-
-        if apply_settings_migrations(&mut settings, &settings_value) {
-            updated = true;
-        }
-
-        updated |= merge_missing_bindings(&mut settings);
+    if let Some(settings_value) = store.get("settings") {
+        let (settings, updated) = load_settings_value(&settings_value);
         if updated {
             store.set("settings", serde_json::to_value(&settings).unwrap());
         }
-
         settings
     } else {
-        let default_settings = get_default_settings();
-        store.set("settings", serde_json::to_value(&default_settings).unwrap());
-        default_settings
-    };
-
-    if ensure_post_process_defaults(&mut settings) {
+        let mut settings = get_default_settings();
+        ensure_post_process_defaults(&mut settings);
         store.set("settings", serde_json::to_value(&settings).unwrap());
+        settings
     }
+}
 
-    settings
+/// The whole load path without store I/O: parse or salvage, migrate, merge
+/// default bindings, normalize profiles, then provider defaults. Returns
+/// whether the result differs from what was stored.
+pub(crate) fn load_settings_value(settings_value: &serde_json::Value) -> (AppSettings, bool) {
+    let (mut settings, mut updated) =
+        match serde_json::from_value::<AppSettings>(settings_value.clone()) {
+            Ok(settings) => (settings, false),
+            Err(e) => {
+                warn!("Failed to parse stored settings ({e}); salvaging valid fields");
+                (salvage_settings(settings_value), true)
+            }
+        };
+    updated |= apply_settings_migrations(&mut settings, settings_value);
+    updated |= merge_missing_bindings(&mut settings);
+    updated |= normalize_profiles(&mut settings);
+    updated |= ensure_post_process_defaults(&mut settings);
+    (settings, updated)
 }
 
 fn merge_missing_bindings(settings: &mut AppSettings) -> bool {
@@ -1476,6 +1489,8 @@ mod tests {
             after["post_process_selected_prompt_id"],
             before["post_process_selected_prompt_id"]
         );
+        // HANDY-008: an in-use prompt is refused, so point Cleanup elsewhere first.
+        settings.post_process_selected_prompt_id = Some("default_improve_transcriptions".into());
         remove_prompt(&mut settings, BUILTIN_CLEANUP_ID).unwrap();
         let mut raw = serde_json::to_value(&settings).unwrap();
         raw["settings_schema_version"] = serde_json::json!(3);
@@ -1568,21 +1583,9 @@ mod tests {
         assert!(settings.bindings.is_empty());
     }
 
-    /// Frozen snapshot of a real v0.9.0-era settings store, as written to
-    /// disk. This pins backwards compatibility: it must always parse strictly
-    /// (no salvage). Schema migrations may then rewrite fields whose native
-    /// meaning changed.
-    ///
-    /// If a schema change breaks this test, do NOT just update the fixture —
-    /// it stands in for the stores on users' machines. Add a
-    /// `#[serde(alias)]`/`#[serde(other)]` or a one-time migration in
-    /// `apply_settings_migrations` so old values keep loading, and only extend
-    /// the fixture alongside that.
-    #[test]
-    fn frozen_v0_9_store_parses_strictly_then_migrates_device_index() {
-        // Note "log_level": 2 — the legacy numeric format, kept deliberately.
-        let stored: serde_json::Value = serde_json::from_str(
-            r##"{
+    /// The v0.9.0-era store used by the frozen-store tests below. Byte-identical
+    /// to the fixture HANDY-008 moved here from the original test body.
+    const FROZEN_V0_9_STORE: &str = r##"{
             "settings_schema_version": 1,
             "bindings": {
                 "transcribe": {
@@ -1671,9 +1674,23 @@ mod tests {
             "extra_recording_buffer_ms": 0,
             "vad_enabled": true,
             "overlay_style": "live"
-        }"##,
-        )
-        .expect("fixture is valid JSON");
+        }"##;
+
+    /// Frozen snapshot of a real v0.9.0-era settings store, as written to
+    /// disk. This pins backwards compatibility: it must always parse strictly
+    /// (no salvage). Schema migrations may then rewrite fields whose native
+    /// meaning changed.
+    ///
+    /// If a schema change breaks this test, do NOT just update the fixture —
+    /// it stands in for the stores on users' machines. Add a
+    /// `#[serde(alias)]`/`#[serde(other)]` or a one-time migration in
+    /// `apply_settings_migrations` so old values keep loading, and only extend
+    /// the fixture alongside that.
+    #[test]
+    fn frozen_v0_9_store_parses_strictly_then_migrates_device_index() {
+        // Note "log_level": 2 — the legacy numeric format, kept deliberately.
+        let stored: serde_json::Value =
+            serde_json::from_str(FROZEN_V0_9_STORE).expect("fixture is valid JSON");
 
         let mut settings: AppSettings = serde_json::from_value(stored.clone())
             .expect("a stored v0.9.0 settings object must keep parsing strictly");
@@ -1710,6 +1727,32 @@ mod tests {
             stored["post_process_prompts"][0]
         );
         assert_eq!(settings.post_process_prompts.len(), 3);
+    }
+
+    #[test]
+    fn handy008_frozen_v0_9_store_gets_builtin_profiles_without_prompts() {
+        let stored: serde_json::Value =
+            serde_json::from_str(FROZEN_V0_9_STORE).expect("fixture is valid JSON");
+        let (settings, changed) = load_settings_value(&stored);
+        assert!(changed);
+        assert_eq!(
+            settings.settings_schema_version,
+            CURRENT_SETTINGS_SCHEMA_VERSION
+        );
+        assert_eq!(
+            settings
+                .processing_profiles
+                .iter()
+                .map(|p| (p.id.as_str(), p.prompt_id.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (BUILTIN_CLEANUP_PROFILE_ID, None),
+                (BUILTIN_ASSISTANT_PROFILE_ID, None)
+            ]
+        );
+        assert_eq!(settings.bindings["transcribe"].current_binding, "f13");
+        let (_, again) = load_settings_value(&serde_json::to_value(&settings).unwrap());
+        assert!(!again);
     }
 
     #[test]
@@ -2218,8 +2261,15 @@ mod tests {
     }
 
     #[test]
-    fn deleted_builtin_is_not_readded_at_v3_and_removing_selected_assistant_clears_it() {
+    fn deleted_builtin_is_not_readded_at_v3_and_in_use_prompt_is_refused() {
         let mut settings = get_default_settings();
+        let before = serde_json::to_value(&settings).unwrap();
+        assert_eq!(
+            remove_prompt(&mut settings, BUILTIN_ASSISTANT_ID).unwrap_err(),
+            "prompt_in_use"
+        );
+        assert_eq!(serde_json::to_value(&settings).unwrap(), before);
+        settings.assistant_selected_prompt_id = None;
         remove_prompt(&mut settings, BUILTIN_ASSISTANT_ID).unwrap();
         assert_eq!(settings.assistant_selected_prompt_id, None);
         assert_eq!(
@@ -2232,6 +2282,11 @@ mod tests {
             .post_process_prompts
             .iter()
             .any(|p| p.id == BUILTIN_ASSISTANT_ID));
+        assert_eq!(
+            remove_prompt(&mut settings, BUILTIN_CLEANUP_ID).unwrap_err(),
+            "prompt_in_use"
+        );
+        settings.post_process_selected_prompt_id = Some("default_improve_transcriptions".into());
         remove_prompt(&mut settings, BUILTIN_CLEANUP_ID).unwrap();
         assert_eq!(
             settings.post_process_selected_prompt_id.as_deref(),
@@ -2250,6 +2305,8 @@ mod tests {
             .unwrap()
             .clone();
         settings.post_process_prompts.push(duplicate);
+        // HANDY-008: an in-use prompt is refused, so point the assistant elsewhere first.
+        settings.assistant_selected_prompt_id = None;
         remove_prompt(&mut settings, BUILTIN_ASSISTANT_ID).unwrap();
         assert!(!settings
             .post_process_prompts

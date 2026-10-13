@@ -10,7 +10,7 @@ use crate::prompts::{self, AssistantRequest};
 use crate::selection::{
     self, CapturedText, ClipboardSettlement, CommitOutcome, RefuseReason, StaleReason,
 };
-use crate::settings::{AppSettings, ClipboardHandling};
+use crate::settings::{AppSettings, ClipboardHandling, ProfileSpec};
 use recovery::{AssistantRecoveryItem, RecoveryStore, Reservation};
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -93,23 +93,45 @@ pub(crate) struct Admission {
     pub reservation: Reservation,
     pub clipboard_handling: ClipboardHandling,
     pub settings: AppSettings,
+    /// The selection-command profile snapshotted at admission.
+    pub spec: ProfileSpec,
 }
+/// Order: shutdown, configuration (a missing profile is a configuration
+/// error), capacity.
 pub(crate) fn admit(
     shutting_down: bool,
     settings: &AppSettings,
+    spec: Option<&ProfileSpec>,
     store: &Arc<RecoveryStore>,
 ) -> Result<Admission, IntakeRejection> {
     if shutting_down {
         return Err(IntakeRejection::ShuttingDown);
     }
-    let request = AssistantRequest::from_settings(settings).map_err(IntakeRejection::Config)?;
+    let spec = spec.ok_or(IntakeRejection::Config(LlmError::Config(
+        crate::llm_client::ConfigError::ProfileNotFound,
+    )))?;
+    let request = AssistantRequest::from_spec(settings, spec).map_err(IntakeRejection::Config)?;
     let reservation = store.reserve().ok_or(IntakeRejection::RecoveryFull)?;
     Ok(Admission {
         request,
         reservation,
         clipboard_handling: settings.clipboard_handling,
         settings: settings.clone(),
+        spec: spec.clone(),
     })
+}
+
+/// Admission for one selection-command binding, resolved on the coordinator
+/// thread so the profile is snapshotted at press time.
+pub(crate) fn admit_binding(
+    shutting_down: bool,
+    settings: &AppSettings,
+    binding_id: &str,
+    store: &Arc<RecoveryStore>,
+) -> Result<Admission, IntakeRejection> {
+    let spec = crate::settings::spec_for_binding(settings, binding_id)
+        .filter(|spec| spec.kind == crate::settings::ProfileKind::SelectionCommand);
+    admit(shutting_down, settings, spec.as_ref(), store)
 }
 
 pub(crate) struct AssistantSession {
@@ -404,6 +426,7 @@ pub(crate) async fn finish(
     probe: CancelProbe,
 ) {
     timer.set_capture(session.capture);
+    timer.set_llm_route(session.request.route);
     let report = complete_session(session, instruction, probe, selection::commit, &COMMITS).await;
     timer.set_selection_scalars(report.selection_scalars);
     if let Some(duration) = report.llm {

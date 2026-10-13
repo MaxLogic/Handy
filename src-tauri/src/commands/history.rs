@@ -1,6 +1,6 @@
 use crate::actions::{
     process_transcription_output_with_language, report_cleanup_failure, CleanupFallbackNotice,
-    DictationSession, WorkflowMode,
+    DictationSession,
 };
 use crate::managers::{
     history::{HistoryManager, PaginatedHistory},
@@ -76,15 +76,11 @@ pub async fn retry_history_entry_transcription(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("History entry {} not found", id))?;
 
-    // The persisted boolean is a compatibility boundary. A retry snapshots
-    // current configuration once, before model loading or STT can suspend.
-    let mode = if entry.post_process_requested {
-        WorkflowMode::Cleanup
-    } else {
-        WorkflowMode::Raw
-    };
-    let session = DictationSession::snapshot(mode, &crate::settings::get_settings(&app))
-        .ok_or("assistant sessions cannot be retried")?;
+    // A profile entry retries with its profile; legacy rows keep the persisted
+    // boolean. A retry snapshots current configuration once, before model
+    // loading or STT can suspend.
+    let session =
+        DictationSession::for_history_retry(&entry, &crate::settings::get_settings(&app))?;
 
     let audio_path = history_manager.get_audio_file_path(&entry.file_name);
     let samples = crate::audio_toolkit::read_wav_samples(&audio_path)
@@ -97,11 +93,13 @@ pub async fn retry_history_entry_transcription(
     transcription_manager.initiate_model_load();
 
     let tm = Arc::clone(&transcription_manager);
-    let (transcription, output_language) =
-        tauri::async_runtime::spawn_blocking(move || tm.transcribe_with_language(samples))
-            .await
-            .map_err(|e| format!("Transcription task panicked: {}", e))?
-            .map_err(|e| e.to_string())?;
+    let stt_language = session.stt_language.clone();
+    let (transcription, output_language) = tauri::async_runtime::spawn_blocking(move || {
+        tm.transcribe_with_language_for(samples, stt_language.as_deref())
+    })
+    .await
+    .map_err(|e| format!("Transcription task panicked: {}", e))?
+    .map_err(|e| e.to_string())?;
 
     if transcription.is_empty() {
         return Err("Recording contains no speech".to_string());

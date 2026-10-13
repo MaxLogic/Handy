@@ -483,6 +483,11 @@ mod imp {
                 if id == "transcribe_with_post_process" && !settings.post_process_enabled {
                     continue;
                 }
+                // Never shadow a skipped or unregistrable profile binding: it
+                // could steal another owner's accelerator.
+                if crate::shortcut::fallback_excluded(&settings, id) {
+                    continue;
+                }
 
                 match plan_fallback_binding(id, binding) {
                     ShadowPlan::Immune => immune += 1,

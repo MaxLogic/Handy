@@ -609,3 +609,113 @@ describe("baseline comparison", () => {
     expect(code).toBe(0);
   });
 });
+
+describe("routed records (HANDY-008)", () => {
+  const warmCleanup = () =>
+    baselineText
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .flatMap((r, index) =>
+        r.mode === "cleanup" && !r.cold && r.outcome === "pasted"
+          ? [index]
+          : [],
+      );
+
+  test("routed records never supply samples, languages or the baseline", () => {
+    const [first, second] = warmCleanup();
+    let text = mutateLine(baselineText, first, (r) => {
+      r.profile = "p1700000000000";
+      r.llm_route = "default";
+      r.language = "pl";
+    });
+    text = mutateLine(text, second, (r) => {
+      r.llm_route = "english_model";
+    });
+    const result = summarizeText(text);
+    expect(result.code).toBe(1); // Two required cleanup samples are now routed.
+    expect(result.output).toContain("en cleanup 5s: n=28");
+    expect(result.output).not.toContain(
+      'unexpected workload language/label "pl"',
+    );
+    expect(result.output).toContain(
+      "routed (profiles and non-default models; excluded from samples and baseline):",
+    );
+    expect(result.output).toContain("p1700000000000|default: n=1");
+    expect(result.output).toContain("built-in|english_model: n=1");
+
+    const parsed = parseJsonl(text);
+    expect(parsed.errors).toEqual([]);
+    const opts = parseArgs([
+      "--input",
+      "unused",
+      "--samples",
+      "30",
+      "--warmup",
+      "3",
+      "--languages",
+      "en",
+      "--allow-synthetic",
+    ]).opts;
+    const summary = summarize(parsed.records, opts, parsed.ends);
+    const cleanup5 = summary.workloads.find((w) => w.key === "en|cleanup|5")!;
+    expect(cleanup5.available).toBe(28);
+    expect(summary.routed.map((g) => g.key)).toEqual([
+      "built-in|english_model",
+      "p1700000000000|default",
+    ]);
+    expect(summary.routed[0].outcomes.pasted).toBe(1);
+    expect(summary.routed[0].total?.n).toBe(1);
+    expect(summary.routed[0].llmMedianUs).not.toBeNull();
+  });
+
+  test("a built-in record with the default route is not routed", () => {
+    const [first] = warmCleanup();
+    const result = summarizeText(
+      mutateLine(baselineText, first, (r) => {
+        r.llm_route = "default";
+      }),
+    );
+    expect(result.code).toBe(0);
+    expect(result.output).toContain("en cleanup 5s: n=30");
+    expect(result.output).not.toContain("routed (");
+  });
+
+  test("custom command profiles appear in both assistant and routed sections", () => {
+    const record = {
+      ...assistantRecord(),
+      profile: "p2",
+      llm_route: "profile_model",
+    };
+    expect(validateRecord(record)).toBeNull();
+    const result = summarizeText(baselineText + assistantText([record]));
+    expect(result.code).toBe(0);
+    expect(result.output).toContain("p2|profile_model: n=1");
+    expect(result.output).toContain("assistant (separate");
+  });
+
+  test("route and profile fields are strictly validated", () => {
+    const cleanup = {
+      ...assistantRecord(),
+      mode: "cleanup",
+      outcome: "pasted",
+    };
+    expect(
+      validateRecord({ ...cleanup, llm_route: "english_model" }),
+    ).toBeNull();
+    expect(
+      validateRecord({ ...cleanup, mode: "raw", llm_route: "default" }),
+    ).toBe("llm_route is invalid for raw mode");
+    expect(
+      validateRecord({ ...assistantRecord(), llm_route: "english_model" }),
+    ).toBe("english_model requires cleanup mode");
+    expect(validateRecord({ ...cleanup, llm_route: "teleport" })).toBe(
+      "unknown llm_route",
+    );
+    for (const profile of ["", 5, null]) {
+      expect(validateRecord({ ...cleanup, profile })).toBe(
+        "profile must be a non-empty string",
+      );
+    }
+  });
+});

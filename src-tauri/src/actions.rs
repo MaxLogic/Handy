@@ -8,7 +8,10 @@ use crate::managers::model::ModelManager;
 use crate::managers::transcription::StreamWorkKind;
 use crate::managers::transcription::TranscriptionManager;
 use crate::prompts;
-use crate::settings::{AppSettings, OverlayStyle};
+use crate::settings::{
+    spec_for_binding, spec_for_profile, AppSettings, OverlayStyle, ProfileKind, ProfileRef,
+    ProfileSpec, COMMAND_PROFILE_PREFIX, DICTATION_PROFILE_PREFIX,
+};
 use crate::shortcut;
 use crate::tray::{set_tray_state, TrayIconState};
 use crate::utils::{
@@ -63,11 +66,15 @@ pub(crate) enum WorkflowMode {
 }
 
 impl WorkflowMode {
+    /// Custom profiles encode their immutable kind in the binding id prefix,
+    /// so dispatch never reads settings.
     pub(crate) fn from_binding_id(id: &str) -> Option<Self> {
         match id {
             "transcribe" => Some(Self::Raw),
             "transcribe_with_post_process" => Some(Self::Cleanup),
             "assistant" => Some(Self::Assistant),
+            id if id.starts_with(DICTATION_PROFILE_PREFIX) => Some(Self::Cleanup),
+            id if id.starts_with(COMMAND_PROFILE_PREFIX) => Some(Self::Assistant),
             _ => None,
         }
     }
@@ -93,8 +100,14 @@ impl WorkflowMode {
 /// configuration is snapshotted too, so later settings cannot switch targets.
 pub(crate) struct DictationSession {
     workflow: SessionWorkflow,
+    /// For timing: the profile's speech language, or the global setting.
     language: String,
     overlay_style: OverlayStyle,
+    /// The profile's speech language. It overrides only this run's STT
+    /// settings copy and is never written back.
+    pub(crate) stt_language: Option<String>,
+    /// Every profile session, built-ins included; None for raw dictation.
+    pub(crate) profile: Option<ProfileRef>,
 }
 
 enum SessionWorkflow {
@@ -112,27 +125,89 @@ impl DictationSession {
         }
     }
 
-    pub(crate) fn snapshot(mode: WorkflowMode, settings: &AppSettings) -> Option<Self> {
-        Some(Self {
-            workflow: match mode {
-                WorkflowMode::Raw => SessionWorkflow::Raw,
-                WorkflowMode::Assistant => return None,
-                WorkflowMode::Cleanup => SessionWorkflow::Cleanup(Box::new(
-                    prompts::CleanupRequest::from_settings(settings),
-                )),
-            },
+    fn raw(settings: &AppSettings) -> Self {
+        Self {
+            workflow: SessionWorkflow::Raw,
             language: settings.selected_language.clone(),
             overlay_style: settings.overlay_style,
-        })
+            stt_language: None,
+            profile: None,
+        }
     }
+
+    fn with_spec(settings: &AppSettings, spec: &ProfileSpec, workflow: SessionWorkflow) -> Self {
+        Self {
+            workflow,
+            language: spec
+                .speech_language
+                .clone()
+                .unwrap_or_else(|| settings.selected_language.clone()),
+            overlay_style: settings.overlay_style,
+            stt_language: spec.speech_language.clone(),
+            profile: Some(spec.profile.clone()),
+        }
+    }
+
+    fn cleanup(settings: &AppSettings, spec: &ProfileSpec) -> Self {
+        let request = prompts::CleanupRequest::from_spec(settings, spec);
+        Self::with_spec(settings, spec, SessionWorkflow::Cleanup(Box::new(request)))
+    }
+
+    /// Resolve what a binding records. Selection-command bindings go through
+    /// capture instead and give None, as does a deleted custom profile.
+    pub(crate) fn for_binding(binding_id: &str, settings: &AppSettings) -> Option<Self> {
+        if binding_id == WorkflowMode::Raw.binding_id() {
+            return Some(Self::raw(settings));
+        }
+        let spec = spec_for_binding(settings, binding_id)?;
+        (spec.kind == ProfileKind::Dictation).then(|| Self::cleanup(settings, &spec))
+    }
+
+    /// The built-in workflows; kept for tests and the legacy history retry.
+    pub(crate) fn snapshot(mode: WorkflowMode, settings: &AppSettings) -> Option<Self> {
+        Self::for_binding(mode.binding_id(), settings)
+    }
+
+    /// Profile rows retry with their profile, never silently with built-in
+    /// Cleanup; legacy rows keep the stored boolean.
+    pub(crate) fn for_history_retry(
+        entry: &crate::managers::history::HistoryEntry,
+        settings: &AppSettings,
+    ) -> Result<Self, String> {
+        match &entry.profile_id {
+            Some(id) => spec_for_profile(settings, id)
+                .filter(|spec| spec.kind == ProfileKind::Dictation)
+                .map(|spec| Self::cleanup(settings, &spec))
+                .ok_or_else(|| "profile_not_found".to_string()),
+            None => {
+                let mode = if entry.post_process_requested {
+                    WorkflowMode::Cleanup
+                } else {
+                    WorkflowMode::Raw
+                };
+                Self::snapshot(mode, settings)
+                    .ok_or_else(|| "assistant sessions cannot be retried".to_string())
+            }
+        }
+    }
+
     pub(crate) fn assistant(
         settings: &AppSettings,
+        spec: &ProfileSpec,
         session: crate::assistant::AssistantSession,
     ) -> Self {
-        Self {
-            workflow: SessionWorkflow::Assistant(Box::new(session)),
-            language: settings.selected_language.clone(),
-            overlay_style: settings.overlay_style,
+        Self::with_spec(
+            settings,
+            spec,
+            SessionWorkflow::Assistant(Box::new(session)),
+        )
+    }
+
+    /// Custom profiles mark their timing record; built-ins keep today's shape
+    /// so built-in Cleanup stays in the baseline comparison.
+    fn note_timing_profile(&self, timer: &OperationTimer) {
+        if let Some(profile) = self.profile.as_ref().filter(|p| !p.builtin) {
+            timer.set_profile(profile.id.clone());
         }
     }
     pub(crate) fn into_assistant(self) -> Result<crate::assistant::AssistantSession, Self> {
@@ -180,6 +255,14 @@ pub(crate) struct ProcessedTranscription {
     pub post_process_prompt: Option<String>,
     pub cleanup_error: Option<String>,
     pub cleanup_skipped: Option<prompts::CleanupSkipReason>,
+    /// The route cleanup took or planned; None without a cleanup request.
+    pub llm_route: Option<dictation_timing::LlmRoute>,
+}
+
+fn note_cleanup_route(timer: &OperationTimer, output: &ProcessedTranscription) {
+    if let Some(route) = output.llm_route {
+        timer.set_llm_route(route);
+    }
 }
 
 impl ProcessedTranscription {
@@ -212,12 +295,16 @@ pub(crate) async fn process_transcription_output_with_language(
     transcription: &str,
     evidence: &OutputLanguageEvidence,
 ) -> ProcessedTranscription {
-    process_transcription_output_with(session, transcription, |req, text| {
-        prompts::cleanup(req, text, evidence)
-    })
+    process_transcription_output_routed(
+        session,
+        transcription,
+        |req| prompts::plan_cleanup(req, evidence).route(req),
+        |req, text| prompts::cleanup(req, text, evidence),
+    )
     .await
 }
 
+#[cfg(test)]
 async fn process_transcription_output_with<'a, F, Fut>(
     session: &'a DictationSession,
     transcription: &'a str,
@@ -227,32 +314,58 @@ where
     F: FnOnce(&'a prompts::CleanupRequest, &'a str) -> Fut,
     Fut: Future<Output = Result<prompts::CleanupOutcome, crate::llm_client::LlmError>>,
 {
+    process_transcription_output_routed(session, transcription, |req| req.target_route, cleanup)
+        .await
+}
+
+/// `planned` names the route a failed request was sent to.
+async fn process_transcription_output_routed<'a, P, F, Fut>(
+    session: &'a DictationSession,
+    transcription: &'a str,
+    planned: P,
+    cleanup: F,
+) -> ProcessedTranscription
+where
+    P: FnOnce(&prompts::CleanupRequest) -> dictation_timing::LlmRoute,
+    F: FnOnce(&'a prompts::CleanupRequest, &'a str) -> Fut,
+    Fut: Future<Output = Result<prompts::CleanupOutcome, crate::llm_client::LlmError>>,
+{
     let mut final_text = transcription.to_string();
     let mut post_processed_text: Option<String> = None;
     let mut post_process_prompt: Option<String> = None;
     let mut cleanup_error = None;
     let mut cleanup_skipped = None;
+    let mut llm_route = None;
 
     // The STT manager has already applied deterministic/custom-word cleanup.
     // Preserve that exact recoverable result whenever cleanup fails.
     if let SessionWorkflow::Cleanup(request) = &session.workflow {
         if !prompts::is_blank_transcription(transcription) {
             match request.as_ref() {
-                Ok(request) => match cleanup(request, transcription).await {
-                    Ok(prompts::CleanupOutcome::Cleaned(text)) => {
-                        post_processed_text = Some(text.clone());
-                        final_text = text;
-                        // S1 uses fixed controls rather than the user's cleanup prompt.
-                        if request.target.provider.id
-                            == crate::settings::APPLE_INTELLIGENCE_PROVIDER_ID
-                            || !crate::llm_client::is_s1_mini(&request.target.model)
-                        {
-                            post_process_prompt = Some(request.prompt.clone());
+                Ok(request) => {
+                    let planned = planned(request);
+                    match cleanup(request, transcription).await {
+                        Ok(prompts::CleanupOutcome::Cleaned {
+                            text,
+                            route,
+                            prompt_sent,
+                        }) => {
+                            post_processed_text = Some(text.clone());
+                            final_text = text;
+                            llm_route = Some(route);
+                            // The S1 format ignores the prompt; record only a sent one.
+                            post_process_prompt = prompt_sent.then(|| request.prompt.clone());
+                        }
+                        Ok(prompts::CleanupOutcome::Skipped(reason)) => {
+                            cleanup_skipped = Some(reason);
+                            llm_route = Some(request.target_route);
+                        }
+                        Err(error) => {
+                            cleanup_error = Some(error.to_string());
+                            llm_route = Some(planned);
                         }
                     }
-                    Ok(prompts::CleanupOutcome::Skipped(reason)) => cleanup_skipped = Some(reason),
-                    Err(error) => cleanup_error = Some(error.to_string()),
-                },
+                }
                 Err(error) => cleanup_error = Some(error.to_string()),
             }
         }
@@ -264,6 +377,7 @@ where
         post_process_prompt,
         cleanup_error,
         cleanup_skipped,
+        llm_route,
     }
 }
 
@@ -329,13 +443,22 @@ pub(crate) fn report_cleanup_failure(
 ) {
     if let Some(error) = &output.cleanup_error {
         app.play_failure_feedback();
-        warn!("LLM cleanup failed: {error}");
+        match output.llm_route {
+            Some(route) => warn!("LLM cleanup failed: route={route:?} {error}"),
+            None => warn!("LLM cleanup failed: {error}"),
+        }
         app.emit_notice("cleanup-fallback", notice);
     }
 }
 
 impl TranscribeAction {
-    pub(crate) fn start(app: &AppHandle, binding_id: &str, settings: &AppSettings) {
+    /// `stt_language` is the session's profile speech language, if any.
+    pub(crate) fn start(
+        app: &AppHandle,
+        binding_id: &str,
+        settings: &AppSettings,
+        stt_language: Option<&str>,
+    ) {
         let start_time = Instant::now();
         debug!("TranscribeAction::start called for binding: {}", binding_id);
 
@@ -399,7 +522,7 @@ impl TranscribeAction {
             VadPolicy::Offline
         };
         if model_supports_streaming {
-            tm.start_stream();
+            tm.start_stream_with_language(stt_language.map(str::to_string));
         }
         let plan_elapsed = plan_started.elapsed();
 
@@ -519,6 +642,7 @@ impl TranscribeAction {
         // and language from recording start.
         let timer =
             OperationTimer::begin_stop(session.mode().timing_mode(), session.language.clone());
+        session.note_timing_profile(&timer);
         let stop_entry = Instant::now();
 
         // Prevent a slow microphone from emitting a ready event or start chime
@@ -636,7 +760,10 @@ impl TranscribeAction {
                         }
                         Ok(_) => {
                             timer.set_stt_path(SttPath::Batch);
-                            tm.transcribe_with_language(samples)
+                            tm.transcribe_with_language_for(
+                                samples,
+                                session.stt_language.as_deref(),
+                            )
                         }
                         Err(err) => Err(err),
                     };
@@ -733,6 +860,9 @@ impl TranscribeAction {
                             {
                                 timer.add_since(Stage::Llm, cleanup_started);
                             }
+                            if let Some(processed) = &processed {
+                                note_cleanup_route(&timer, processed);
+                            }
                             let Some(mut processed) = processed else {
                                 debug!("Transcription operation cancelled during output handling");
                                 timer.finish(Outcome::Cancelled);
@@ -759,6 +889,7 @@ impl TranscribeAction {
                                     session.mode() == WorkflowMode::Cleanup,
                                     processed.post_processed_text.clone(),
                                     processed.post_process_prompt.clone(),
+                                    session.profile.as_ref(),
                                 ) {
                                     Ok(_) => history_saved = true,
                                     Err(err) => error!("Failed to save history entry: {}", err),
@@ -846,6 +977,7 @@ impl TranscribeAction {
                                     session.mode() == WorkflowMode::Cleanup,
                                     None,
                                     None,
+                                    session.profile.as_ref(),
                                 ) {
                                     error!("Failed to save failed history entry: {}", save_err);
                                 }
@@ -952,6 +1084,7 @@ mod tests {
                     post_process_prompt: None,
                     cleanup_error: cleanup_failed.then(|| "llm_timeout".into()),
                     cleanup_skipped: None,
+                    llm_route: None,
                 };
                 super::report_transcription_delivery(
                     &reporter,
@@ -986,6 +1119,7 @@ mod tests {
                 post_process_prompt: None,
                 cleanup_error: Some("llm_timeout".into()),
                 cleanup_skipped: None,
+                llm_route: None,
             };
             super::report_transcription_delivery(&reporter, &output, history_saved, &Ok(false));
             assert_eq!(
@@ -1010,6 +1144,7 @@ mod tests {
             post_process_prompt: None,
             cleanup_error: Some("llm_timeout".into()),
             cleanup_skipped: None,
+            llm_route: None,
         };
         let reporter = FakeCleanupReporter::default();
         let notice = super::CleanupFallbackNotice {
@@ -1040,6 +1175,7 @@ mod tests {
             post_process_prompt: None,
             cleanup_error: Some("llm_timeout".into()),
             cleanup_skipped: None,
+            llm_route: None,
         };
         let notice = super::CleanupFallbackNotice {
             history_available: true,
@@ -1271,7 +1407,11 @@ mod tests {
         )
         .unwrap();
         let output = process_transcription_output_with(&session, "raw", |_, _| {
-            future::ready(Ok(prompts::CleanupOutcome::Cleaned("Cleaned.".into())))
+            future::ready(Ok(prompts::CleanupOutcome::Cleaned {
+                text: "Cleaned.".into(),
+                route: dictation_timing::LlmRoute::Default,
+                prompt_sent: true,
+            }))
         })
         .await;
         assert_eq!(output.final_text, "Cleaned.");
@@ -1288,7 +1428,11 @@ mod tests {
         let output = process_transcription_output_with(&session, raw, |_, _| {
             panic!("raw mode must never invoke an LLM client");
             #[allow(unreachable_code)]
-            future::ready(Ok(prompts::CleanupOutcome::Cleaned(String::new())))
+            future::ready(Ok(prompts::CleanupOutcome::Cleaned {
+                text: String::new(),
+                route: dictation_timing::LlmRoute::Default,
+                prompt_sent: true,
+            }))
         })
         .await;
         assert_eq!(output.final_text, raw);
@@ -1420,7 +1564,11 @@ mod tests {
         let output = process_transcription_output_with(&session, "raw", |_, _| {
             panic!("a later configuration fix must not change this session");
             #[allow(unreachable_code)]
-            future::ready(Ok(prompts::CleanupOutcome::Cleaned(String::new())))
+            future::ready(Ok(prompts::CleanupOutcome::Cleaned {
+                text: String::new(),
+                route: dictation_timing::LlmRoute::Default,
+                prompt_sent: true,
+            }))
         })
         .await;
         assert_eq!(output.final_text, "raw");
@@ -1517,6 +1665,357 @@ mod tests {
 
         cancel_thread.join().unwrap();
         assert_eq!(result, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // HANDY-008: profile sessions
+    // -----------------------------------------------------------------------
+
+    fn custom_profile(
+        id: &str,
+        kind: crate::settings::ProfileKind,
+        model: Option<crate::settings::LlmEndpoint>,
+        speech_language: Option<&str>,
+    ) -> crate::settings::ProcessingProfile {
+        crate::settings::ProcessingProfile {
+            id: id.into(),
+            name: format!("Profile {id}"),
+            kind,
+            prompt_id: Some("default_improve_transcriptions".into()),
+            model,
+            speech_language: speech_language.map(Into::into),
+            english_cleanup: None,
+        }
+    }
+
+    fn builtin_cleanup(settings: &mut AppSettings) -> &mut crate::settings::ProcessingProfile {
+        settings
+            .processing_profiles
+            .iter_mut()
+            .find(|p| p.id == crate::settings::BUILTIN_CLEANUP_PROFILE_ID)
+            .unwrap()
+    }
+
+    fn history_entry(
+        profile_id: Option<&str>,
+        requested: bool,
+    ) -> crate::managers::history::HistoryEntry {
+        crate::managers::history::HistoryEntry {
+            id: 1,
+            file_name: "handy-1.wav".into(),
+            timestamp: 1,
+            saved: false,
+            title: "Recording".into(),
+            transcription_text: String::new(),
+            post_processed_text: None,
+            post_process_prompt: None,
+            post_process_requested: requested,
+            profile_id: profile_id.map(Into::into),
+            profile_name: None,
+        }
+    }
+
+    #[test]
+    fn handy008_for_binding_resolves_each_binding_kind() {
+        use crate::settings::ProfileKind;
+        let mut settings = configured_settings("http://unused.invalid");
+        settings
+            .processing_profiles
+            .push(custom_profile("pd", ProfileKind::Dictation, None, None));
+        settings.processing_profiles.push(custom_profile(
+            "pc",
+            ProfileKind::SelectionCommand,
+            None,
+            None,
+        ));
+        let raw = DictationSession::for_binding("transcribe", &settings).unwrap();
+        assert_eq!(raw.mode(), WorkflowMode::Raw);
+        assert_eq!(
+            (raw.profile.clone(), raw.stt_language.clone()),
+            (None, None)
+        );
+        let cleanup =
+            DictationSession::for_binding("transcribe_with_post_process", &settings).unwrap();
+        assert_eq!(cleanup.mode(), WorkflowMode::Cleanup);
+        assert_eq!(
+            cleanup.profile,
+            Some(crate::settings::ProfileRef {
+                id: crate::settings::BUILTIN_CLEANUP_PROFILE_ID.into(),
+                name: String::new(),
+                builtin: true
+            })
+        );
+        let custom = DictationSession::for_binding("dictation_profile_pd", &settings).unwrap();
+        assert_eq!(custom.mode(), WorkflowMode::Cleanup);
+        assert_eq!(custom.profile.as_ref().unwrap().id, "pd");
+        assert!(!custom.profile.as_ref().unwrap().builtin);
+        for capture_or_missing in [
+            "assistant",
+            "command_profile_pc",
+            "dictation_profile_missing",
+            "dictation_profile_pc",
+            "cancel",
+        ] {
+            assert!(
+                DictationSession::for_binding(capture_or_missing, &settings).is_none(),
+                "{capture_or_missing}"
+            );
+        }
+        assert_eq!(
+            WorkflowMode::from_binding_id("dictation_profile_pd"),
+            Some(WorkflowMode::Cleanup)
+        );
+        assert_eq!(
+            WorkflowMode::from_binding_id("command_profile_pc"),
+            Some(WorkflowMode::Assistant)
+        );
+    }
+
+    #[test]
+    fn handy008_stt_language_is_none_for_builtins_without_a_hint() {
+        use crate::settings::ProfileKind;
+        let mut settings = configured_settings("http://unused.invalid");
+        settings.selected_language = "auto".into();
+        let seeded = DictationSession::snapshot(WorkflowMode::Cleanup, &settings).unwrap();
+        assert_eq!(seeded.stt_language, None);
+        assert_eq!(seeded.language, "auto");
+        builtin_cleanup(&mut settings).speech_language = Some("pl".into());
+        let hinted = DictationSession::snapshot(WorkflowMode::Cleanup, &settings).unwrap();
+        assert_eq!(hinted.stt_language.as_deref(), Some("pl"));
+        assert_eq!(hinted.language, "pl");
+        settings.processing_profiles.push(custom_profile(
+            "pd",
+            ProfileKind::Dictation,
+            None,
+            Some("de"),
+        ));
+        let custom = DictationSession::for_binding("dictation_profile_pd", &settings).unwrap();
+        assert_eq!(custom.stt_language.as_deref(), Some("de"));
+        let raw = DictationSession::snapshot(WorkflowMode::Raw, &settings).unwrap();
+        assert_eq!(raw.stt_language, None);
+        assert_eq!(raw.language, "auto");
+        // The override is session-only: global settings are unchanged.
+        assert_eq!(settings.selected_language, "auto");
+    }
+
+    #[tokio::test]
+    async fn handy008_session_snapshot_survives_later_profile_edit() {
+        use crate::settings::{LlmEndpoint, ProfileKind};
+        let selected = FakeServer::new(vec![Step::Respond(
+            200,
+            completion(Some(r#"{"transcription":"Translated."}"#), "stop"),
+        )])
+        .await;
+        let other = FakeServer::new(vec![]).await;
+        let mut settings = configured_settings(&other.url);
+        settings
+            .post_process_prompts
+            .push(crate::settings::LLMPrompt {
+                id: "prompt_translate".into(),
+                name: "Translate".into(),
+                prompt: "Translate into German.".into(),
+            });
+        let mut profile = custom_profile(
+            "pd",
+            ProfileKind::Dictation,
+            Some(LlmEndpoint {
+                provider_id: "custom".into(),
+                base_url: Some(selected.url.clone()),
+                model: "start-model".into(),
+            }),
+            None,
+        );
+        profile.prompt_id = Some("prompt_translate".into());
+        settings.processing_profiles.push(profile);
+        let session = DictationSession::for_binding("dictation_profile_pd", &settings).unwrap();
+        // Later edits, renames and deletes never affect a running session.
+        settings.processing_profiles.retain(|p| p.id != "pd");
+        settings
+            .post_process_prompts
+            .retain(|p| p.id != "prompt_translate");
+        let output = process_transcription_output(&session, "Guten Tag").await;
+        assert_eq!(output.final_text, "Translated.");
+        assert_eq!(
+            output.post_process_prompt.as_deref(),
+            Some("Translate into German.")
+        );
+        assert_eq!(
+            output.llm_route,
+            Some(dictation_timing::LlmRoute::ProfileModel)
+        );
+        let requests = selected.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["model"], "start-model");
+        assert!(other.requests.lock().unwrap().is_empty());
+    }
+
+    fn english_routing(settings: &mut AppSettings, english_url: &str) {
+        settings.english_cleanup = crate::settings::EnglishCleanupSettings {
+            enabled: true,
+            base_url: english_url.into(),
+            model: "S1-mini".into(),
+        };
+    }
+
+    #[tokio::test]
+    async fn handy008_english_route_success_records_no_unsent_prompt() {
+        let default = FakeServer::new(vec![]).await;
+        let english = FakeServer::new(vec![Step::Respond(
+            200,
+            completion(Some("Sounds good."), "stop"),
+        )])
+        .await;
+        let mut settings = configured_settings(&default.url);
+        english_routing(&mut settings, &english.url);
+        let session = DictationSession::snapshot(WorkflowMode::Cleanup, &settings).unwrap();
+        let output = process_transcription_output_with_language(
+            &session,
+            "sounds good",
+            &OutputLanguageEvidence::UserSelected("en".into()),
+        )
+        .await;
+        assert_eq!(output.final_text, "Sounds good.");
+        assert_eq!(output.post_processed_text.as_deref(), Some("Sounds good."));
+        assert!(output.post_process_prompt.is_none());
+        assert_eq!(
+            output.llm_route,
+            Some(dictation_timing::LlmRoute::EnglishModel)
+        );
+        assert_eq!(english.requests.lock().unwrap().len(), 1);
+        assert!(default.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handy008_english_route_failure_reports_one_cue_and_notice_without_fallback() {
+        let default = FakeServer::new(vec![]).await;
+        let closed = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let mut settings = configured_settings(&default.url);
+        settings.post_process_request_options.connect_timeout_secs = 1;
+        settings.post_process_request_options.timeout_secs = 2;
+        english_routing(&mut settings, &closed);
+        let session = DictationSession::snapshot(WorkflowMode::Cleanup, &settings).unwrap();
+        let raw = "sounds good";
+        let output = process_transcription_output_with_language(
+            &session,
+            raw,
+            &OutputLanguageEvidence::ModelDetected("en".into()),
+        )
+        .await;
+        assert_eq!(output.final_text, raw);
+        assert!(output.cleanup_error.is_some());
+        assert!(output.cleanup_skipped.is_none());
+        assert_eq!(
+            output.llm_route,
+            Some(dictation_timing::LlmRoute::EnglishModel)
+        );
+        assert_eq!(output.paste_outcome(), Outcome::CleanupFallback);
+        assert_eq!(default.accepts.load(Ordering::SeqCst), 0, "no fallback");
+        let reporter = FakeCleanupReporter::default();
+        report_transcription_delivery(&reporter, &output, true, &Ok(true));
+        assert_eq!(reporter.cues.get(), 1);
+        assert_eq!(
+            &*reporter.events.borrow(),
+            &[(
+                "cleanup-fallback".into(),
+                CleanupFallbackNotice {
+                    history_available: true,
+                    raw_delivered: true
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn handy008_history_retry_uses_the_entry_profile() {
+        use crate::settings::ProfileKind;
+        let mut settings = configured_settings("http://unused.invalid");
+        settings.processing_profiles.push(custom_profile(
+            "pd",
+            ProfileKind::Dictation,
+            None,
+            Some("pl"),
+        ));
+        let custom =
+            DictationSession::for_history_retry(&history_entry(Some("pd"), true), &settings)
+                .unwrap();
+        assert_eq!(custom.mode(), WorkflowMode::Cleanup);
+        assert_eq!(custom.profile.as_ref().unwrap().id, "pd");
+        assert_eq!(custom.stt_language.as_deref(), Some("pl"));
+        assert_eq!(
+            DictationSession::for_history_retry(&history_entry(Some("gone"), true), &settings)
+                .err()
+                .as_deref(),
+            Some("profile_not_found"),
+            "never silently retry with built-in Cleanup"
+        );
+        let builtin = DictationSession::for_history_retry(
+            &history_entry(Some(crate::settings::BUILTIN_CLEANUP_PROFILE_ID), true),
+            &settings,
+        )
+        .unwrap();
+        assert!(builtin.profile.as_ref().unwrap().builtin);
+        let legacy =
+            DictationSession::for_history_retry(&history_entry(None, true), &settings).unwrap();
+        assert_eq!(legacy.mode(), WorkflowMode::Cleanup);
+        assert_eq!(
+            legacy.profile.as_ref().unwrap().id,
+            crate::settings::BUILTIN_CLEANUP_PROFILE_ID
+        );
+        let legacy_raw =
+            DictationSession::for_history_retry(&history_entry(None, false), &settings).unwrap();
+        assert_eq!(legacy_raw.mode(), WorkflowMode::Raw);
+    }
+
+    #[tokio::test]
+    async fn handy008_timing_marks_only_custom_profiles_and_records_the_route() {
+        use crate::settings::{LlmEndpoint, ProfileKind};
+        let server = FakeServer::new(vec![
+            Step::Respond(200, completion(Some(r#"{"transcription":"A."}"#), "stop")),
+            Step::Respond(200, completion(Some(r#"{"transcription":"B."}"#), "stop")),
+            Step::Respond(200, completion(Some(r#"{"transcription":"C."}"#), "stop")),
+        ])
+        .await;
+        let mut settings = configured_settings(&server.url);
+        settings
+            .processing_profiles
+            .push(custom_profile("pd", ProfileKind::Dictation, None, None));
+        let seeded = DictationSession::snapshot(WorkflowMode::Cleanup, &settings).unwrap();
+        builtin_cleanup(&mut settings).model = Some(LlmEndpoint {
+            provider_id: "custom".into(),
+            base_url: None,
+            model: "override".into(),
+        });
+        let overridden = DictationSession::snapshot(WorkflowMode::Cleanup, &settings).unwrap();
+        let custom = DictationSession::for_binding("dictation_profile_pd", &settings).unwrap();
+        for (session, profile, route) in [
+            (&seeded, None, dictation_timing::LlmRoute::Default),
+            (&overridden, None, dictation_timing::LlmRoute::ProfileModel),
+            (
+                &custom,
+                Some("pd".to_string()),
+                dictation_timing::LlmRoute::Default,
+            ),
+        ] {
+            let timer = OperationTimer::begin_stop(Mode::Cleanup, session.language.clone());
+            session.note_timing_profile(&timer);
+            let output = process_transcription_output(session, "raw").await;
+            note_cleanup_route(&timer, &output);
+            let record = timer.record_for_test();
+            assert_eq!(record.profile, profile);
+            assert_eq!(record.llm_route, Some(route));
+            timer.finish(Outcome::Pasted);
+        }
+        let raw = DictationSession::snapshot(WorkflowMode::Raw, &settings).unwrap();
+        let timer = OperationTimer::begin_stop(Mode::Raw, raw.language.clone());
+        raw.note_timing_profile(&timer);
+        let output = process_transcription_output(&raw, "raw").await;
+        note_cleanup_route(&timer, &output);
+        let record = timer.record_for_test();
+        assert_eq!((record.profile, record.llm_route), (None, None));
+        timer.finish(Outcome::Pasted);
     }
 
     #[test]
