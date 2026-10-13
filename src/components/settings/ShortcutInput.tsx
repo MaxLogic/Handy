@@ -8,6 +8,12 @@ interface ShortcutInputProps {
   grouped?: boolean;
   shortcutId: string;
   disabled?: boolean;
+  label?: string;
+  title?: string;
+  unassignedLabel?: string;
+  onRemove?: () => Promise<void>;
+  removeLabel?: string;
+  describedBy?: string;
 }
 
 /**

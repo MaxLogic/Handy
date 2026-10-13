@@ -4,13 +4,21 @@ import ResetIcon from "../icons/ResetIcon";
 interface ResetButtonProps {
   onClick: () => void;
   disabled?: boolean;
+  ariaDisabled?: boolean;
   className?: string;
   ariaLabel?: string;
   children?: React.ReactNode;
 }
 
 export const ResetButton: React.FC<ResetButtonProps> = React.memo(
-  ({ onClick, disabled = false, className = "", ariaLabel, children }) => (
+  ({
+    onClick,
+    disabled = false,
+    ariaDisabled = false,
+    className = "",
+    ariaLabel,
+    children,
+  }) => (
     <button
       type="button"
       aria-label={ariaLabel}
@@ -19,7 +27,10 @@ export const ResetButton: React.FC<ResetButtonProps> = React.memo(
           ? "opacity-50 cursor-not-allowed text-text/40"
           : "hover:bg-logo-primary/30 active:bg-logo-primary/50 active:translate-y-[1px] hover:cursor-pointer hover:border-logo-primary text-text/80"
       } ${className}`}
-      onClick={onClick}
+      onClick={() => {
+        if (!ariaDisabled) onClick();
+      }}
+      aria-disabled={ariaDisabled}
       disabled={disabled}
     >
       {children ?? <ResetIcon />}

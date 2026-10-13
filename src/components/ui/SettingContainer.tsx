@@ -3,6 +3,8 @@ import { Tooltip } from "./Tooltip";
 
 interface SettingContainerProps {
   title: string;
+  titleTag?: "h3" | "p";
+  titleId?: string;
   description: string;
   children: React.ReactNode;
   descriptionMode?: "inline" | "tooltip";
@@ -14,6 +16,8 @@ interface SettingContainerProps {
 
 export const SettingContainer: React.FC<SettingContainerProps> = ({
   title,
+  titleTag: Title = "h3",
+  titleId,
   description,
   children,
   descriptionMode = "tooltip",
@@ -52,15 +56,16 @@ export const SettingContainer: React.FC<SettingContainerProps> = ({
     : "px-4 p-2 rounded-lg border border-mid-gray/20";
 
   if (layout === "stacked") {
-    if (descriptionMode === "tooltip") {
+    if (descriptionMode === "tooltip" && description.trim()) {
       return (
         <div className={containerClasses}>
           <div className="flex items-center gap-2 mb-2">
-            <h3
+            <Title
+              id={titleId}
               className={`text-sm font-medium ${disabled ? "opacity-50" : ""}`}
             >
               {title}
-            </h3>
+            </Title>
             <div
               ref={tooltipRef}
               className="relative"
@@ -107,9 +112,12 @@ export const SettingContainer: React.FC<SettingContainerProps> = ({
     return (
       <div className={containerClasses}>
         <div className="mb-2">
-          <h3 className={`text-sm font-medium ${disabled ? "opacity-50" : ""}`}>
+          <Title
+            id={titleId}
+            className={`text-sm font-medium ${disabled ? "opacity-50" : ""}`}
+          >
             {title}
-          </h3>
+          </Title>
           <p className={`text-sm ${disabled ? "opacity-50" : ""}`}>
             {description}
           </p>
@@ -124,16 +132,17 @@ export const SettingContainer: React.FC<SettingContainerProps> = ({
     ? "flex items-center justify-between min-h-12 px-4 p-2"
     : "flex items-center justify-between min-h-12 px-4 p-2 rounded-lg border border-mid-gray/20";
 
-  if (descriptionMode === "tooltip") {
+  if (descriptionMode === "tooltip" && description.trim()) {
     return (
       <div className={horizontalContainerClasses}>
         <div className="max-w-2/3">
           <div className="flex items-center gap-2">
-            <h3
+            <Title
+              id={titleId}
               className={`text-sm font-medium ${disabled ? "opacity-50" : ""}`}
             >
               {title}
-            </h3>
+            </Title>
             <div
               ref={tooltipRef}
               className="relative"
@@ -181,9 +190,12 @@ export const SettingContainer: React.FC<SettingContainerProps> = ({
   return (
     <div className={horizontalContainerClasses}>
       <div className="max-w-2/3">
-        <h3 className={`text-sm font-medium ${disabled ? "opacity-50" : ""}`}>
+        <Title
+          id={titleId}
+          className={`text-sm font-medium ${disabled ? "opacity-50" : ""}`}
+        >
           {title}
-        </h3>
+        </Title>
         <p className={`text-sm ${disabled ? "opacity-50" : ""}`}>
           {description}
         </p>

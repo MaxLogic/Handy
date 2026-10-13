@@ -1,238 +1,14 @@
-import { test, expect, type Page, type TestInfo } from "@playwright/test";
-import type {
-  AppSettings,
-  AssistantRecoveryItem,
-  LlmRequestOptions,
-} from "../src/bindings";
-
-type HarnessWindow = Window & {
-  __TAURI_INTERNALS__: Record<string, unknown>;
-  __TAURI_OS_PLUGIN_INTERNALS__: Record<string, unknown>;
-  __TAURI_EVENT_PLUGIN_INTERNALS__: Record<string, unknown>;
-  emitTestEvent: (event: string, payload: unknown) => void;
-  failCommand?: string;
-  pendingCommand?: string;
-  releaseCommand?: () => void;
-  commandCalls: string[];
-};
-
-async function screenshot(page: Page, testInfo: TestInfo, name: string) {
-  await page.screenshot({
-    path:
-      process.env.HANDY_UX_SCREENS === "1"
-        ? `.agents/slices/HANDY-006/screens/${name}.png`
-        : testInfo.outputPath(`${name}.png`),
-    fullPage: true,
-  });
-}
-
-async function setup(page: Page, keyboard = "tauri") {
-  await page.addInitScript(
-    ({ keyboard }) => {
-      const w = window as unknown as HarnessWindow;
-      w.commandCalls = [];
-      const initial: AppSettings = {
-        onboarding_completed: true,
-        app_language: "en",
-        post_process_enabled: false,
-        keyboard_implementation: keyboard as "tauri" | "handy_keys",
-        audio_feedback: true,
-        theme: "light",
-        overlay_style: "none",
-        selected_model: "turbo",
-        whats_new_last_seen_version: "0.9.8",
-        bindings: {
-          assistant: {
-            id: "assistant",
-            name: "Selected Text Assistant",
-            description: "Assistant",
-            current_binding: "ctrl+alt+space",
-            default_binding: "ctrl+alt+space",
-          },
-          transcribe: {
-            id: "transcribe",
-            name: "Transcribe",
-            description: "Raw",
-            current_binding: "ctrl+space",
-            default_binding: "ctrl+space",
-          },
-          transcribe_with_post_process: {
-            id: "transcribe_with_post_process",
-            name: "Cleanup",
-            description: "Cleanup",
-            current_binding: "ctrl+shift+space",
-            default_binding: "ctrl+shift+space",
-          },
-        },
-        post_process_provider_id: "custom",
-        post_process_providers: [
-          {
-            id: "custom",
-            label: "Custom",
-            base_url: "http://localhost:11434/v1",
-          },
-        ],
-        post_process_api_keys: { custom: "" },
-        post_process_models: { custom: "old-model" },
-        post_process_prompts: [
-          {
-            id: "cleanup",
-            name: "Conservative Cleanup",
-            prompt: "Clean the text.",
-          },
-          {
-            id: "assistant",
-            name: "Assistant",
-            prompt: "Apply the instruction.",
-          },
-        ],
-        assistant_selected_prompt_id: "assistant",
-        post_process_selected_prompt_id: "cleanup",
-        post_process_request_options: {
-          temperature: 0,
-          max_output_tokens: null,
-          timeout_secs: 60,
-          connect_timeout_secs: 5,
-        },
-      };
-      let settings: AppSettings = JSON.parse(
-        localStorage.getItem("test-settings") ?? JSON.stringify(initial),
-      );
-      const callbacks: Record<number, (event: unknown) => void> = {};
-      const listeners: Record<string, number[]> = {};
-      let next = 1;
-      const persist = () =>
-        localStorage.setItem("test-settings", JSON.stringify(settings));
-      w.emitTestEvent = (event, payload) => {
-        (listeners[event] ?? []).forEach((id) =>
-          callbacks[id]?.({ event, id, payload }),
-        );
-      };
-      w.__TAURI_OS_PLUGIN_INTERNALS__ = {
-        platform: "windows",
-        os_type: "windows",
-        family: "windows",
-        arch: "x86_64",
-        version: "11",
-        eol: "\r\n",
-      };
-      w.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
-        unregisterListener: (event: string, id: number) => {
-          listeners[event] = (listeners[event] ?? []).filter(
-            (value) => value !== id,
-          );
-        },
-      };
-      w.__TAURI_INTERNALS__ = {
-        metadata: {
-          currentWindow: { label: "main" },
-          currentWebview: { label: "main" },
-        },
-        transformCallback: (callback: (event: unknown) => void) => {
-          const id = next++;
-          callbacks[id] = callback;
-          return id;
-        },
-        unregisterCallback: (id: number) => {
-          delete callbacks[id];
-        },
-        convertFileSrc: (path: string) => path,
-        invoke: async (command: string, args: Record<string, unknown> = {}) => {
-          w.commandCalls.push(command);
-          if (command === w.pendingCommand)
-            await new Promise<void>((resolve) => {
-              w.releaseCommand = resolve;
-            });
-          if (command === w.failCommand) throw "fixture rejected setting";
-          if (command === "plugin:event|listen") {
-            const event = String(args.event);
-            (listeners[event] ??= []).push(Number(args.handler));
-            return args.handler;
-          }
-          if (command === "plugin:os|locale") return "en-US";
-          if (command === "plugin:app|version") return "0.9.8";
-          if (command === "get_app_settings") return settings;
-          if (command === "get_default_settings") return initial;
-          if (command === "get_windows_microphone_permission_status")
-            return { supported: false, overall_access: "allowed" };
-          if (command === "get_available_models") return [];
-          if (
-            command === "get_audio_devices" ||
-            command === "get_output_devices"
-          )
-            return [];
-          if (command === "get_history_entries")
-            return {
-              entries: JSON.parse(localStorage.getItem("test-history") ?? "[]"),
-              has_more: false,
-            };
-          if (command === "get_assistant_recovery_state")
-            return {
-              items: JSON.parse(localStorage.getItem("test-recovery") ?? "[]"),
-              capacity: 8,
-              free_slots: 8,
-            };
-          if (command === "dismiss_assistant_recovery_item") {
-            const items: AssistantRecoveryItem[] = JSON.parse(
-              localStorage.getItem("test-recovery") ?? "[]",
-            );
-            localStorage.setItem(
-              "test-recovery",
-              JSON.stringify(items.filter((item) => item.id !== args.id)),
-            );
-            return null;
-          }
-          if (command === "copy_assistant_recovery_text") {
-            localStorage.setItem("test-copy", String(args.part));
-            return null;
-          }
-          if (command === "fetch_post_process_models") return ["qwen3.5:9b"];
-          if (command === "set_assistant_selected_prompt")
-            settings.assistant_selected_prompt_id = args.id as string | null;
-          if (command === "change_post_process_request_options")
-            settings.post_process_request_options =
-              args.options as LlmRequestOptions;
-          if (command === "update_post_process_prompt") {
-            const prompt = settings.post_process_prompts?.find(
-              (p) => p.id === args.id,
-            );
-            if (prompt) {
-              prompt.name = String(args.name);
-              prompt.prompt = String(args.prompt);
-            }
-          }
-          if (command === "change_post_process_base_url_setting")
-            settings.post_process_providers![0].base_url = String(args.baseUrl);
-          if (command === "change_post_process_model_setting")
-            settings.post_process_models!.custom = String(args.model);
-          if (command === "change_post_process_api_key_setting")
-            settings.post_process_api_keys!.custom = String(args.apiKey);
-          if (command === "change_binding") {
-            if (args.binding === "ctrl+space")
-              return {
-                success: false,
-                error: "Shortcut already used by Transcribe",
-              };
-            settings.bindings![String(args.id)].current_binding = String(
-              args.binding,
-            );
-            persist();
-            return { success: true, error: null };
-          }
-          if (command === "reset_binding")
-            settings.bindings![String(args.id)].current_binding =
-              settings.bindings![String(args.id)].default_binding;
-          persist();
-          return null;
-        },
-      };
-    },
-    { keyboard },
-  );
-  await page.goto("/");
-  await page.getByRole("button", { name: "Post Process", exact: true }).click();
-}
-
+import { test, expect, type Page } from "@playwright/test";
+import type { AssistantRecoveryItem } from "../src/bindings";
+import {
+  setup,
+  screenshot,
+  emitKeys,
+  defer,
+  pending,
+  release,
+  type HarnessWindow,
+} from "./support/settings-harness";
 test("accessible settings and keyboard prompt dialog entry, trap and return", async ({
   page,
 }, testInfo) => {
@@ -247,14 +23,16 @@ test("accessible settings and keyboard prompt dialog entry, trap and return", as
     page.getByRole("combobox", { name: "Model", exact: true }),
   ).toBeVisible();
   const trigger = page.getByRole("button", {
-    name: "Edit assistant prompt",
+    name: "Edit Selected-text assistant",
     exact: true,
   });
   await trigger.focus();
   await page.keyboard.press("Enter");
-  const dialog = page.getByRole("dialog", { name: "Edit assistant prompt" });
+  const dialog = page.getByRole("dialog", {
+    name: "Edit Selected-text assistant",
+  });
   const name = dialog.getByRole("textbox", {
-    name: "Prompt Label",
+    name: "Name",
     exact: true,
   });
   await expect(name).toBeFocused();
@@ -264,24 +42,26 @@ test("accessible settings and keyboard prompt dialog entry, trap and return", as
   ).toBeFocused();
   await page.keyboard.press("Shift+Tab");
   await expect(
-    dialog.getByRole("button", { name: "Save assistant prompt", exact: true }),
+    dialog.getByRole("button", { name: "Save", exact: true }),
   ).toBeFocused();
   await page.keyboard.press("Escape");
   await expect(trigger).toBeFocused();
   await trigger.press("Enter");
   await name.fill("Personal assistant");
   await dialog
-    .getByRole("textbox", { name: "Prompt Instructions", exact: true })
-    .fill("Preserve technical terms.");
-  await dialog.getByRole("button", { name: "Save assistant prompt" }).click();
-  await expect(trigger).toBeFocused();
+    .getByRole("combobox", { name: "Profile prompt", exact: true })
+    .selectOption("cleanup");
+  await dialog.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Edit Personal assistant", exact: true }),
+  ).toBeFocused();
   await page.reload();
   await page.getByRole("button", { name: "Post Process", exact: true }).click();
-  await page.getByRole("button", { name: "Edit assistant prompt" }).click();
+  await page.getByRole("button", { name: "Edit Personal assistant" }).click();
   await expect(
     page
       .getByRole("dialog")
-      .getByRole("textbox", { name: "Prompt Label", exact: true }),
+      .getByRole("textbox", { name: "Name", exact: true }),
   ).toHaveValue("Personal assistant");
   await screenshot(page, testInfo, "assistant-prompt-dialog");
 });
@@ -300,8 +80,15 @@ test("endpoint, model, assistant prompt, options and shortcut persist after relo
   await model.fill("qwen3.5:9b");
   await model.press("Enter");
   await page
-    .getByRole("combobox", { name: "Assistant prompt", exact: true })
+    .getByRole("button", { name: "Edit Selected-text assistant", exact: true })
+    .click();
+  await page
+    .getByRole("combobox", { name: "Profile prompt", exact: true })
     .selectOption("cleanup");
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Save", exact: true })
+    .click();
   await page
     .getByRole("spinbutton", { name: "Temperature (optional)", exact: true })
     .fill("0.3");
@@ -339,9 +126,16 @@ test("endpoint, model, assistant prompt, options and shortcut persist after relo
   await expect(
     page.getByRole("textbox", { name: "Base URL", exact: true }),
   ).toHaveValue("http://127.0.0.1:8080/v1");
+  await page
+    .getByRole("button", { name: "Edit Selected-text assistant", exact: true })
+    .click();
   await expect(
-    page.getByRole("combobox", { name: "Assistant prompt", exact: true }),
+    page.getByRole("combobox", { name: "Profile prompt", exact: true }),
   ).toHaveValue("cleanup");
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Cancel", exact: true })
+    .click();
   await expect(
     page.getByRole("spinbutton", {
       name: "Temperature (optional)",
@@ -395,12 +189,14 @@ test("validation and backend rejection are accessible and preserve persisted val
   ).toBe(5);
   await page.evaluate(() => {
     (window as unknown as HarnessWindow).failCommand =
-      "update_post_process_prompt";
+      "update_processing_profile";
   });
-  await page.getByRole("button", { name: "Edit assistant prompt" }).click();
+  await page
+    .getByRole("button", { name: "Edit Selected-text assistant" })
+    .click();
   await page
     .getByRole("dialog")
-    .getByRole("button", { name: "Save assistant prompt" })
+    .getByRole("button", { name: "Save", exact: true })
     .click();
   await expect(page.getByRole("dialog").getByRole("alert")).toContainText(
     "Could not save",
@@ -718,32 +514,6 @@ for (const backend of ["tauri", "handy_keys"]) {
   });
 }
 
-async function emitKeys(
-  page: Page,
-  key: string,
-  hotkey: string,
-  modifiers: string[] = [],
-) {
-  await page.evaluate(
-    ({ key, hotkey, modifiers }) => {
-      const w = window as unknown as HarnessWindow;
-      w.emitTestEvent("handy-keys-event", {
-        modifiers,
-        key,
-        is_key_down: true,
-        hotkey_string: hotkey,
-      });
-      w.emitTestEvent("handy-keys-event", {
-        modifiers,
-        key,
-        is_key_down: false,
-        hotkey_string: hotkey,
-      });
-    },
-    { key, hotkey, modifiers },
-  );
-}
-
 async function binding(page: Page) {
   return page.evaluate(
     () =>
@@ -816,7 +586,7 @@ for (const backend of ["tauri", "handy_keys"]) {
   }) => {
     await setup(page, backend);
     const shortcut = page.locator(
-      'button[aria-describedby="shortcut-assistant-value"]',
+      'button[aria-describedby~="shortcut-assistant-value"]',
     );
     await shortcut.focus();
     await shortcut.press("Enter");
@@ -1121,39 +891,6 @@ test("cleanup with no paste never claims delivery or unsaved History", async ({
   }
 });
 
-async function defer(page: Page, command: string, fail = false) {
-  await page.evaluate(
-    ({ command, fail }) => {
-      const w = window as unknown as HarnessWindow;
-      w.pendingCommand = command;
-      w.failCommand = fail ? command : undefined;
-      w.releaseCommand = undefined;
-    },
-    { command, fail },
-  );
-}
-
-async function pending(page: Page) {
-  await expect
-    .poll(() =>
-      page.evaluate(
-        () => !!(window as unknown as HarnessWindow).releaseCommand,
-      ),
-    )
-    .toBe(true);
-  expect(await page.evaluate(() => document.activeElement?.tagName)).not.toBe(
-    "BODY",
-  );
-}
-
-async function release(page: Page) {
-  await page.evaluate(() => {
-    const w = window as unknown as HarnessWindow;
-    w.pendingCommand = undefined;
-    w.releaseCommand?.();
-  });
-}
-
 test("async settings and rejected modal Save retain keyboard focus and guard re-entry", async ({
   page,
 }) => {
@@ -1182,27 +919,53 @@ test("async settings and rejected modal Save retain keyboard focus and guard re-
     ),
   ).toBe(1);
 
+  await page
+    .getByRole("button", { name: "Edit Selected-text assistant", exact: true })
+    .press("Enter");
   const select = page.getByRole("combobox", {
-    name: "Assistant prompt",
+    name: "Profile prompt",
     exact: true,
   });
-  await defer(page, "set_assistant_selected_prompt");
   await select.focus();
   await select.selectOption("cleanup");
+  await expect(select).toBeFocused();
+  const firstSave = page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Save", exact: true });
+  await defer(page, "update_processing_profile");
+  await firstSave.focus();
+  await firstSave.press("Enter");
   await pending(page);
-  await expect(select).toBeFocused();
+  await expect(firstSave).toBeFocused();
+  await firstSave.press("Enter");
   await release(page);
-  await expect(select).toHaveAttribute("aria-disabled", "false");
-  await expect(select).toBeFocused();
-
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", {
+      name: "Edit Selected-text assistant",
+      exact: true,
+    }),
+  ).toBeFocused();
+  expect(
+    await page.evaluate(
+      () =>
+        (window as unknown as HarnessWindow).commandCalls.filter(
+          (c) => c === "update_processing_profile",
+        ).length,
+    ),
+  ).toBe(1);
+  await page.evaluate(() => {
+    (window as unknown as HarnessWindow).commandCalls = [];
+  });
   await page
-    .getByRole("button", { name: "Edit assistant prompt" })
+    .getByRole("button", { name: "Edit Selected-text assistant", exact: true })
     .press("Enter");
   const dialog = page.getByRole("dialog");
   const dialogSave = dialog.getByRole("button", {
-    name: "Save assistant prompt",
+    name: "Save",
+    exact: true,
   });
-  await defer(page, "update_post_process_prompt", true);
+  await defer(page, "update_processing_profile", true);
   await dialogSave.focus();
   await dialogSave.press("Enter");
   await pending(page);
@@ -1220,7 +983,7 @@ test("async settings and rejected modal Save retain keyboard focus and guard re-
     await page.evaluate(
       () =>
         (window as unknown as HarnessWindow).commandCalls.filter(
-          (c) => c === "update_post_process_prompt",
+          (c) => c === "update_processing_profile",
         ).length,
     ),
   ).toBe(1);

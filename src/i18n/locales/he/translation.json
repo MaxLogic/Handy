@@ -417,9 +417,6 @@
       }
     },
     "postProcessing": {
-      "hotkey": {
-        "title": "קיצור מקשים"
-      },
       "api": {
         "title": "API (תואם OpenAI)",
         "provider": {
@@ -453,10 +450,8 @@
         }
       },
       "prompts": {
-        "title": "פרומפט",
         "selectedPrompt": {
-          "title": "פרומפט נבחר",
-          "description": "בחר תבנית לשיפור התמלול או צור חדשה. השתמש ב-${output} בתוך טקסט הפרומפט כדי להפנות לתמלול שנקלט."
+          "description": "Choose which prompt to edit in the library. This does not change any profile's prompt."
         },
         "noPrompts": "אין פרומפטים זמינים",
         "selectPrompt": "בחר פרומפט",
@@ -476,17 +471,11 @@
       "assistant": {
         "title": "Selected-text assistant",
         "description": "Uses the provider, model and request options above. Cleanup can be disabled without disabling the assistant.",
-        "prompt": "Assistant prompt",
         "noPrompt": "No assistant prompt selected",
-        "editPrompt": "Edit assistant prompt",
-        "promptRequired": "Enter a prompt name and instructions.",
-        "saveError": "Could not save these settings. Check your settings and try again.",
-        "save": "Save assistant prompt",
-        "sharedPrompt": "Prompts are shared with cleanup. Editing this prompt also changes cleanup if it uses the same prompt."
+        "saveError": "Could not save these settings. Check your settings and try again."
       },
       "requestOptions": {
         "title": "LLM request options",
-        "description": "Shared by cleanup and the assistant. Changes apply to the next recording.",
         "temperature": "Temperature (optional)",
         "max_output_tokens": "Maximum output tokens (optional)",
         "timeout_secs": "Overall timeout (seconds)",
@@ -499,7 +488,82 @@
         "invalidTimeout": "Overall timeout must be a whole number from 1 to 300 seconds.",
         "invalidConnectTimeout": "Connection timeout must be a whole number from 1 to 30 seconds.",
         "connectExceedsOverall": "Connection timeout must not exceed the overall timeout.",
-        "saved": "Saved"
+        "saved": "Saved",
+        "descriptionProfiles": "Shared by all profiles. Changes apply to the next recording."
+      },
+      "profiles": {
+        "title": "Profiles",
+        "builtinName": {
+          "cleanup": "Cleanup"
+        },
+        "intro": "Each profile runs its own prompt and can have its own hotkey. Microphone, speech model, output and sound settings are shared. To translate, create a prompt that names the target language, then a dictation profile that uses it. Cleanup and the selected-text assistant are built in: you can edit them but not delete them. Profile hotkeys work even when Post Processing is off; that switch only controls the Cleanup hotkey.",
+        "kind": {
+          "dictation": "Dictation",
+          "selection_command": "Selection command"
+        },
+        "row": "{{name}}, {{kind}}",
+        "builtinRow": "{{name}}, {{kind}}, built-in",
+        "builtin": "built-in",
+        "edit": "Edit {{name}}",
+        "duplicate": "Duplicate {{name}}",
+        "delete": "Delete {{name}}",
+        "deleteTitle": "Delete {{name}}?",
+        "deleteHelp": "The profile and its hotkey are removed. Prompts are kept.",
+        "deleted": "Profile deleted",
+        "confirmDelete": "Delete profile",
+        "add": {
+          "dictation": "Add dictation profile",
+          "selection_command": "Add selection command profile"
+        },
+        "copyName": "{{name}} (copy)",
+        "save": "Save",
+        "name": "Name",
+        "nameHelp": "Leave blank to use the default name.",
+        "kindLabel": "Kind",
+        "prompt": "Profile prompt",
+        "promptHelp": "Prompts are edited in the Prompts section. One prompt can be used by several profiles.",
+        "model": "Profile model",
+        "defaultModel": "Default model",
+        "modelName": "Profile model name",
+        "baseUrl": "Profile base URL",
+        "baseUrlHelp": "Optional. Leave blank to use the current Custom provider URL.",
+        "speechLanguage": "Speech language",
+        "globalLanguage": "Use the global speech language",
+        "languageHelp": "Applies to this profile only. With Translate to English on, speech is translated to English before this profile's prompt runs.",
+        "notSet": "Not set",
+        "removeHotkey": "Remove {{name}} hotkey",
+        "cleanupOff": "This hotkey is off. In Advanced settings, enable Experimental Features, then turn on Post Processing under Experimental to use it.",
+        "defaultApiHelp": "Default provider and model for every profile that has no model of its own.",
+        "promptToEdit": "Prompt to edit",
+        "usedBy": "Used by: {{names}}",
+        "notUsed": "Not used by any profile.",
+        "promptInUse": "This prompt is used by {{names}}. Choose another prompt for those profiles first.",
+        "unknownUsers": "a profile",
+        "errors": {
+          "not_found": "This profile no longer exists. Close the editor and reload settings.",
+          "name_required": "Enter a profile name.",
+          "name_too_long": "Use a profile name of at most 60 characters.",
+          "name_taken": "A profile already uses that name. Choose a different name.",
+          "profile_limit": "You can create at most 16 custom profiles. Delete a custom profile before adding another.",
+          "prompt_required": "Choose a prompt for this profile.",
+          "prompt_not_found": "This prompt no longer exists. Choose another prompt.",
+          "prompt_in_use": "This prompt is used by a profile. Choose another prompt for that profile first.",
+          "kind_immutable": "The profile kind cannot be changed.",
+          "kind_unsupported": "Selection command profiles are available only on Windows.",
+          "builtin_profile": "Built-in profiles cannot be deleted and their hotkeys cannot be removed. Use Reset to restore the hotkey.",
+          "provider_not_found": "This provider no longer exists. Choose another provider.",
+          "provider_unsupported": "Apple Intelligence is not supported for selection command profiles.",
+          "base_url_not_allowed": "Only the Custom provider supports a profile base URL.",
+          "base_url_invalid": "Enter an HTTP or HTTPS base URL of at most 2048 characters.",
+          "model_required": "Enter a model name of 1 to 256 characters.",
+          "language_invalid": "Choose a valid speech language.",
+          "controls_invalid": "The stored English cleanup controls are invalid. Close this editor and check the profile settings.",
+          "english_cleanup_command": "English cleanup is available only for dictation profiles.",
+          "model_too_long": "Enter a model name of 1 to 256 characters."
+        },
+        "promptLibraryTitle": "Prompts",
+        "noPrompt": "No prompt selected",
+        "hotkey": "Hotkey"
       }
     },
     "history": {
@@ -590,7 +654,7 @@
       },
       "postProcessingToggle": {
         "label": "עיבוד משלים",
-        "description": "הפעל שיפור טקסט מבוסס AI אחרי התמלול"
+        "descriptionProfiles": "Turns the Cleanup hotkey on or off. Other profile hotkeys and the --toggle-post-process command keep working."
       },
       "muteWhileRecording": {
         "label": "השתק בזמן הקלטה",

@@ -11,12 +11,19 @@ import { useSettings } from "../../hooks/useSettings";
 import { useOsType } from "../../hooks/useOsType";
 import { commands } from "@/bindings";
 import { toast } from "sonner";
+import { X } from "lucide-react";
 
 interface GlobalShortcutInputProps {
   descriptionMode?: "inline" | "tooltip";
   grouped?: boolean;
   shortcutId: string;
   disabled?: boolean;
+  label?: string;
+  title?: string;
+  unassignedLabel?: string;
+  onRemove?: () => Promise<void>;
+  removeLabel?: string;
+  describedBy?: string;
 }
 
 export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
@@ -24,6 +31,12 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
   grouped = false,
   shortcutId,
   disabled = false,
+  label,
+  title,
+  unassignedLabel,
+  onRemove,
+  removeLabel,
+  describedBy,
 }) => {
   const { t } = useTranslation();
   const translateRef = useRef(t);
@@ -44,6 +57,34 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
   const [shortcutError, setShortcutError] = useState("");
 
   const bindings = getSetting("bindings") || {};
+  const actionRef = useRef(false);
+  const [actionPending, setActionPending] = useState(false);
+  const changeHotkey = async () => {
+    if (actionRef.current || captureSessionRef.current) return;
+    const retainedFocus = captureRef.current?.contains(document.activeElement);
+    actionRef.current = true;
+    setActionPending(true);
+    setShortcutError("");
+    try {
+      if (onRemove) {
+        await onRemove();
+        if (
+          retainedFocus &&
+          (document.activeElement === document.body ||
+            captureRef.current?.contains(document.activeElement))
+        ) {
+          shortcutRefs.current.get(shortcutId)?.focus();
+        }
+      } else await resetBinding(shortcutId);
+    } catch (error) {
+      setShortcutError(
+        t("settings.general.shortcut.errors.set", { error: String(error) }),
+      );
+    } finally {
+      actionRef.current = false;
+      setActionPending(false);
+    }
+  };
 
   // The session owns its one matching release, including a start still in flight.
   const captureSessionRef = useRef<{
@@ -200,7 +241,10 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
         });
         const newShortcut = sortedKeys.join("+");
 
-        if (editingShortcutId && bindings[editingShortcutId]) {
+        if (
+          editingShortcutId &&
+          (bindings[editingShortcutId] || unassignedLabel)
+        ) {
           try {
             if (
               ["enter", "escape", "tab"].includes(newShortcut.toLowerCase())
@@ -287,12 +331,14 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
     t,
     shortcutId,
     releaseCapture,
+    unassignedLabel,
   ]);
 
   // Start recording a new shortcut
   const startRecording = async (id: string) => {
     setShortcutError("");
     if (
+      actionRef.current ||
       captureSessionRef.current ||
       editingShortcutId === id ||
       disabled ||
@@ -357,7 +403,8 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
   if (isLoading) {
     return (
       <SettingContainer
-        title={t("settings.general.shortcut.title")}
+        title={title ?? t("settings.general.shortcut.title")}
+        titleTag={title ? "p" : "h3"}
         description={t("settings.general.shortcut.description")}
         descriptionMode={descriptionMode}
         grouped={grouped}
@@ -370,10 +417,11 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
   }
 
   // If no bindings are loaded, show empty state
-  if (Object.keys(bindings).length === 0) {
+  if (Object.keys(bindings).length === 0 && !unassignedLabel) {
     return (
       <SettingContainer
-        title={t("settings.general.shortcut.title")}
+        title={title ?? t("settings.general.shortcut.title")}
+        titleTag={title ? "p" : "h3"}
         description={t("settings.general.shortcut.description")}
         descriptionMode={descriptionMode}
         grouped={grouped}
@@ -385,11 +433,22 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
     );
   }
 
-  const binding = bindings[shortcutId];
+  const binding =
+    bindings[shortcutId] ??
+    (unassignedLabel
+      ? {
+          id: shortcutId,
+          name: label ?? shortcutId,
+          description: "",
+          current_binding: "",
+          default_binding: "",
+        }
+      : undefined);
   if (!binding) {
     return (
       <SettingContainer
-        title={t("settings.general.shortcut.title")}
+        title={title ?? t("settings.general.shortcut.title")}
+        titleTag={title ? "p" : "h3"}
         description={t("settings.general.shortcut.notFound")}
         descriptionMode={descriptionMode}
         grouped={grouped}
@@ -402,10 +461,9 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
   }
 
   // Get translated name and description for the binding
-  const translatedName = t(
-    `settings.general.shortcut.bindings.${shortcutId}.name`,
-    binding.name,
-  );
+  const translatedName =
+    label ??
+    t(`settings.general.shortcut.bindings.${shortcutId}.name`, binding.name);
   const translatedDescription = t(
     `settings.general.shortcut.bindings.${shortcutId}.description`,
     binding.description,
@@ -413,7 +471,9 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
 
   return (
     <SettingContainer
-      title={translatedName}
+      title={title ?? translatedName}
+      titleTag={title ? "p" : "h3"}
+      titleId={title ? `shortcut-${shortcutId}-label` : undefined}
       description={translatedDescription}
       descriptionMode={descriptionMode}
       grouped={grouped}
@@ -432,13 +492,20 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
           type="button"
           ref={(ref) => setShortcutRef(shortcutId, ref)}
           aria-label={t("settings.general.shortcut.change", {
-            name: translatedName,
+            name: label ?? translatedName.replace(/\s+shortcut$/i, ""),
           })}
           aria-pressed={editingShortcutId === shortcutId}
-          aria-describedby={`shortcut-${shortcutId}-value`}
+          aria-describedby={[
+            title ? `shortcut-${shortcutId}-label` : "",
+            `shortcut-${shortcutId}-value`,
+            describedBy,
+            shortcutError ? `shortcut-${shortcutId}-error` : "",
+          ]
+            .filter(Boolean)
+            .join(" ")}
           className="px-2 py-1 text-sm font-semibold bg-mid-gray/10 border border-mid-gray/80 rounded-md cursor-pointer hover:border-logo-primary focus-visible:ring-2 focus-visible:ring-logo-primary"
           disabled={disabled}
-          aria-disabled={isUpdating(`binding_${shortcutId}`)}
+          aria-disabled={actionPending || isUpdating(`binding_${shortcutId}`)}
           onClick={() => startRecording(shortcutId)}
         >
           <span
@@ -449,7 +516,9 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
           >
             {editingShortcutId === shortcutId
               ? formatCurrentKeys()
-              : formatKeyCombination(binding.current_binding, osType)}
+              : binding.current_binding
+                ? formatKeyCombination(binding.current_binding, osType)
+                : unassignedLabel}
           </span>
         </button>
         {editingShortcutId === shortcutId && (
@@ -461,16 +530,29 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
             {t("settings.postProcessing.prompts.cancel")}
           </button>
         )}
-        <ResetButton
-          onClick={() => resetBinding(shortcutId)}
-          disabled={disabled || isUpdating(`binding_${shortcutId}`)}
-          ariaLabel={t("settings.general.shortcut.reset", {
-            name: translatedName,
-          })}
-        />
+        {(!onRemove || !!binding.current_binding) && (
+          <ResetButton
+            onClick={() => void changeHotkey()}
+            disabled={disabled}
+            ariaDisabled={actionPending || isUpdating(`binding_${shortcutId}`)}
+            ariaLabel={
+              onRemove
+                ? removeLabel
+                : t("settings.general.shortcut.reset", { name: translatedName })
+            }
+          >
+            {onRemove ? (
+              <X aria-hidden="true" className="h-4 w-4" />
+            ) : undefined}
+          </ResetButton>
+        )}
       </div>
       {shortcutError && (
-        <p role="alert" className="text-sm text-red-500">
+        <p
+          id={`shortcut-${shortcutId}-error`}
+          role="alert"
+          className="text-sm text-red-500"
+        >
           {shortcutError}
         </p>
       )}

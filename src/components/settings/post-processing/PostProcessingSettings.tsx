@@ -1,15 +1,10 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
 import { RefreshCcw } from "lucide-react";
 import { commands } from "@/bindings";
 
 import { Alert } from "../../ui/Alert";
-import {
-  Dropdown,
-  SettingContainer,
-  SettingsGroup,
-  Textarea,
-} from "@/components/ui";
+import { SettingContainer, SettingsGroup, Textarea } from "@/components/ui";
 import { Button } from "../../ui/Button";
 import { ResetButton } from "../../ui/ResetButton";
 import { Input } from "../../ui/Input";
@@ -19,9 +14,10 @@ import { BaseUrlField } from "../PostProcessingSettingsApi/BaseUrlField";
 import { ApiKeyField } from "../PostProcessingSettingsApi/ApiKeyField";
 import { ModelSelect } from "../PostProcessingSettingsApi/ModelSelect";
 import { usePostProcessProviderState } from "../PostProcessingSettingsApi/usePostProcessProviderState";
-import { ShortcutInput } from "../ShortcutInput";
+import { profileDisplayName, BUILTIN_PROFILE_IDS } from "@/lib/profiles";
+import { ProfilesSettings } from "./ProfilesSettings";
 import { useSettings } from "../../../hooks/useSettings";
-import { AssistantSettings, LlmRequestSettings } from "./AssistantSettings";
+import { LlmRequestSettings } from "./LlmRequestSettings";
 
 const PostProcessingSettingsApiComponent: React.FC = () => {
   const { t } = useTranslation();
@@ -158,17 +154,45 @@ const PostProcessingSettingsApiComponent: React.FC = () => {
 
 const PostProcessingSettingsPromptsComponent: React.FC = () => {
   const { t } = useTranslation();
-  const { getSetting, updateSetting, isUpdating, refreshSettings } =
-    useSettings();
+  const { getSetting, refreshSettings } = useSettings();
   const [isCreating, setIsCreating] = useState(false);
   const [draftName, setDraftName] = useState("");
   const [draftText, setDraftText] = useState("");
   const [promptError, setPromptError] = useState("");
 
   const prompts = getSetting("post_process_prompts") || [];
-  const selectedPromptId = getSetting("post_process_selected_prompt_id") || "";
+  const [selectedPromptId, setSelectedPromptId] = useState<string | null>(null);
+  const effectivePromptId =
+    selectedPromptId ??
+    getSetting("post_process_selected_prompt_id") ??
+    prompts[0]?.id ??
+    "";
+  const profiles = getSetting("processing_profiles") ?? [];
+  const usedBy = profiles
+    .filter(
+      (profile) =>
+        (profile.id === BUILTIN_PROFILE_IDS.cleanup
+          ? getSetting("post_process_selected_prompt_id")
+          : profile.id === BUILTIN_PROFILE_IDS.assistant
+            ? getSetting("assistant_selected_prompt_id")
+            : profile.prompt_id) === effectivePromptId,
+    )
+    .map((profile) => profileDisplayName(profile, t))
+    .join(", ");
+  const savingRef = useRef(false);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const createTriggerRef = useRef<HTMLButtonElement>(null);
+  const creationRef = useRef<HTMLDivElement>(null);
+  const returnCreateFocusRef = useRef(false);
+  useLayoutEffect(() => {
+    if (!isCreating && returnCreateFocusRef.current) {
+      returnCreateFocusRef.current = false;
+      createTriggerRef.current?.focus();
+    }
+  }, [isCreating]);
   const selectedPrompt =
-    prompts.find((prompt) => prompt.id === selectedPromptId) || null;
+    prompts.find((prompt) => prompt.id === effectivePromptId) || null;
 
   useEffect(() => {
     if (isCreating) return;
@@ -182,86 +206,83 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
     }
   }, [
     isCreating,
-    selectedPromptId,
+    effectivePromptId,
     selectedPrompt?.name,
     selectedPrompt?.prompt,
   ]);
 
-  const handlePromptSelect = (promptId: string | null) => {
-    if (!promptId) return;
-    updateSetting("post_process_selected_prompt_id", promptId);
-    setIsCreating(false);
-  };
-
-  const handleCreatePrompt = async () => {
-    if (!draftName.trim() || !draftText.trim()) return;
-
+  const perform = async (action: () => Promise<void>, inUse = false) => {
+    if (savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    setSaved(false);
+    setPromptError("");
     try {
-      setPromptError("");
+      await action();
+      await refreshSettings();
+      setSaved(true);
+    } catch (error) {
+      setPromptError(
+        inUse && String(error) === "prompt_in_use"
+          ? t("settings.postProcessing.profiles.promptInUse", {
+              names:
+                usedBy || t("settings.postProcessing.profiles.unknownUsers"),
+            })
+          : t("settings.postProcessing.assistant.saveError"),
+      );
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  };
+  const handleCreatePrompt = () => {
+    if (!draftName.trim() || !draftText.trim()) return;
+    return perform(async () => {
       const result = await commands.addPostProcessPrompt(
         draftName.trim(),
         draftText.trim(),
       );
-      if (result.status === "error") throw new Error(result.error);
-      if (result.status === "ok") {
-        await refreshSettings();
-        updateSetting("post_process_selected_prompt_id", result.data.id);
-        setIsCreating(false);
-      }
-    } catch (error) {
-      console.error("Failed to create prompt:", error);
-      setPromptError(t("settings.postProcessing.assistant.saveError"));
-    }
+      if (result.status === "error") throw result.error;
+      setSelectedPromptId(result.data.id);
+      returnCreateFocusRef.current = !!creationRef.current?.contains(
+        document.activeElement,
+      );
+      setIsCreating(false);
+    });
   };
-
-  const handleUpdatePrompt = async () => {
-    if (!selectedPromptId || !draftName.trim() || !draftText.trim()) return;
-
-    try {
-      setPromptError("");
+  const handleUpdatePrompt = () => {
+    if (!effectivePromptId || !draftName.trim() || !draftText.trim()) return;
+    return perform(async () => {
       const result = await commands.updatePostProcessPrompt(
-        selectedPromptId,
+        effectivePromptId,
         draftName.trim(),
         draftText.trim(),
       );
-      if (result.status === "error") throw new Error(result.error);
-      await refreshSettings();
-    } catch (error) {
-      console.error("Failed to update prompt:", error);
-      setPromptError(t("settings.postProcessing.assistant.saveError"));
-    }
+      if (result.status === "error") throw result.error;
+    });
   };
-
-  const handleDeletePrompt = async (promptId: string) => {
-    if (!promptId) return;
-
-    try {
-      setPromptError("");
-      const result = await commands.deletePostProcessPrompt(promptId);
-      if (result.status === "error") throw new Error(result.error);
-      await refreshSettings();
-      setIsCreating(false);
-    } catch (error) {
-      console.error("Failed to delete prompt:", error);
-      setPromptError(t("settings.postProcessing.assistant.saveError"));
-    }
-  };
-
-  const handleCancelCreate = () => {
-    setIsCreating(false);
-    if (selectedPrompt) {
-      setDraftName(selectedPrompt.name);
-      setDraftText(selectedPrompt.prompt);
-    } else {
-      setDraftName("");
-      setDraftText("");
-    }
-  };
+  const handleDeletePrompt = () =>
+    perform(async () => {
+      const result = await commands.deletePostProcessPrompt(effectivePromptId);
+      if (result.status === "error") throw result.error;
+      setSelectedPromptId(null);
+    }, true);
 
   const handleStartCreate = () => {
+    if (savingRef.current || isCreating) return;
+    setPromptError("");
+    setSaved(false);
     setIsCreating(true);
     setDraftName("");
     setDraftText("");
+  };
+
+  const handleCancelCreate = () => {
+    if (savingRef.current) return;
+    returnCreateFocusRef.current = true;
+    setIsCreating(false);
+    setDraftName(selectedPrompt?.name ?? "");
+    setDraftText(selectedPrompt?.prompt ?? "");
   };
 
   const hasPrompts = prompts.length > 0;
@@ -272,7 +293,7 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
 
   return (
     <SettingContainer
-      title={t("settings.postProcessing.prompts.selectedPrompt.title")}
+      title={t("settings.postProcessing.profiles.promptToEdit")}
       description={t(
         "settings.postProcessing.prompts.selectedPrompt.description",
       )}
@@ -282,41 +303,62 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
     >
       <div className="space-y-3">
         {promptError && (
-          <p role="alert" className="text-sm text-red-500">
+          <p
+            id="prompt-library-error"
+            role="alert"
+            className="text-sm text-red-500"
+          >
             {promptError}
           </p>
         )}
         <div className="flex gap-2 min-w-0">
-          <Dropdown
-            ariaLabel={t(
-              "settings.postProcessing.prompts.selectedPrompt.title",
-            )}
-            selectedValue={selectedPromptId || null}
-            options={prompts.map((p) => ({
-              value: p.id,
-              label: p.name,
-            }))}
-            onSelect={(value) => handlePromptSelect(value)}
-            placeholder={
-              prompts.length === 0
-                ? t("settings.postProcessing.prompts.noPrompts")
-                : t("settings.postProcessing.prompts.selectPrompt")
+          <select
+            aria-label={t("settings.postProcessing.profiles.promptToEdit")}
+            aria-disabled={saving || isCreating}
+            aria-describedby={
+              promptError ? "prompt-library-error" : "prompt-used-by"
             }
-            disabled={
-              isUpdating("post_process_selected_prompt_id") || isCreating
-            }
-            className="flex-1 min-w-0"
-          />
+            value={effectivePromptId}
+            onChange={(e) => {
+              if (!savingRef.current && !isCreating) {
+                setSelectedPromptId(e.target.value);
+                setPromptError("");
+                setSaved(false);
+              }
+            }}
+            className="flex-1 min-w-0 rounded-md border border-mid-gray/80 bg-mid-gray/10 px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-logo-primary"
+          >
+            {prompts.map((prompt) => (
+              <option key={prompt.id} value={prompt.id}>
+                {prompt.name}
+              </option>
+            ))}
+          </select>
           <Button
+            ref={createTriggerRef}
             onClick={handleStartCreate}
             variant="primary"
             size="md"
-            disabled={isCreating}
+            aria-disabled={isCreating || saving}
             className="shrink-0"
           >
             {t("settings.postProcessing.prompts.createNew")}
           </Button>
         </div>
+
+        <p id="prompt-used-by" className="text-sm text-mid-gray">
+          {usedBy
+            ? t("settings.postProcessing.profiles.usedBy", { names: usedBy })
+            : t("settings.postProcessing.profiles.notUsed")}
+        </p>
+        <p
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          className="text-sm"
+        >
+          {saved ? t("settings.postProcessing.requestOptions.saved") : ""}
+        </p>
 
         {!isCreating && hasPrompts && selectedPrompt && (
           <div className="space-y-3">
@@ -331,6 +373,11 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
                 id="cleanup-prompt-name"
                 type="text"
                 value={draftName}
+                readOnly={saving}
+                aria-disabled={saving}
+                aria-describedby={
+                  promptError ? "prompt-library-error" : undefined
+                }
                 onChange={(e) => setDraftName(e.target.value)}
                 placeholder={t(
                   "settings.postProcessing.prompts.promptLabelPlaceholder",
@@ -349,6 +396,11 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
               <Textarea
                 id="cleanup-prompt-text"
                 value={draftText}
+                readOnly={saving}
+                aria-disabled={saving}
+                aria-describedby={
+                  promptError ? "prompt-library-error" : undefined
+                }
                 onChange={(e) => setDraftText(e.target.value)}
                 placeholder={t(
                   "settings.postProcessing.prompts.promptInstructionsPlaceholder",
@@ -364,18 +416,29 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
 
             <div className="flex gap-2 pt-2">
               <Button
-                onClick={handleUpdatePrompt}
+                onClick={() => {
+                  if (isDirty) void handleUpdatePrompt();
+                }}
                 variant="primary"
                 size="md"
-                disabled={!draftName.trim() || !draftText.trim() || !isDirty}
+                aria-disabled={
+                  saving || !draftName.trim() || !draftText.trim() || !isDirty
+                }
               >
                 {t("settings.postProcessing.prompts.updatePrompt")}
               </Button>
               <Button
-                onClick={() => handleDeletePrompt(selectedPromptId)}
+                onClick={() => {
+                  if (prompts.length > 1) void handleDeletePrompt();
+                }}
                 variant="secondary"
                 size="md"
-                disabled={!selectedPromptId || prompts.length <= 1}
+                aria-disabled={
+                  saving || !effectivePromptId || prompts.length <= 1
+                }
+                aria-describedby={
+                  promptError ? "prompt-library-error" : undefined
+                }
               >
                 {t("settings.postProcessing.prompts.deletePrompt")}
               </Button>
@@ -394,7 +457,7 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
         )}
 
         {isCreating && (
-          <div className="space-y-3">
+          <div ref={creationRef} className="space-y-3">
             <div className="space-y-2 block flex flex-col">
               <label
                 htmlFor="cleanup-prompt-name"
@@ -406,6 +469,11 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
                 id="cleanup-prompt-name"
                 type="text"
                 value={draftName}
+                readOnly={saving}
+                aria-disabled={saving}
+                aria-describedby={
+                  promptError ? "prompt-library-error" : undefined
+                }
                 onChange={(e) => setDraftName(e.target.value)}
                 placeholder={t(
                   "settings.postProcessing.prompts.promptLabelPlaceholder",
@@ -424,6 +492,11 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
               <Textarea
                 id="cleanup-prompt-text"
                 value={draftText}
+                readOnly={saving}
+                aria-disabled={saving}
+                aria-describedby={
+                  promptError ? "prompt-library-error" : undefined
+                }
                 onChange={(e) => setDraftText(e.target.value)}
                 placeholder={t(
                   "settings.postProcessing.prompts.promptInstructionsPlaceholder",
@@ -442,7 +515,7 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
                 onClick={handleCreatePrompt}
                 variant="primary"
                 size="md"
-                disabled={!draftName.trim() || !draftText.trim()}
+                aria-disabled={saving || !draftName.trim() || !draftText.trim()}
               >
                 {t("settings.postProcessing.prompts.createPrompt")}
               </Button>
@@ -476,22 +549,19 @@ export const PostProcessingSettings: React.FC = () => {
 
   return (
     <div className="max-w-3xl w-full mx-auto space-y-6">
-      <SettingsGroup title={t("settings.postProcessing.hotkey.title")}>
-        <ShortcutInput
-          shortcutId="transcribe_with_post_process"
-          descriptionMode="tooltip"
-          grouped={true}
-        />
-      </SettingsGroup>
-
+      <ProfilesSettings />
       <SettingsGroup title={t("settings.postProcessing.api.title")}>
+        <p className="px-4 py-3 text-sm text-mid-gray">
+          {t("settings.postProcessing.profiles.defaultApiHelp")}
+        </p>
         <PostProcessingSettingsApi />
       </SettingsGroup>
 
-      <SettingsGroup title={t("settings.postProcessing.prompts.title")}>
+      <SettingsGroup
+        title={t("settings.postProcessing.profiles.promptLibraryTitle")}
+      >
         <PostProcessingSettingsPrompts />
       </SettingsGroup>
-      <AssistantSettings />
       <LlmRequestSettings />
     </div>
   );
