@@ -12,6 +12,7 @@ mod clipboard;
 mod commands;
 mod dictation_timing;
 pub mod engine_supervisor;
+mod fork_identity;
 mod helpers;
 mod input;
 mod llm_client;
@@ -29,6 +30,7 @@ mod signal_handle;
 mod transcription_coordinator;
 mod tray;
 mod tray_i18n;
+mod upstream_import;
 mod utils;
 
 pub use cli::CliArgs;
@@ -721,6 +723,10 @@ pub fn run(cli_args: CliArgs) {
             commands::cancel_operation,
             commands::is_portable,
             commands::is_update_checks_locked,
+            commands::upstream_import::get_upstream_import_offer,
+            commands::upstream_import::run_upstream_import,
+            commands::upstream_import::cancel_upstream_import,
+            commands::upstream_import::decline_upstream_import,
             commands::get_app_dir_path,
             commands::get_app_settings,
             commands::get_default_settings,
@@ -882,7 +888,6 @@ pub fn run(cli_args: CliArgs) {
     let mut app = builder
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_macos_permissions::init())
@@ -903,6 +908,13 @@ pub fn run(cli_args: CliArgs) {
             );
 
             specta_builder.mount_events(app);
+
+            log::info!(
+                "{} ({})",
+                fork_identity::PRODUCT_NAME,
+                app.config().identifier
+            );
+            debug_assert_eq!(app.config().identifier, fork_identity::IDENTIFIER);
 
             // Headless one-shot path (`--transcribe-file` / `--list-devices` /
             // `--list-models`): initialize only what transcription needs — the
@@ -949,7 +961,7 @@ pub fn run(cli_args: CliArgs) {
             // for portable mode (redirects WebView2 cache to portable Data dir)
             let mut win_builder =
                 tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("/".into()))
-                    .title("Handy")
+                    .title(fork_identity::PRODUCT_NAME)
                     .inner_size(680.0, 570.0)
                     .min_inner_size(680.0, 570.0)
                     .resizable(true)
@@ -1167,12 +1179,21 @@ mod bindings_export_tests {
             .register::<super::assistant::RecoveryPart>();
         types
     }
-    #[test]
-    fn assistant_binding_type_declarations_match_real_specta_export() {
+    fn upstream_import_types() -> specta::TypeCollection {
+        let mut types = specta::TypeCollection::default();
+        types
+            .register::<super::upstream_import::UpstreamImportOffer>()
+            .register::<super::upstream_import::UpstreamImportChoice>()
+            .register::<super::upstream_import::UpstreamImportReport>();
+        types
+    }
+    /// Compare each exported declaration with the hand-merged `bindings.ts`
+    /// and return how many were compared.
+    fn compare_with_bindings(types: &specta::TypeCollection) -> usize {
         let expected = super::Typescript::default()
             .bigint(super::BigIntExportBehavior::Number)
-            .export(&assistant_types())
-            .expect("export assistant types");
+            .export(types)
+            .expect("export types");
         let bindings = include_str!("../../src/bindings.ts");
         let canonical = |text: &str| {
             text.chars()
@@ -1180,9 +1201,10 @@ mod bindings_export_tests {
                 .collect::<String>()
         };
         let mut compared = 0;
+        // A declaration may be preceded by its JSDoc block.
         for declaration in expected
             .split("\n\n")
-            .filter(|s| s.starts_with("export type "))
+            .filter_map(|s| s.find("export type ").map(|start| &s[start..]))
         {
             let (name, body) = declaration
                 .strip_prefix("export type ")
@@ -1205,7 +1227,35 @@ mod bindings_export_tests {
             );
             compared += 1;
         }
-        assert_eq!(compared, 8, "all public assistant types were compared");
+        compared
+    }
+    #[test]
+    fn assistant_binding_type_declarations_match_real_specta_export() {
+        assert_eq!(
+            compare_with_bindings(&assistant_types()),
+            8,
+            "all public assistant types were compared"
+        );
+    }
+    #[test]
+    fn upstream_import_binding_types_match_real_specta_export() {
+        assert_eq!(
+            compare_with_bindings(&upstream_import_types()),
+            4,
+            "offer, choice, report and failure types were compared"
+        );
+    }
+    #[test]
+    #[ignore = "Explicitly exports upstream import API types without starting the application"]
+    fn export_upstream_import_typescript_bindings() {
+        super::Typescript::default()
+            .bigint(super::BigIntExportBehavior::Number)
+            .export_to(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../.agents/slices/HANDY-007/upstream-import-types.ts"),
+                &upstream_import_types(),
+            )
+            .expect("export upstream import TypeScript types");
     }
     #[test]
     #[ignore = "Explicitly exports assistant API types without starting the application"]

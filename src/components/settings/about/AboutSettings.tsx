@@ -77,6 +77,20 @@ export const AboutSettings: React.FC = () => {
           </Button>
         </SettingContainer>
 
+        <SettingContainer
+          title={t("settings.about.fork.title")}
+          description={t("settings.about.fork.description")}
+          grouped={true}
+        >
+          <Button
+            variant="secondary"
+            size="md"
+            onClick={() => openUrl("https://github.com/MaxLogic/Handy")}
+          >
+            {t("settings.about.fork.button")}
+          </Button>
+        </SettingContainer>
+
         <AppDataDirectory descriptionMode="tooltip" grouped={true} />
         <LogDirectory grouped={true} />
       </SettingsGroup>

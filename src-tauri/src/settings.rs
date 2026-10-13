@@ -1385,15 +1385,18 @@ fn apply_settings_migrations(
 
 /// Update checks are forced off (without touching the persisted setting) when
 /// `HANDY_DISABLE_UPDATER` is set — e.g. by the Nix package, since self-update
-/// can't work against an immutable /nix/store install.
+/// can't work against an immutable /nix/store install — and always in the
+/// Handy MaxLogic fork build, which must never update itself to upstream.
 pub fn update_checks_forced_disabled() -> bool {
     use std::sync::OnceLock;
     static IS_UPDATER_DISABLED: OnceLock<bool> = OnceLock::new();
-    *IS_UPDATER_DISABLED.get_or_init(|| utils::env_flag_enabled("HANDY_DISABLE_UPDATER"))
+    *IS_UPDATER_DISABLED.get_or_init(|| {
+        crate::fork_identity::UPDATER_DISABLED || utils::env_flag_enabled("HANDY_DISABLE_UPDATER")
+    })
 }
 
 /// Effective updater state: the user's stored preference, overridden to `false`
-/// while `HANDY_DISABLE_UPDATER` is set. Callers deciding whether to actually
+/// while update checks are forced off. Callers deciding whether to actually
 /// check for updates must use this rather than reading `update_checks_enabled`
 /// directly, so the forced-off state never leaks into the persisted setting.
 pub fn update_checks_effectively_enabled(settings: &AppSettings) -> bool {

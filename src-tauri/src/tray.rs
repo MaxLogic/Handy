@@ -444,11 +444,7 @@ pub fn tray_tooltip() -> String {
 }
 
 fn version_label() -> String {
-    if cfg!(debug_assertions) {
-        format!("Handy v{} (Dev)", env!("CARGO_PKG_VERSION"))
-    } else {
-        format!("Handy v{}", env!("CARGO_PKG_VERSION"))
-    }
+    crate::fork_identity::version_label(env!("CARGO_PKG_VERSION"), cfg!(debug_assertions))
 }
 
 /// Builds the tray menu and tooltip for the given inputs. Pure with respect
@@ -572,8 +568,9 @@ fn build_menu(app: &AppHandle, inputs: &MenuInputs) -> tauri::Result<(Menu<tauri
         )?
     };
 
-    // When update checks are forced off (e.g. HANDY_DISABLE_UPDATER, set by
-    // the Nix package), the item is dropped from the menu rather than shown
+    // When update checks are forced off (always in the fork build; otherwise
+    // by HANDY_DISABLE_UPDATER, set by the Nix package), the item is dropped
+    // from the menu rather than shown
     // disabled — it can never do anything in that case, and a disabled item
     // still shifts every entry below it by one position. A manually-disabled
     // toggle in Debug Settings keeps the old greyed-out behavior via the

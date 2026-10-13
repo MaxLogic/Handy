@@ -6,6 +6,48 @@
 
 Handy is a cross-platform desktop application that provides simple, privacy-focused speech transcription. Press a shortcut, speak, and have your words appear in any text field. This happens on your own computer without sending any information to the cloud.
 
+## Handy MaxLogic (personal fork)
+
+This repository is also the source of **Handy MaxLogic**, a personal Windows build of Handy by CJ Pais and contributors, used under the [MIT license](LICENSE). The fork lives at [MaxLogic/Handy](https://github.com/MaxLogic/Handy); upstream is [cjpais/Handy](https://github.com/cjpais/Handy). It adds raw/cleanup/assistant workflow modes, processing profiles and English cleanup routing, and keeps everything else from upstream.
+
+### Identity, data and updates
+
+- Name `Handy MaxLogic`, identifier `eu.maxlogic.handy`. Settings, models, history and logs are separate from upstream Handy (`com.pais.handy`), and both apps can run at the same time. Both use the same default global shortcuts through low-level keyboard hooks, so with both running one key press records and pastes twice: close the original Handy or change its shortcuts before using Handy MaxLogic.
+- The only package is a portable folder (no installer). The `portable` marker next to `handy-maxlogic.exe` keeps all data in `Data\` inside that folder. Build it with `scripts/package-portable.ps1` (see [BUILD.md](BUILD.md#portable-package-handy-maxlogic)).
+- Updates are disabled: no update endpoint, no update check, no updater artifacts, and the updater plugin is not built. To upgrade, replace everything in the folder except `Data\`.
+- First run: when `%APPDATA%\com.pais.handy` exists, Handy MaxLogic asks whether to copy settings (with shortcuts, prompts, profiles and custom sounds), speech model files and, optionally, history and recordings into its own data folder. Upstream data is only read. Model files are copied, not linked, and the dialog shows how much will be copied. Imported settings go through the normal migrations, including the settings schema 5 profile migration. Restart the app after importing. `history.db` is copied through SQLite's backup API; a history database from a newer Handy than this build supports is refused. The choices: Import, Not now (asked again on the next start) and Don't import (final). An import with failed items (for example a `history.db` locked by the running original Handy) records nothing and is offered again on the next start; models already copied are kept and skipped. When the fork already has its own settings or history (for example on such a repeated offer), those choices start unchecked and say what they would replace. Links to folders inside upstream `models\` are not followed or copied; the result lists them. An upstream _portable_ install is not detected; copy its `Data\` files by hand.
+- Where the rest of this README mentions `com.pais.handy` (for example, manual model installation), the fork uses its `Data\` folder instead, or `%APPDATA%\eu.maxlogic.handy` when the `portable` marker is removed.
+
+### Supported targets and limitations
+
+- Supported: Windows 11 x64 with NVDA and keyboard-only use, overlay set to None. macOS and Linux code from upstream is kept but not built, packaged or tested for the fork.
+- Text targets for cleanup and the selected-text assistant are listed in the native proof matrix (`spec.md`): standard Win32 edit controls, Chromium/Electron fields, browser textarea/contenteditable and an IDE/editor. Terminals are a compatibility probe only; when the selection cannot be proved, the assistant refuses without changing text. Results are recorded per target during manual acceptance; nothing is claimed here until that record exists.
+- The executable is not code-signed, so SmartScreen may warn on first start.
+- Autostart registers the current executable path. Re-enable it after moving the folder.
+- The app icons are upstream's.
+- Recovery: back up `Data\settings_store.json` before trying an older build. Older builds salvage unknown fields and may drop newer ones, such as profiles. `history.db` stays at upstream's schema 4, so older builds can open it.
+
+### Local configuration (RTX 3090)
+
+Speech: model `turbo` (Whisper Large v3 Turbo), GPU acceleration on the RTX 3090 Vulkan device, model unload timeout `Never`, overlay `None`, short or custom start/stop cues.
+
+LLM servers are llama.cpp instances started by `C:\models\commands\start-*.cmd` (stop with `stop-*.cmd`; see `C:\models\commands\README.txt`). They run hidden, stay loaded and do not start at login.
+
+| Port | API base URL               | Model name                       | Use                                             | Context |
+| ---- | -------------------------- | -------------------------------- | ----------------------------------------------- | ------- |
+| 8080 | `http://127.0.0.1:8080/v1` | `qwen3.5:9b` (Qwen3.5-9B Q4_K_M) | Default cleanup and assistant                   | 16384   |
+| 8081 | `http://127.0.0.1:8081/v1` | `qwen3.5:4b` (Qwen3.5-4B Q4_K_M) | Faster alternative, as a profile model override | 16384   |
+| 8082 | `http://127.0.0.1:8082/v1` | `S1-mini`                        | English cleanup (thinking off, temperature 0)   | 4096    |
+
+In Handy MaxLogic: Post Process provider **Custom** with base URL `http://127.0.0.1:8080/v1` and model `qwen3.5:9b`. English cleanup uses base URL `http://127.0.0.1:8082/v1` and model `S1-mini`. A profile can override its model with `http://127.0.0.1:8081/v1` and `qwen3.5:4b`. Each server has one request slot. Before relying on a model, check its availability and reasoning behavior against the running server, and measure VRAM with speech and LLM models loaded together. Timing measurement is described in [docs/dictation-timing.md](docs/dictation-timing.md).
+
+### Deferred
+
+- A separate arbitrary-language speech translation hotkey. Translation through a selected-text instruction works today.
+- Integrations for additional custom editors and terminals.
+- Installer packages, code signing, distinct icons, and macOS/Linux fork builds.
+- Importing from an upstream portable install, or offering the import again after a decision.
+
 ## Why Handy?
 
 Handy was created to fill the gap for a truly open source, extensible speech-to-text tool. As stated on [handy.computer](https://handy.computer):

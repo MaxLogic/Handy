@@ -116,6 +116,24 @@ bun run tauri build
 
 This compiles a release binary and generates platform-specific bundles (deb, rpm, AppImage on Linux; dmg on macOS; msi on Windows).
 
+In the Handy MaxLogic fork, bundling is disabled (`bundle.active: false` in `tauri.conf.json`), so this command only compiles the release executable. Use the portable package script below.
+
+### Portable package (Handy MaxLogic)
+
+The fork ships only as a portable Windows x64 folder. From PowerShell 7 in the repository root:
+
+```powershell
+pwsh -File scripts/package-portable.ps1
+```
+
+The script:
+
+1. Runs `bun run tauri build --no-bundle`. It needs the Windows prerequisites above and `src-tauri/resources/models/silero_vad_v4.onnx` (see Model Setup in `AGENTS.md`). When `cmake` is not on `PATH`, it uses the CMake bundled with Visual Studio.
+2. Assembles `artifacts/portable/Handy MaxLogic/` with `handy-maxlogic.exe`, the DLLs next to the built executable (transcribe-cpp/ggml and ONNX Runtime's `DirectML.dll`) and in `src-tauri/transcribe-libs`, the app-local VC++ runtime when the Visual Studio redistributables are found, `resources/`, the `portable` marker (`Handy Portable Mode`), `README-portable.txt` and `LICENSE`. It fails if any DLL imported by the packaged binaries is neither in the folder nor in `System32` (checked with `dumpbin` from the Visual Studio C++ tools; without `dumpbin` the script fails unless `-SkipDllCheck` is given).
+3. Zips the folder to `artifacts/portable/Handy-MaxLogic-<version>-<commit>[-dirty]-portable-x64.zip` and prints its size and SHA-256, the executable's SHA-256, the source commit, and a hash of `git diff HEAD --binary` when the tree has changes.
+
+Options: `-OutputDir <dir>`, `-CargoTargetDir <dir>` (separate Cargo target directory, for example to avoid locking the debug target), `-SkipBuild` (package an existing release build), `-SkipDllCheck` (package without the DLL import check). The script never starts the application. No installer, updater artifact or signature is produced.
+
 ## Linux Install (from source)
 
 The raw binary (`src-tauri/target/release/handy`) cannot run standalone — it needs Tauri resource files (tray icons, sounds, VAD model) to be co-located at the expected path.

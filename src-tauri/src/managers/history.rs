@@ -40,6 +40,12 @@ static MIGRATIONS: &[M] = &[
 /// its profile with it. A future migration must not add these names.
 const PROFILE_COLUMNS: [&str; 2] = ["profile_id", "profile_name"];
 
+/// Highest history schema (`user_version`) this build can open. A newer
+/// database would make startup fail in the migration step.
+pub fn supported_schema_version() -> usize {
+    MIGRATIONS.len()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
 pub struct PaginatedHistory {
     pub entries: Vec<HistoryEntry>,

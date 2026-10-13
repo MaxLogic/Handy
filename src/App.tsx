@@ -28,9 +28,11 @@ import { Sidebar, SidebarSection, SECTIONS_CONFIG } from "./components/Sidebar";
 import { WhatsNewGate } from "./components/whats-new";
 import { useSettings } from "./hooks/useSettings";
 import { useSettingsStore } from "./stores/settingsStore";
-import { commands } from "@/bindings";
+import { commands, type UpstreamImportOffer } from "@/bindings";
 import { getLanguageDirection, initializeRTL } from "@/lib/utils/rtl";
 import { WorkflowNotice } from "./components/settings/WorkflowNotice";
+import { UpstreamImportDialog } from "./components/upstream-import/UpstreamImportDialog";
+import { focusNextScreen } from "./components/upstream-import/focusNextScreen";
 
 type OnboardingStep = "accessibility" | "model" | "done";
 
@@ -60,6 +62,10 @@ function App() {
   // Track if this is a returning user who just needs to grant permissions
   // (vs a new user who needs full onboarding including model selection)
   const [isReturningUser, setIsReturningUser] = useState(false);
+  // One-time offer to copy upstream Handy data; shown before onboarding.
+  const [importOffer, setImportOffer] = useState<UpstreamImportOffer | null>(
+    null,
+  );
   const [currentSection, setCurrentSection] =
     useState<SidebarSection>("general");
   const { settings, updateSetting } = useSettings();
@@ -228,8 +234,20 @@ function App() {
     }
   };
 
-  const checkOnboardingStatus = async () => {
+  const checkOnboardingStatus = async (importOfferHandled = false) => {
     try {
+      const offer = importOfferHandled
+        ? null
+        : await commands.getUpstreamImportOffer().catch((e) => {
+            console.warn("Failed to check for upstream Handy data:", e);
+            return null;
+          });
+      if (offer) {
+        await revealMainWindowForPermissions();
+        setImportOffer(offer);
+        return;
+      }
+
       const settingsResult = await commands.getAppSettings();
       const hasCompletedOnboarding =
         settingsResult.status === "ok" &&
@@ -319,6 +337,24 @@ function App() {
       }}
     />
   );
+
+  if (importOffer) {
+    return (
+      <>
+        {toaster}
+        <div dir={direction} className="h-screen" />
+        <UpstreamImportDialog
+          offer={importOffer}
+          onClose={() => {
+            // Not now must not bring the offer straight back in this session.
+            setImportOffer(null);
+            focusNextScreen();
+            void checkOnboardingStatus(true);
+          }}
+        />
+      </>
+    );
+  }
 
   // Still checking onboarding status
   if (onboardingStep === null) {

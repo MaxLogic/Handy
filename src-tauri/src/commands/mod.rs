@@ -4,6 +4,7 @@ pub mod history;
 pub mod models;
 pub mod profiles;
 pub mod transcription;
+pub mod upstream_import;
 
 use crate::settings::{
     get_settings, update_checks_forced_disabled, write_settings, AppSettings, LogLevel,

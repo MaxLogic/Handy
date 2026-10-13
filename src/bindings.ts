@@ -629,6 +629,28 @@ async isPortable() : Promise<boolean> {
 async isUpdateChecksLocked() : Promise<boolean> {
     return await TAURI_INVOKE("is_update_checks_locked");
 },
+async getUpstreamImportOffer() : Promise<UpstreamImportOffer | null> {
+    return await TAURI_INVOKE("get_upstream_import_offer");
+},
+async runUpstreamImport(choice: UpstreamImportChoice) : Promise<Result<UpstreamImportReport, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("run_upstream_import", { choice }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async cancelUpstreamImport() : Promise<void> {
+    await TAURI_INVOKE("cancel_upstream_import");
+},
+async declineUpstreamImport() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("decline_upstream_import") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async getAppDirPath() : Promise<Result<string, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_app_dir_path") };
@@ -1370,6 +1392,30 @@ export type StreamWorkKind = "transcribing" | "polishing"
 export type Theme = "system" | "light" | "dark"
 export type TranscribeAcceleratorSetting = "auto" | "cpu" | "gpu"
 export type TypingTool = "auto" | "wtype" | "kwtype" | "dotool" | "ydotool" | "xdotool"
+
+export type UpstreamImportChoice = { settings: boolean; models: boolean; history: boolean }
+
+export type UpstreamImportFailure = { item: string; error: string }
+
+/**
+ * What upstream data exists and what importing it would replace.
+ */
+export type UpstreamImportOffer = { source_dir: string; destination_dir: string; settings_available: boolean;
+/**
+ * The fork already completed onboarding; importing settings replaces them.
+ */
+replaces_settings: boolean;
+/**
+ * Model entries not yet present in the destination.
+ */
+model_count: number; model_bytes: number; history_available: boolean; history_bytes: number;
+/**
+ * The fork already has history entries; importing history replaces them.
+ */
+replaces_history: boolean }
+
+export type UpstreamImportReport = { settings_imported: boolean; models_copied: number; models_skipped: number; history_imported: boolean; bytes_copied: number; cancelled: boolean; failures: UpstreamImportFailure[]; skipped_links: string[] }
+
 export type VadBackend = "silero" | "earshot"
 export type WindowsMicrophonePermissionStatus = { supported: boolean; overall_access: PermissionAccess; device_access: PermissionAccess; app_access: PermissionAccess; desktop_app_access: PermissionAccess }
 

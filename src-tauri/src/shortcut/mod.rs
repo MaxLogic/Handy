@@ -1178,9 +1178,7 @@ pub fn change_autostart_setting(app: AppHandle, enabled: bool) -> Result<(), Str
 #[specta::specta]
 pub fn change_update_checks_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
     if settings::update_checks_forced_disabled() {
-        return Err(
-            "Update checks are disabled by system configuration (HANDY_DISABLE_UPDATER)".into(),
-        );
+        return Err("Update checks are disabled in this build or by HANDY_DISABLE_UPDATER".into());
     }
 
     let mut settings = settings::get_settings(&app);

@@ -19,6 +19,11 @@ export type HarnessWindow = Window & {
   pendingCommand?: string;
   releaseCommand?: () => void;
   commandCalls: string[];
+  /** Optional per-spec responder installed by an earlier init script. */
+  commandHook?: (
+    command: string,
+    args: Record<string, unknown>,
+  ) => { value: unknown } | { error: unknown } | undefined;
 };
 
 export async function screenshot(
@@ -39,6 +44,7 @@ export async function setup(
   page: Page,
   keyboard = "tauri",
   overrides: AppSettings & { omitProfiles?: boolean } = {},
+  openSection: string | null = "Post Process",
 ) {
   await page.addInitScript(
     ({ keyboard, overrides }) => {
@@ -190,6 +196,9 @@ export async function setup(
             });
           if (command === w.failCommand)
             throw w.failCode ?? "fixture rejected setting";
+          const hooked = w.commandHook?.(command, args);
+          if (hooked && "error" in hooked) throw hooked.error;
+          if (hooked) return hooked.value;
           if (command === "plugin:event|listen") {
             const event = String(args.event);
             (listeners[event] ??= []).push(Number(args.handler));
@@ -377,7 +386,8 @@ export async function setup(
     { keyboard, overrides },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Post Process", exact: true }).click();
+  if (openSection)
+    await page.getByRole("button", { name: openSection, exact: true }).click();
 }
 
 export async function emitKeys(
