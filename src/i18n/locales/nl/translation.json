@@ -557,13 +557,38 @@
           "base_url_invalid": "Enter an HTTP or HTTPS base URL of at most 2048 characters.",
           "model_required": "Enter a model name of 1 to 256 characters.",
           "language_invalid": "Choose a valid speech language.",
-          "controls_invalid": "The stored English cleanup controls are invalid. Close this editor and check the profile settings.",
+          "controls_invalid": "Fix the profile styling, structure and context fields, then save again.",
           "english_cleanup_command": "English cleanup is available only for dictation profiles.",
           "model_too_long": "Enter a model name of 1 to 256 characters."
         },
         "promptLibraryTitle": "Prompts",
         "noPrompt": "No prompt selected",
-        "hotkey": "Hotkey"
+        "hotkey": "Hotkey",
+        "englishNote": "S1-mini ignores this profile's prompt and custom words. Leave this off for translation or rewriting profiles.",
+        "englishOverride": "This profile's own model replaces the English cleanup model, so the English cleanup model is not used.",
+        "englishControls": {
+          "styling": "Profile styling",
+          "structure": "Profile structure",
+          "context": "Profile context"
+        },
+        "englishControlsHelp": "Use 1 to 40 characters without brackets or control characters.",
+        "englishDisabled": "English cleanup is off in the English cleanup model settings, so this has no effect.",
+        "englishControlErrors": {
+          "styling": "Profile styling must be 1 to 40 characters without brackets or control characters.",
+          "structure": "Profile structure must be 1 to 40 characters without brackets or control characters.",
+          "context": "Profile context must be 1 to 40 characters without brackets or control characters."
+        }
+      },
+      "englishCleanup": {
+        "title": "English cleanup model",
+        "enabled": "Use the English cleanup model for English speech",
+        "baseUrl": "English model base URL",
+        "model": "English model name",
+        "promptNote": "S1-mini ignores the cleanup prompt and custom words. It uses each profile's styling, structure and context.",
+        "languageNote": "It is used only when Handy knows the speech is English: the speech language is English on a model that accepts it, Translate to English is on, or the speech model reports that it detected English. With Auto speech language and an engine that reports no detected language, S1-mini is never used. Otherwise the default model cleans up the text.",
+        "failureNote": "If the English model cannot be reached, cleanup fails: the raw text is pasted, the failure sound plays and a notice appears in Handy's window.",
+        "invalidBaseUrl": "Enter an HTTP or HTTPS base URL of at most 2048 characters.",
+        "invalidModel": "Enter an English model name of at most 256 characters."
       }
     },
     "history": {
@@ -593,7 +618,9 @@
         "refused": "Automatic insertion failed or was refused. The generated text is available here.",
         "generatedCopied": "Generated text copied.",
         "instructionCopied": "Instruction copied."
-      }
+      },
+      "profile": "Profile: {{name}}",
+      "profileNotFound": "This recording's profile no longer exists. Create a profile and make a new recording."
     },
     "debug": {
       "title": "Probleemoplossing",

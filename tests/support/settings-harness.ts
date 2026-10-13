@@ -2,6 +2,7 @@ import { expect, type Page, type TestInfo } from "@playwright/test";
 import type {
   AppSettings,
   AssistantRecoveryItem,
+  EnglishCleanupSettings,
   LlmRequestOptions,
   ProcessingProfile,
   ProcessingProfileInput,
@@ -72,6 +73,7 @@ export async function setup(
         onboarding_completed: true,
         app_language: "en",
         post_process_enabled: false,
+        english_cleanup: { enabled: false, base_url: "", model: "" },
         keyboard_implementation: keyboard as "tauri" | "handy_keys",
         audio_feedback: true,
         theme: "light",
@@ -239,6 +241,8 @@ export async function setup(
           if (command === "change_post_process_request_options")
             settings.post_process_request_options =
               args.options as LlmRequestOptions;
+          if (command === "change_english_cleanup_settings")
+            settings.english_cleanup = args.value as EnglishCleanupSettings;
           if (command === "update_post_process_prompt") {
             const prompt = settings.post_process_prompts?.find(
               (p) => p.id === args.id,

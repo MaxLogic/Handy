@@ -352,7 +352,13 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
       await retryTranscription(entry.id);
     } catch (error) {
       console.error("Failed to re-transcribe:", error);
-      toast.error(t("settings.history.retranscribeError"));
+      toast.error(
+        t(
+          error instanceof Error && error.message === "profile_not_found"
+            ? "settings.history.profileNotFound"
+            : "settings.history.retranscribeError",
+        ),
+      );
     } finally {
       setRetrying(false);
     }
@@ -446,6 +452,11 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
             : t("settings.history.transcriptionFailed")}
       </p>
 
+      {(entry.profile_name ?? null) !== null && (
+        <p className="text-sm text-text/70">
+          {t("settings.history.profile", { name: entry.profile_name })}
+        </p>
+      )}
       <AudioPlayer onLoadRequest={handleLoadAudio} className="w-full" />
     </div>
   );

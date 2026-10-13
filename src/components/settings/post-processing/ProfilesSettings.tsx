@@ -5,6 +5,7 @@ import {
   type ProcessingProfile,
   type ProcessingProfileInput,
   type ProfileKind,
+  type S1Controls,
 } from "@/bindings";
 import { useSettings } from "@/hooks/useSettings";
 import { useOsType } from "@/hooks/useOsType";
@@ -22,6 +23,12 @@ import { ShortcutInput } from "../ShortcutInput";
 
 const fieldClass =
   "w-full rounded-md border border-mid-gray/80 bg-mid-gray/10 px-3 py-2 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-logo-primary";
+// Backend S1Controls::default(); bindings export the type, not the constants.
+const defaultControls: S1Controls = {
+  styling: "semi-formal",
+  structure: "prose",
+  context: "general",
+};
 const knownErrors = [
   "not_found",
   "name_required",
@@ -98,6 +105,11 @@ export const ProfilesSettings: React.FC = () => {
   const name = (profile: ProcessingProfile) => profileDisplayName(profile, t);
   const builtin =
     !!editor?.source && !editor.duplicate && isBuiltinProfile(editor.source);
+  const englishOverride =
+    !!editor?.input.english_cleanup &&
+    !!editor.input.model &&
+    !editor.input.model.model.toLowerCase().includes("s1-mini");
+  const englishDisabled = !getSetting("english_cleanup")?.enabled;
 
   useLayoutEffect(() => {
     if (deleting || focusAfterDelete.current === null) return;
@@ -134,9 +146,10 @@ export const ProfilesSettings: React.FC = () => {
         prompt_id: source ? (promptId ?? null) : (prompts[0]?.id ?? null),
         model: source?.model ? { ...source.model } : null,
         speech_language: source?.speech_language ?? null,
-        english_cleanup: source?.english_cleanup
-          ? { ...source.english_cleanup }
-          : null,
+        english_cleanup:
+          !duplicate && source?.english_cleanup
+            ? { ...source.english_cleanup }
+            : null,
       },
     });
   };
@@ -164,6 +177,13 @@ export const ProfilesSettings: React.FC = () => {
             ...editor.input.model,
             model: editor.input.model.model.trim(),
             base_url: editor.input.model.base_url?.trim() || null,
+          }
+        : null,
+      english_cleanup: editor.input.english_cleanup
+        ? {
+            styling: editor.input.english_cleanup.styling.trim(),
+            structure: editor.input.english_cleanup.structure.trim(),
+            context: editor.input.english_cleanup.context.trim(),
           }
         : null,
     };
@@ -201,6 +221,17 @@ export const ProfilesSettings: React.FC = () => {
       )
         errors.provider = message("provider_unsupported");
     }
+    if (input.english_cleanup) {
+      for (const field of ["styling", "structure", "context"] as const) {
+        const value = input.english_cleanup[field];
+        if (
+          ![...value].length ||
+          [...value].length > 40 ||
+          /[\[\]\p{Cc}]/u.test(value)
+        )
+          errors[field] = t(k(`englishControlErrors.${field}`));
+      }
+    }
     if (Object.keys(errors).length) {
       setInvalid(errors);
       return;
@@ -222,6 +253,15 @@ export const ProfilesSettings: React.FC = () => {
       const code = String(caught);
       const field = errorField[code];
       if (field) setInvalid({ [field]: message(code) });
+      else if (code === "controls_invalid" && input.english_cleanup)
+        setInvalid(
+          Object.fromEntries(
+            ["styling", "structure", "context"].map((field) => [
+              field,
+              message(code),
+            ]),
+          ),
+        );
       else setError(message(code));
     } finally {
       busyRef.current = false;
@@ -527,7 +567,10 @@ export const ProfilesSettings: React.FC = () => {
               value={editor.input.model?.provider_id ?? ""}
               aria-disabled={saving}
               aria-invalid={!!invalid.provider}
-              aria-describedby={described("provider")}
+              aria-describedby={described(
+                "provider",
+                englishOverride ? "profile-english-override" : undefined,
+              )}
               onChange={(e) =>
                 update({
                   model: e.target.value
@@ -643,6 +686,114 @@ export const ProfilesSettings: React.FC = () => {
               {t(k("languageHelp"))}
             </p>
             {fieldError("speech_language")}
+            {editor.input.kind === "dictation" && (
+              <div id="profile-english-controls" className="space-y-3">
+                <div className="flex items-start gap-2">
+                  <input
+                    id="profile-english-enabled"
+                    type="checkbox"
+                    checked={!!editor.input.english_cleanup}
+                    aria-disabled={saving}
+                    aria-describedby={described(
+                      "english_cleanup",
+                      [
+                        "profile-english-note",
+                        englishDisabled ? "profile-english-disabled" : "",
+                        englishOverride ? "profile-english-override" : "",
+                      ]
+                        .filter(Boolean)
+                        .join(" "),
+                    )}
+                    onClick={(event) => {
+                      if (busyRef.current) event.preventDefault();
+                    }}
+                    onChange={(event) =>
+                      update({
+                        english_cleanup: event.target.checked
+                          ? { ...defaultControls }
+                          : null,
+                      })
+                    }
+                    className="mt-1 accent-logo-primary focus-visible:ring-2 focus-visible:ring-logo-primary"
+                  />
+                  <label
+                    htmlFor="profile-english-enabled"
+                    className="text-sm font-semibold"
+                  >
+                    {t("settings.postProcessing.englishCleanup.enabled")}
+                  </label>
+                </div>
+                <p id="profile-english-note" className="text-xs text-mid-gray">
+                  {t(k("englishNote"))}
+                </p>
+                {englishDisabled && (
+                  <p
+                    id="profile-english-disabled"
+                    className="text-xs text-mid-gray"
+                  >
+                    {t(k("englishDisabled"))}
+                  </p>
+                )}
+                {englishOverride && (
+                  <p
+                    id="profile-english-override"
+                    className="text-xs text-mid-gray"
+                  >
+                    {t(k("englishOverride"))}
+                  </p>
+                )}
+                {editor.input.english_cleanup && (
+                  <>
+                    {(["styling", "structure", "context"] as const).map(
+                      (field) => (
+                        <div key={field} className="space-y-2">
+                          <label
+                            htmlFor={`profile-${field}`}
+                            className="block text-sm font-semibold"
+                          >
+                            {t(k(`englishControls.${field}`))}
+                          </label>
+                          <input
+                            id={`profile-${field}`}
+                            className={fieldClass}
+                            value={editor.input.english_cleanup![field]}
+                            readOnly={saving}
+                            aria-disabled={saving}
+                            aria-invalid={!!invalid[field]}
+                            aria-describedby={described(
+                              field,
+                              [
+                                "profile-english-help",
+                                englishOverride
+                                  ? "profile-english-override"
+                                  : "",
+                              ]
+                                .filter(Boolean)
+                                .join(" "),
+                            )}
+                            onChange={(event) =>
+                              update({
+                                english_cleanup: {
+                                  ...editor.input.english_cleanup!,
+                                  [field]: event.target.value,
+                                },
+                              })
+                            }
+                          />
+                          {fieldError(field)}
+                        </div>
+                      ),
+                    )}
+                    <p
+                      id="profile-english-help"
+                      className="text-xs text-mid-gray"
+                    >
+                      {t(k("englishControlsHelp"))}
+                    </p>
+                  </>
+                )}
+              </div>
+            )}
             {error && (
               <p
                 id="profile-error"

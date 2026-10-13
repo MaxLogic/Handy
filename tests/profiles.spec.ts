@@ -478,7 +478,7 @@ test("custom blank and duplicate default names reject before commands with per-f
   await expect(page.getByRole("alert")).toContainText("already uses that name");
 });
 
-test("model, URL, language, fixed kind and hidden English controls round-trip on edit and duplicate", async ({
+test("model, URL, language, fixed kind and English controls round-trip on edit and duplicate", async ({
   page,
 }, testInfo) => {
   await setup(page, "tauri", { processing_profiles: builtins });
@@ -489,7 +489,17 @@ test("model, URL, language, fixed kind and hidden English controls round-trip on
   await expect(
     dialog.getByRole("combobox", { name: "Kind", exact: true }),
   ).toHaveCount(0);
-  await expect(dialog.getByRole("checkbox")).toHaveCount(0);
+  await expect(
+    dialog.getByRole("checkbox", {
+      name: "Use the English cleanup model for English speech",
+      exact: true,
+    }),
+  ).toBeChecked();
+  for (const [field, value] of Object.entries(builtins[0].english_cleanup!)) {
+    await expect(
+      dialog.getByRole("textbox", { name: `Profile ${field}`, exact: true }),
+    ).toHaveValue(value);
+  }
   await dialog
     .getByRole("combobox", { name: "Speech language", exact: true })
     .selectOption("pl");
@@ -532,13 +542,21 @@ test("model, URL, language, fixed kind and hidden English controls round-trip on
   await expect(
     dialog.getByRole("textbox", { name: "Name", exact: true }),
   ).toHaveValue("Cleanup (copy)");
+  // Coordinator r2 decision overrides HANDY-008 D11 line 606: a copy must
+  // explicitly opt in, so a translation prompt cannot inherit S1 routing.
+  await expect(
+    dialog.getByRole("checkbox", {
+      name: "Use the English cleanup model for English speech",
+      exact: true,
+    }),
+  ).not.toBeChecked();
   await dialog.getByRole("button", { name: "Save", exact: true }).click();
   const duplicate = (await saved(page)).processing_profiles?.find(
     (p) => p.name === "Cleanup (copy)",
   )!;
   expect(duplicate).toMatchObject({
     kind: "dictation",
-    english_cleanup: builtins[0].english_cleanup,
+    english_cleanup: null,
     speech_language: "pl",
   });
   expect(

@@ -18,6 +18,7 @@ import { profileDisplayName, BUILTIN_PROFILE_IDS } from "@/lib/profiles";
 import { ProfilesSettings } from "./ProfilesSettings";
 import { useSettings } from "../../../hooks/useSettings";
 import { LlmRequestSettings } from "./LlmRequestSettings";
+import { EnglishCleanupSettings } from "./EnglishCleanupSettings";
 
 const PostProcessingSettingsApiComponent: React.FC = () => {
   const { t } = useTranslation();
@@ -556,7 +557,7 @@ export const PostProcessingSettings: React.FC = () => {
         </p>
         <PostProcessingSettingsApi />
       </SettingsGroup>
-
+      <EnglishCleanupSettings />
       <SettingsGroup
         title={t("settings.postProcessing.profiles.promptLibraryTitle")}
       >
