@@ -187,6 +187,17 @@ pub fn env_flag_enabled(name: &str) -> bool {
     }
 }
 
+/// Set `var` to `value` for this process (and its children) unless the user
+/// already set it or opted out with a truthy `keep_flag`. Returns whether it set
+/// the variable. Call only during single-threaded startup.
+pub fn set_env_default_unless(var: &str, value: &str, keep_flag: &str) -> bool {
+    if std::env::var_os(var).is_some() || env_flag_enabled(keep_flag) {
+        return false;
+    }
+    std::env::set_var(var, value);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +265,47 @@ mod tests {
         assert!(!native_machine_is_arm64(Some(0x8664))); // AMD64
         assert!(!native_machine_is_arm64(Some(0x014c))); // I386
         assert!(!native_machine_is_arm64(None)); // API unavailable or failed
+    }
+
+    #[test]
+    fn env_default_sets_unset_variable() {
+        let (var, keep) = (
+            "HANDY_TEST_ENV_DEFAULT_UNSET",
+            "HANDY_TEST_ENV_DEFAULT_UNSET_KEEP",
+        );
+        std::env::remove_var(var);
+        assert!(set_env_default_unless(var, "1", keep));
+        assert_eq!(std::env::var(var).as_deref(), Ok("1"));
+        std::env::remove_var(var);
+    }
+
+    #[test]
+    fn env_default_preserves_existing_value() {
+        let (var, keep) = (
+            "HANDY_TEST_ENV_DEFAULT_SET",
+            "HANDY_TEST_ENV_DEFAULT_SET_KEEP",
+        );
+        std::env::set_var(var, "0");
+        assert!(!set_env_default_unless(var, "1", keep));
+        assert_eq!(std::env::var(var).as_deref(), Ok("0"));
+        std::env::remove_var(var);
+    }
+
+    #[test]
+    fn env_default_honours_opt_out_flag() {
+        let (var, keep) = (
+            "HANDY_TEST_ENV_DEFAULT_OPT",
+            "HANDY_TEST_ENV_DEFAULT_OPT_KEEP",
+        );
+        std::env::remove_var(var);
+        std::env::set_var(keep, "1");
+        assert!(!set_env_default_unless(var, "1", keep));
+        assert!(std::env::var_os(var).is_none());
+        // A falsy opt-out value does not opt out.
+        std::env::set_var(keep, "0");
+        assert!(set_env_default_unless(var, "1", keep));
+        std::env::remove_var(var);
+        std::env::remove_var(keep);
     }
 
     #[test]

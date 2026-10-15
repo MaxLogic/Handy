@@ -884,6 +884,8 @@ trait RecordingStartContext {
     );
     fn is_recording(&self) -> bool;
     fn cancel_operation(&self) -> bool;
+    /// Non-blocking cue confirming that a cancel stopped real work.
+    fn cancel_feedback(&self);
     fn capture_error(&self, error: crate::assistant::AssistantError);
 }
 impl RecordingStartContext for AppHandle {
@@ -902,6 +904,9 @@ impl RecordingStartContext for AppHandle {
     fn cancel_operation(&self) -> bool {
         crate::utils::perform_cancellation(self)
     }
+    fn cancel_feedback(&self) {
+        crate::audio_feedback::play_feedback_sound(self, crate::audio_feedback::SoundType::Cancel);
+    }
 
     fn capture_error(&self, error: crate::assistant::AssistantError) {
         error.emit(self);
@@ -913,7 +918,13 @@ impl<C: RecordingStartContext> Executor<C> {
     }
 
     fn on_cancel(&mut self, state: &mut CoordinatorState) -> Option<Effect> {
+        // Read before teardown: a cancel only confirms itself audibly when it
+        // stopped a recording or an in-flight transcription/post-process.
+        let busy = matches!(state.stage, Stage::Recording(_) | Stage::Processing);
         let was = self.app.cancel_operation();
+        if was || busy {
+            self.app.cancel_feedback();
+        }
         state.on_cancel(was)
     }
 
@@ -1139,6 +1150,7 @@ pub(crate) mod tests {
         calls: Vec<(thread::ThreadId, &'static str)>,
         fallback: bool,
         stt_languages: Vec<Option<String>>,
+        cancel_sounds: usize,
     }
 
     impl Runtime {
@@ -1220,6 +1232,9 @@ pub(crate) mod tests {
         }
         fn cancel_operation(&self) -> bool {
             crate::utils::perform_cancellation(self)
+        }
+        fn cancel_feedback(&self) {
+            self.runtime.lock().unwrap().cancel_sounds += 1;
         }
         fn capture_error(&self, _: crate::assistant::AssistantError) {
             panic!("unexpected capture error")
@@ -1647,6 +1662,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn cancel_sound_only_when_cancel_stopped_work() {
+        let _guard = CANCEL_RUNTIME_TEST.blocking_lock();
+        let sounds = |h: &Harness| h.executor.app.runtime.lock().unwrap().cancel_sounds;
+
+        // No-op cancel while idle: silent.
+        let mut h = Harness::new();
+        h.request();
+        h.next();
+        h.assert_idle();
+        assert_eq!(sounds(&h), 0);
+
+        // Cancel during recording: one cue.
+        let mut h = Harness::new();
+        h.press(WorkflowMode::Raw);
+        assert!(h.executor.app.is_recording());
+        h.request();
+        h.next();
+        h.assert_idle();
+        assert_eq!(sounds(&h), 1);
+        // A second cancel after teardown is a no-op again.
+        h.request();
+        h.next();
+        assert_eq!(sounds(&h), 1);
+
+        // Cancel during in-flight transcription (microphone already closed).
+        let mut h = Harness::new();
+        h.press(WorkflowMode::Raw);
+        h.state.stage = Stage::Processing;
+        {
+            let mut r = h.executor.app.runtime.lock().unwrap();
+            r.mic = None;
+            r.stream = None;
+            r.stt = Some(1);
+        }
+        h.request();
+        h.next();
+        assert_eq!(sounds(&h), 1);
+    }
+
+    #[test]
     fn cancel_queued_vetoes_idle_press_drain_start_and_capture_start() {
         let (tx, rx) = mpsc::channel();
         let mut state = CoordinatorState::new();
@@ -1739,6 +1794,7 @@ pub(crate) mod tests {
         fn cancel_operation(&self) -> bool {
             crate::utils::perform_cancellation(self)
         }
+        fn cancel_feedback(&self) {}
         fn capture_error(&self, _: crate::assistant::AssistantError) {
             panic!("unexpected capture error")
         }

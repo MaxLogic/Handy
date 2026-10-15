@@ -19,11 +19,21 @@ fn main() {
     {
         // Avoid overlay/capture layer crashes (#2049). Set before backend
         // initialization, preserving user overrides.
-        if std::env::var_os("VK_LOADER_LAYERS_DISABLE").is_none()
-            && !handy_app_lib::env_flag_enabled("HANDY_KEEP_VULKAN_IMPLICIT_LAYERS")
-        {
-            std::env::set_var("VK_LOADER_LAYERS_DISABLE", "~implicit~");
-        }
+        handy_app_lib::set_env_default_unless(
+            "VK_LOADER_LAYERS_DISABLE",
+            "~implicit~",
+            "HANDY_KEEP_VULKAN_IMPLICIT_LAYERS",
+        );
+        // NVIDIA coopmat2 shaders compile on every model load and the driver
+        // cache does not keep them: the first transcription took ~48 s on an
+        // RTX 3090 (then ~0.35 s). Without coopmat2 the first run takes <5 s
+        // cold and ~0.4 s with a warm driver cache, steady speed equal or
+        // better. Opt out with HANDY_KEEP_VULKAN_COOPMAT2=1.
+        handy_app_lib::set_env_default_unless(
+            "GGML_VK_DISABLE_COOPMAT2",
+            "1",
+            "HANDY_KEEP_VULKAN_COOPMAT2",
+        );
     }
 
     // Transcription worker: runs transcribe.cpp in isolation and never touches

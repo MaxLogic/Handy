@@ -9,39 +9,63 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use tauri::{AppHandle, Manager};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SoundType {
     Start,
     Stop,
+    /// Confirms that a cancel stopped a recording or in-flight transcription.
+    Cancel,
 }
+
+/// Where a sound file lives: the user's data directory (custom theme) or the
+/// bundled resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoundDir {
+    AppData,
+    Resource,
+}
+
+/// Built-in cancel cue shared by every bundled theme.
+const BUILTIN_CANCEL_SOUND: &str = "resources/cancel.wav";
 
 fn resolve_sound_path(
     app: &AppHandle,
     settings: &AppSettings,
     sound_type: SoundType,
 ) -> Option<PathBuf> {
-    let sound_file = get_sound_path(settings, sound_type);
-    let base_dir = get_sound_base_dir(settings);
-    match base_dir {
-        tauri::path::BaseDirectory::AppData => {
-            crate::portable::resolve_app_data(app, &sound_file).ok()
+    let candidates = sound_candidates(settings.sound_theme, sound_type);
+    let last = candidates.len() - 1;
+    for (index, (file, base_dir)) in candidates.into_iter().enumerate() {
+        let resolved = match base_dir {
+            SoundDir::AppData => crate::portable::resolve_app_data(app, &file).ok(),
+            SoundDir::Resource => app
+                .path()
+                .resolve(&file, tauri::path::BaseDirectory::Resource)
+                .ok(),
+        };
+        // Earlier candidates are optional overrides; the last one is used as-is.
+        match resolved {
+            Some(path) if index == last || path.is_file() => return Some(path),
+            _ => {}
         }
-        _ => app.path().resolve(&sound_file, base_dir).ok(),
     }
+    None
 }
 
-fn get_sound_path(settings: &AppSettings, sound_type: SoundType) -> String {
-    match (settings.sound_theme, sound_type) {
-        (SoundTheme::Custom, SoundType::Start) => "custom_start.wav".to_string(),
-        (SoundTheme::Custom, SoundType::Stop) => "custom_stop.wav".to_string(),
-        (_, SoundType::Start) => settings.sound_theme.to_start_path(),
-        (_, SoundType::Stop) => settings.sound_theme.to_stop_path(),
-    }
-}
-
-fn get_sound_base_dir(settings: &AppSettings) -> tauri::path::BaseDirectory {
-    match settings.sound_theme {
-        SoundTheme::Custom => tauri::path::BaseDirectory::AppData,
-        _ => tauri::path::BaseDirectory::Resource,
+/// Sound files to try in order. A custom theme without `custom_cancel.wav`
+/// falls back to the built-in cancel cue.
+fn sound_candidates(theme: SoundTheme, sound_type: SoundType) -> Vec<(String, SoundDir)> {
+    use SoundDir::{AppData, Resource};
+    match (theme, sound_type) {
+        (SoundTheme::Custom, SoundType::Start) => vec![("custom_start.wav".into(), AppData)],
+        (SoundTheme::Custom, SoundType::Stop) => vec![("custom_stop.wav".into(), AppData)],
+        (SoundTheme::Custom, SoundType::Cancel) => vec![
+            ("custom_cancel.wav".into(), AppData),
+            (BUILTIN_CANCEL_SOUND.into(), Resource),
+        ],
+        (_, SoundType::Start) => vec![(theme.to_start_path(), Resource)],
+        (_, SoundType::Stop) => vec![(theme.to_stop_path(), Resource)],
+        (_, SoundType::Cancel) => vec![(BUILTIN_CANCEL_SOUND.into(), Resource)],
     }
 }
 
@@ -157,4 +181,61 @@ fn play_audio_file(
     sink.sleep_until_end();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use SoundDir::{AppData, Resource};
+
+    fn files(theme: SoundTheme, sound: SoundType) -> Vec<(String, SoundDir)> {
+        sound_candidates(theme, sound)
+    }
+
+    #[test]
+    fn bundled_themes_use_builtin_cancel_sound() {
+        for theme in [SoundTheme::Marimba, SoundTheme::Pop] {
+            assert_eq!(
+                files(theme, SoundType::Cancel),
+                [("resources/cancel.wav".to_string(), Resource)]
+            );
+        }
+    }
+
+    #[test]
+    fn custom_cancel_prefers_user_file_then_falls_back_to_builtin() {
+        assert_eq!(
+            files(SoundTheme::Custom, SoundType::Cancel),
+            [
+                ("custom_cancel.wav".to_string(), AppData),
+                ("resources/cancel.wav".to_string(), Resource),
+            ]
+        );
+    }
+
+    #[test]
+    fn start_and_stop_paths_are_unchanged() {
+        assert_eq!(
+            files(SoundTheme::Pop, SoundType::Stop),
+            [("resources/pop_stop.wav".to_string(), Resource)]
+        );
+        assert_eq!(
+            files(SoundTheme::Marimba, SoundType::Start),
+            [("resources/marimba_start.wav".to_string(), Resource)]
+        );
+        assert_eq!(
+            files(SoundTheme::Custom, SoundType::Start),
+            [("custom_start.wav".to_string(), AppData)]
+        );
+        assert_eq!(
+            files(SoundTheme::Custom, SoundType::Stop),
+            [("custom_stop.wav".to_string(), AppData)]
+        );
+    }
+
+    #[test]
+    fn builtin_cancel_sound_is_bundled() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(BUILTIN_CANCEL_SOUND);
+        assert!(path.is_file(), "{} missing", path.display());
+    }
 }

@@ -496,6 +496,10 @@ $env:HANDY_KEEP_VULKAN_IMPLICIT_LAYERS = "1"
 
 Adjust the executable path if needed. This override only applies to apps launched from that PowerShell session, not the Start menu. Handy also preserves any existing `VK_LOADER_LAYERS_DISABLE` value.
 
+### Slow First Transcription on NVIDIA/Vulkan (`HANDY_KEEP_VULKAN_COOPMAT2`)
+
+On Windows, Handy sets `GGML_VK_DISABLE_COOPMAT2=1` for its own process. With NVIDIA's coopmat2 shaders enabled, the first transcription after each model load spent about 48 s compiling shaders on an RTX 3090; without them it takes under 5 s cold and about 0.4 s once the driver cache is warm, with equal or better steady speed. To keep coopmat2, set `HANDY_KEEP_VULKAN_COOPMAT2=1` the same way as above, or set `GGML_VK_DISABLE_COOPMAT2` yourself; Handy preserves an existing value.
+
 ### How to Contribute
 
 1. **Check existing issues** at [github.com/cjpais/Handy/issues](https://github.com/cjpais/Handy/issues)

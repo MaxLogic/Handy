@@ -38,7 +38,7 @@ pub use cli::CliArgs;
 #[cfg(debug_assertions)]
 use specta_typescript::{BigIntExportBehavior, Typescript};
 use tauri_specta::{collect_commands, collect_events, Builder};
-pub use utils::env_flag_enabled;
+pub use utils::{env_flag_enabled, set_env_default_unless};
 
 use env_filter::Builder as EnvFilterBuilder;
 use managers::audio::AudioRecordingManager;
