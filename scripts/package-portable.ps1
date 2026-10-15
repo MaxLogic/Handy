@@ -17,9 +17,15 @@
       README-portable.txt      usage, data location, identity of this build
       LICENSE                  upstream MIT license (attribution)
 
-    The folder is zipped and the script prints the zip path, size, SHA-256 and
-    the source commit plus a hash of any uncommitted diff. It never starts the
-    application.
+    The folder is assembled in a fresh staging directory, zipped from there and
+    then published as `<OutputDir>\Handy MaxLogic\`. The script prints the zip
+    path, size, SHA-256 and the source commit plus a hash of any uncommitted
+    diff. It never starts the application.
+
+    An existing package folder is replaced only when it holds no `Data\`
+    folder: a folder someone ran the portable app from keeps its settings,
+    history and recordings there, so the script stops instead of deleting
+    them. The zip never contains `Data\`.
 
 .PARAMETER OutputDir
     Where the folder and zip are written. Defaults to artifacts\portable.
@@ -47,6 +53,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$stagingRoot = $null
 
 $productName = 'Handy MaxLogic'
 $exeName = 'handy-maxlogic.exe'
@@ -115,6 +122,14 @@ function Assert-ImportsResolved {
     if ($missing) { throw "Imported DLLs missing from the package: $($missing -join ', ')" }
 }
 
+function Assert-NoUserData {
+    param([string]$Folder)
+    $data = Join-Path $Folder 'Data'
+    if (Test-Path -LiteralPath $data) {
+        throw "Refusing to replace '$Folder': it contains Data\ (settings, history and recordings of a portable install). Move or back up that folder, or pass a different -OutputDir."
+    }
+}
+
 function Invoke-Native {
     param([string]$FilePath, [string[]]$ArgumentList)
     & $FilePath @ArgumentList
@@ -129,8 +144,13 @@ if ($config.productName -ne $productName) {
 }
 $version = $config.version
 
+$publishDir = Join-Path $OutputDir $productName
+
 Push-Location $repoRoot
 try {
+    # Checked before the build and again just before the old folder is
+    # replaced.
+    Assert-NoUserData $publishDir
     $commit = (git rev-parse HEAD).Trim()
     $shortCommit = $commit.Substring(0, 7)
     $diffFile = New-TemporaryFile
@@ -170,8 +190,8 @@ try {
     if ($runtimeDlls.Count -eq 0) { throw 'src-tauri\transcribe-libs contains no DLLs; run the release build first.' }
 
     New-Item -ItemType Directory -Force $OutputDir | Out-Null
-    $packageDir = Join-Path $OutputDir $productName
-    if (Test-Path $packageDir) { Remove-Item $packageDir -Recurse -Force }
+    $stagingRoot = Join-Path $OutputDir (".staging-{0}" -f [guid]::NewGuid().ToString('N'))
+    $packageDir = Join-Path $stagingRoot $productName
     New-Item -ItemType Directory $packageDir | Out-Null
 
     Copy-Item $builtExe (Join-Path $packageDir $exeName)
@@ -241,10 +261,19 @@ Requirements
 "@
     Set-Content -Path (Join-Path $packageDir 'README-portable.txt') -Value $readme -Encoding utf8NoBOM
 
+    # The staging folder is new, so this only guards against a future step
+    # that would copy user data into it.
+    Assert-NoUserData $packageDir
+
     $dirtyTag = if ($dirty -or $untracked.Count -gt 0) { '-dirty' } else { '' }
     $zipPath = Join-Path $OutputDir ("Handy-MaxLogic-{0}-{1}{2}-portable-x64.zip" -f $version, $shortCommit, $dirtyTag)
     if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
     Compress-Archive -Path $packageDir -DestinationPath $zipPath -CompressionLevel Optimal
+
+    Assert-NoUserData $publishDir
+    if (Test-Path -LiteralPath $publishDir) { Remove-Item -LiteralPath $publishDir -Recurse -Force }
+    Move-Item -LiteralPath $packageDir -Destination $publishDir
+    $packageDir = $publishDir
 
     $zip = Get-Item $zipPath
     $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -262,5 +291,8 @@ Requirements
     if ($untracked.Count -gt 0) { Write-Output "Untracked:      $($untracked.Count) files (not in the diff hash)" }
 }
 finally {
+    if ($stagingRoot -and (Test-Path -LiteralPath $stagingRoot)) {
+        Remove-Item -LiteralPath $stagingRoot -Recurse -Force
+    }
     Pop-Location
 }

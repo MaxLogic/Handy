@@ -637,7 +637,9 @@ pub fn run(cli_args: CliArgs) {
     memory::init_allocator();
 
     // Detect portable mode before anything else
-    portable::init();
+    if let Err(message) = portable::init() {
+        portable::exit_with_startup_error(&message);
+    }
 
     // Parse console logging directives from RUST_LOG, falling back to info-level logging
     // when the variable is unset

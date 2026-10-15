@@ -132,6 +132,8 @@ The script:
 2. Assembles `artifacts/portable/Handy MaxLogic/` with `handy-maxlogic.exe`, the DLLs next to the built executable (transcribe-cpp/ggml and ONNX Runtime's `DirectML.dll`) and in `src-tauri/transcribe-libs`, the app-local VC++ runtime when the Visual Studio redistributables are found, `resources/`, the `portable` marker (`Handy Portable Mode`), `README-portable.txt` and `LICENSE`. It fails if any DLL imported by the packaged binaries is neither in the folder nor in `System32` (checked with `dumpbin` from the Visual Studio C++ tools; without `dumpbin` the script fails unless `-SkipDllCheck` is given).
 3. Zips the folder to `artifacts/portable/Handy-MaxLogic-<version>-<commit>[-dirty]-portable-x64.zip` and prints its size and SHA-256, the executable's SHA-256, the source commit, and a hash of `git diff HEAD --binary` when the tree has changes.
 
+The folder is assembled in a new staging directory and zipped from there, so the zip never contains `Data\`. It then replaces `<OutputDir>/Handy MaxLogic/`, but only when that folder holds no `Data\`: if someone ran the portable app from it, the script stops before building and deletes nothing. Move or back up that folder, or pass another `-OutputDir`.
+
 Options: `-OutputDir <dir>`, `-CargoTargetDir <dir>` (separate Cargo target directory, for example to avoid locking the debug target), `-SkipBuild` (package an existing release build), `-SkipDllCheck` (package without the DLL import check). The script never starts the application. No installer, updater artifact or signature is produced.
 
 ## Linux Install (from source)

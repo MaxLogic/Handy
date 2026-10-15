@@ -46,6 +46,29 @@ pub fn supported_schema_version() -> usize {
     MIGRATIONS.len()
 }
 
+/// Bring a history database to the schema this build reads, as startup does:
+/// convert tauri-plugin-sql tracking, run [`MIGRATIONS`] and add the profile
+/// columns. The upstream import runs it on a staged copy before that copy
+/// replaces anything.
+pub fn prepare_database(conn: &mut Connection) -> Result<()> {
+    // Handle migration from tauri-plugin-sql to rusqlite_migration
+    // tauri-plugin-sql used _sqlx_migrations table, rusqlite_migration uses user_version pragma
+    HistoryManager::migrate_from_tauri_plugin_sql(conn)?;
+
+    HistoryManager::prepare_schema(conn)
+}
+
+/// Fail unless every column [`HistoryManager`] reads exists. Migrations can
+/// succeed on a database whose `user_version` claims a schema its table does
+/// not have.
+pub fn check_readable(conn: &Connection) -> Result<()> {
+    conn.prepare(
+        "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, profile_id, profile_name
+         FROM transcription_history LIMIT 0",
+    )?;
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
 pub struct PaginatedHistory {
     pub entries: Vec<HistoryEntry>,
@@ -133,11 +156,7 @@ impl HistoryManager {
 
         let mut conn = Connection::open(&self.db_path)?;
 
-        // Handle migration from tauri-plugin-sql to rusqlite_migration
-        // tauri-plugin-sql used _sqlx_migrations table, rusqlite_migration uses user_version pragma
-        self.migrate_from_tauri_plugin_sql(&conn)?;
-
-        Self::prepare_schema(&mut conn)
+        prepare_database(&mut conn)
     }
 
     fn prepare_schema(conn: &mut Connection) -> Result<()> {
@@ -194,7 +213,7 @@ impl HistoryManager {
     /// tauri-plugin-sql used a _sqlx_migrations table, while rusqlite_migration uses
     /// SQLite's user_version pragma. This function checks if the old system was in use
     /// and sets the user_version accordingly so migrations don't re-run.
-    fn migrate_from_tauri_plugin_sql(&self, conn: &Connection) -> Result<()> {
+    fn migrate_from_tauri_plugin_sql(conn: &Connection) -> Result<()> {
         // Check if the old _sqlx_migrations table exists
         let has_sqlx_migrations: bool = conn
             .query_row(

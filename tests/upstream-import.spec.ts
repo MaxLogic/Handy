@@ -282,6 +282,26 @@ test.describe("upstream Handy import offer", () => {
     ).toBeFocused();
   });
 
+  test("a slow next screen gets focus parked on the app, then on the screen", async ({
+    page,
+  }) => {
+    await openWithOffer(page);
+    await page.clock.install();
+    // The settings load hangs, so no screen replaces the dialog yet.
+    await defer(page, "get_app_settings");
+    await dialog(page).getByRole("button", { name: "Not now" }).click();
+    await expect(dialog(page)).toHaveCount(0);
+
+    await page.clock.runFor(10_500);
+    expect(await page.evaluate(() => document.activeElement?.id)).toBe("root");
+
+    await release(page);
+    await page.clock.runFor(100);
+    await expect(
+      page.getByRole("button", { name: "General", exact: true }),
+    ).toBeFocused();
+  });
+
   test("settings only: no 0-byte total and Import has no size description", async ({
     page,
   }) => {

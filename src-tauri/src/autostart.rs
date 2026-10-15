@@ -1,7 +1,8 @@
 //! Launch-at-login (autostart) handling.
 //!
-//! All platforms apply the setting through tauri-plugin-autostart, except
-//! macOS 13+ where the app registers itself as a login item via
+//! Linux and macOS before 13 apply the setting through
+//! tauri-plugin-autostart. Windows writes its own HKCU `Run` value (see
+//! `windows_run`), and macOS 13+ registers the app as a login item via
 //! `SMAppService`. The plugin's launch agent plist carries no app
 //! association, so the System Settings Login Items pane attributes it to the
 //! code-signing certificate's developer name instead of the app (#337).
@@ -9,6 +10,7 @@
 //! appear under "Open at Login" with the app's name and icon.
 
 use tauri::AppHandle;
+#[cfg(not(windows))]
 use tauri_plugin_autostart::ManagerExt;
 
 /// Apply the user's autostart preference using the best mechanism for the
@@ -26,18 +28,251 @@ pub fn apply_autostart(app: &AppHandle, enabled: bool) {
         return;
     }
 
-    let manager = app.autolaunch();
-    let result = if enabled {
-        manager.enable()
-    } else {
-        manager.disable()
+    #[cfg(windows)]
+    let result = windows_run::apply(&app.package_info().name, enabled);
+
+    #[cfg(not(windows))]
+    let result = {
+        let manager = app.autolaunch();
+        if enabled {
+            manager.enable()
+        } else {
+            manager.disable()
+        }
     };
+
     if let Err(e) = result {
         log::warn!(
             "Failed to apply autostart setting (enabled={}): {}",
             enabled,
             e
         );
+    }
+}
+
+/// The HKCU `Run` entry on Windows.
+///
+/// tauri-plugin-autostart 2.5.1 (through auto-launch 0.5.0) writes the
+/// executable path unquoted, so for a path with spaces such as
+/// `D:\Tools\Handy MaxLogic\handy-maxlogic.exe` Windows may start
+/// `D:\Tools\Handy.exe` instead. This writes the same value name the plugin
+/// uses (the product name), so an entry it wrote earlier is replaced or
+/// removed rather than duplicated, and the plugin's `is_enabled` still reads
+/// it.
+#[cfg(windows)]
+mod windows_run {
+    use std::ffi::{OsStr, OsString};
+    use std::io;
+    use std::path::Path;
+
+    use winreg::enums::{RegType, HKEY_CURRENT_USER, KEY_SET_VALUE};
+    use winreg::{RegKey, RegValue};
+
+    const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+    const STARTUP_APPROVED_KEY: &str =
+        r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+    /// Task Manager's "enabled" state, as auto-launch writes it.
+    const STARTUP_APPROVED_ENABLED: [u8; 12] = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    /// Launch arguments: none, as registered with the plugin in `lib.rs`.
+    const ARGS: [&str; 0] = [];
+
+    pub fn apply(app_name: &str, enabled: bool) -> io::Result<()> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        if enabled {
+            let command = command_line(&std::env::current_exe()?, &ARGS);
+            enable(&hkcu, RUN_KEY, STARTUP_APPROVED_KEY, app_name, &command)
+        } else {
+            disable(&hkcu, RUN_KEY, app_name)
+        }
+    }
+
+    /// `"<exe>"` followed by each argument, quoted so the command line parses
+    /// back to the same path and arguments (CommandLineToArgvW rules).
+    pub(super) fn command_line(exe: &Path, args: &[&str]) -> OsString {
+        let mut command = OsString::from("\"");
+        command.push(exe.as_os_str());
+        command.push("\"");
+        for arg in args {
+            command.push(" ");
+            command.push(quote_arg(arg));
+        }
+        command
+    }
+
+    fn quote_arg(arg: &str) -> String {
+        let mut quoted = String::from('"');
+        let mut backslashes = 0;
+        for c in arg.chars() {
+            if c == '\\' {
+                backslashes += 1;
+                continue;
+            }
+            // Backslashes are literal unless a quote follows: then each is
+            // doubled and the quote escaped.
+            let escaped = if c == '"' {
+                backslashes * 2 + 1
+            } else {
+                backslashes
+            };
+            quoted.extend(std::iter::repeat_n('\\', escaped));
+            quoted.push(c);
+            backslashes = 0;
+        }
+        // Doubled so the closing quote stays a quote.
+        quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+        quoted.push('"');
+        quoted
+    }
+
+    pub(super) fn enable(
+        root: &RegKey,
+        run_key: &str,
+        approved_key: &str,
+        name: &str,
+        command: &OsStr,
+    ) -> io::Result<()> {
+        let (run, _) = root.create_subkey_with_flags(run_key, KEY_SET_VALUE)?;
+        run.set_value(name, &command)?;
+        // As auto-launch did: an entry switched off in Task Manager is
+        // switched back on, since autostart was just requested. The key may
+        // not exist.
+        if let Ok(approved) = root.open_subkey_with_flags(approved_key, KEY_SET_VALUE) {
+            approved.set_raw_value(
+                name,
+                &RegValue {
+                    bytes: STARTUP_APPROVED_ENABLED.to_vec(),
+                    vtype: RegType::REG_BINARY,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Remove the value; a missing key or value is already disabled.
+    pub(super) fn disable(root: &RegKey, run_key: &str, name: &str) -> io::Result<()> {
+        let run = match root.open_subkey_with_flags(run_key, KEY_SET_VALUE) {
+            Ok(run) => run,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        match run.delete_value(name) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use winreg::enums::KEY_READ;
+
+        #[test]
+        fn command_line_quotes_paths_with_spaces() {
+            let exe = Path::new(r"C:\Program Files\Handy MaxLogic\handy-maxlogic.exe");
+            assert_eq!(
+                command_line(exe, &[]),
+                OsString::from(r#""C:\Program Files\Handy MaxLogic\handy-maxlogic.exe""#)
+            );
+        }
+
+        #[test]
+        fn command_line_keeps_non_ascii_paths() {
+            let exe = Path::new(r"D:\Narzędzia\Zażółć gęślą\handy-maxlogic.exe");
+            assert_eq!(
+                command_line(exe, &[]),
+                OsString::from(r#""D:\Narzędzia\Zażółć gęślą\handy-maxlogic.exe""#)
+            );
+        }
+
+        #[test]
+        fn command_line_quotes_each_argument() {
+            let exe = Path::new(r"C:\A B\handy-maxlogic.exe");
+            let command = command_line(
+                exe,
+                &[
+                    "--start-hidden",
+                    "two words",
+                    r#"say "hi""#,
+                    r"dir\",
+                    r"a\b",
+                ],
+            );
+            assert_eq!(
+                command,
+                OsString::from(
+                    r#""C:\A B\handy-maxlogic.exe" "--start-hidden" "two words" "say \"hi\"" "dir\\" "a\b""#
+                )
+            );
+        }
+
+        const TEST_KEY: &str = r"Software\eu.maxlogic.handy.test";
+
+        /// Deletes the throwaway test key, also when an assertion fails.
+        struct TestKey;
+
+        impl Drop for TestKey {
+            fn drop(&mut self) {
+                let _ = RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(TEST_KEY);
+            }
+        }
+
+        /// Writes only below HKCU\Software\eu.maxlogic.handy.test, never the
+        /// real Run key.
+        #[test]
+        fn enable_replaces_an_unquoted_entry_and_disable_removes_it() {
+            let _cleanup = TestKey;
+            let run_key = format!(r"{TEST_KEY}\Run");
+            let approved_key = format!(r"{TEST_KEY}\StartupApproved\Run");
+            let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+            let name = "Handy MaxLogic";
+            // An unquoted entry as the plugin wrote it, switched off in Task
+            // Manager.
+            let (run, _) = hkcu.create_subkey(&run_key).unwrap();
+            run.set_value(name, &r"D:\Zażółć gęślą\handy-maxlogic.exe ")
+                .unwrap();
+            let (approved, _) = hkcu.create_subkey(&approved_key).unwrap();
+            approved
+                .set_raw_value(
+                    name,
+                    &RegValue {
+                        bytes: vec![3, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8],
+                        vtype: RegType::REG_BINARY,
+                    },
+                )
+                .unwrap();
+            let exe = Path::new(r"D:\Zażółć gęślą\handy-maxlogic.exe");
+
+            enable(
+                &hkcu,
+                &run_key,
+                &approved_key,
+                name,
+                &command_line(exe, &[]),
+            )
+            .unwrap();
+
+            let run = hkcu.open_subkey_with_flags(&run_key, KEY_READ).unwrap();
+            let names: Vec<String> = run.enum_values().map(|v| v.unwrap().0).collect();
+            assert_eq!(names, [name], "replaced, not duplicated");
+            let stored: OsString = run.get_value(name).unwrap();
+            assert_eq!(
+                stored,
+                OsString::from(r#""D:\Zażółć gęślą\handy-maxlogic.exe""#)
+            );
+            let approved = hkcu
+                .open_subkey_with_flags(&approved_key, KEY_READ)
+                .unwrap();
+            assert_eq!(
+                approved.get_raw_value(name).unwrap().bytes,
+                STARTUP_APPROVED_ENABLED
+            );
+
+            disable(&hkcu, &run_key, name).unwrap();
+            assert!(run.get_raw_value(name).is_err(), "value removed");
+            disable(&hkcu, &run_key, name).expect("disabling twice is fine");
+            disable(&hkcu, &format!(r"{TEST_KEY}\Missing"), name)
+                .expect("a missing key is already disabled");
+        }
     }
 }
 
