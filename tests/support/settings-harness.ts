@@ -13,6 +13,8 @@ export type HarnessWindow = Window & {
   __TAURI_OS_PLUGIN_INTERNALS__: Record<string, unknown>;
   __TAURI_EVENT_PLUGIN_INTERNALS__: Record<string, unknown>;
   emitTestEvent: (event: string, payload: unknown) => void;
+  /** Change the fixture settings as a backend-side edit would. */
+  patchSettings: (patch: AppSettings) => void;
   failCommand?: string;
   failCode?: string;
   commandArgs: { command: string; args: Record<string, unknown> }[];
@@ -153,6 +155,10 @@ export async function setup(
       let next = 1;
       const persist = () =>
         localStorage.setItem("test-settings", JSON.stringify(settings));
+      w.patchSettings = (patch) => {
+        settings = { ...settings, ...patch };
+        persist();
+      };
       w.emitTestEvent = (event, payload) => {
         (listeners[event] ?? []).forEach((id) =>
           callbacks[id]?.({ event, id, payload }),
@@ -375,6 +381,15 @@ export async function setup(
             persist();
             return { success: true, error: null };
           }
+          if (command === "add_custom_word") {
+            const word = String(args.word).trim();
+            if (word.startsWith("#")) throw "comment_prefix";
+            settings.custom_words = [...(settings.custom_words ?? []), word];
+          }
+          if (command === "remove_custom_word")
+            settings.custom_words = (settings.custom_words ?? []).filter(
+              (word) => word !== args.word,
+            );
           if (command === "reset_binding")
             settings.bindings![String(args.id)].current_binding =
               settings.bindings![String(args.id)].default_binding;

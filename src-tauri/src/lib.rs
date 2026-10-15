@@ -10,6 +10,7 @@ mod chinese_script;
 pub mod cli;
 mod clipboard;
 mod commands;
+mod custom_words;
 mod dictation_timing;
 pub mod engine_supervisor;
 mod fork_identity;
@@ -695,7 +696,10 @@ pub fn run(cli_args: CliArgs) {
             commands::profiles::delete_processing_profile,
             commands::profiles::clear_profile_hotkey,
             commands::profiles::change_english_cleanup_settings,
-            shortcut::update_custom_words,
+            commands::custom_words::update_custom_words,
+            commands::custom_words::add_custom_word,
+            commands::custom_words::remove_custom_word,
+            commands::custom_words::open_custom_words_file,
             shortcut::suspend_all_bindings,
             shortcut::resume_all_bindings,
             shortcut::change_mute_while_recording_setting,
@@ -938,6 +942,7 @@ pub fn run(cli_args: CliArgs) {
                 app_handle.manage(model_manager);
                 app_handle.manage(transcription_manager);
                 managers::transcription::apply_accelerator_settings(&app_handle);
+                custom_words::sync_headless(&app_handle);
 
                 let handle = app_handle.clone();
                 let args = cli_args.clone();
@@ -1029,6 +1034,9 @@ pub fn run(cli_args: CliArgs) {
             app.manage(assistant::recovery::RecoveryStore::new(assistant::RECOVERY_CAPACITY));
             app.manage(TranscriptionCoordinator::new(app_handle.clone()));
 
+            // Before the managers, so the first dictation already uses the
+            // words from custom_words.txt.
+            custom_words::start(&app_handle);
             initialize_core_logic(&app_handle);
 
             // Secure Input monitor (macOS): detects stuck secure input that

@@ -388,7 +388,14 @@
         "placeholder": "Dodaj słowo",
         "add": "Dodaj",
         "remove": "Usuń {{word}}",
-        "duplicate": "\"{{word}}\" już istnieje"
+        "duplicate": "\"{{word}}\" już istnieje",
+        "inputLabel": "New custom word",
+        "fileHelp": "Words are saved in custom_words.txt in the app data folder, one word or phrase per line. Lines starting with # are comments. Changes made in any text editor apply automatically.",
+        "openFile": "Open file",
+        "commentPrefix": "A word cannot start with #, because lines starting with # are comments in custom_words.txt.",
+        "fileUnreadable": "custom_words.txt could not be read. Fix the file or delete it, then try again.",
+        "saveFailed": "Could not save custom words: {{error}}",
+        "openFailed": "Could not open custom_words.txt: {{error}}"
       },
       "voiceActivityDetection": {
         "title": "Wykrywanie aktywności głosowej",

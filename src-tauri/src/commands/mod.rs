@@ -1,5 +1,6 @@
 pub mod assistant;
 pub mod audio;
+pub mod custom_words;
 pub mod history;
 pub mod models;
 pub mod profiles;

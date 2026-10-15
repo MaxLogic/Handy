@@ -97,7 +97,14 @@ pub async fn run_upstream_import(
             .store(crate::portable::store_path(SETTINGS_STORE_PATH))
             .map_err(|e| e.to_string())?;
         let mut write_settings = |settings: &crate::settings::AppSettings| {
-            let value = serde_json::to_value(settings).map_err(|e| e.to_string())?;
+            // custom_words.txt is the source of truth for custom words, so
+            // imported words go into the file (keeping its comments);
+            // otherwise the next start would restore the file's old list.
+            let mut settings = settings.clone();
+            let file = crate::custom_words::file(&app)?;
+            let current = crate::settings::get_settings(&app).custom_words;
+            settings.custom_words = file.replace(&current, &settings.custom_words)?;
+            let value = serde_json::to_value(&settings).map_err(|e| e.to_string())?;
             store.set("settings", value);
             store.save().map_err(|e| e.to_string())
         };

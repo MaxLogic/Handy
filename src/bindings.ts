@@ -389,9 +389,47 @@ async changeEnglishCleanupSettings(value: EnglishCleanupSettings) : Promise<Resu
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Replace the whole custom words list (used by setting resets).
+ */
 async updateCustomWords(words: string[]) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("update_custom_words", { words }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Add one word to `custom_words.txt`. Errors: `empty`, `comment_prefix`
+ * (the word starts with `#`), `file_unreadable`, or an I/O message.
+ */
+async addCustomWord(word: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_custom_word", { word }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Remove one word from `custom_words.txt`, keeping comments.
+ */
+async removeCustomWord(word: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_custom_word", { word }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Open `custom_words.txt` in the default text editor, recreating it from the
+ * current words if it was deleted.
+ */
+async openCustomWordsFile() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("open_custom_words_file") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
