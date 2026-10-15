@@ -121,6 +121,15 @@ fn classify_busy_input(
     }
 }
 
+/// Transcribe, transcribe-with-post-process and dictation profile bindings —
+/// not the assistant/command bindings and not cancel.
+fn is_dictation_binding(binding_id: &str) -> bool {
+    matches!(
+        WorkflowMode::from_binding_id(binding_id),
+        Some(WorkflowMode::Raw | WorkflowMode::Cleanup)
+    )
+}
+
 /// Pipeline lifecycle.
 #[derive(Debug, PartialEq, Eq)]
 enum Stage {
@@ -494,6 +503,22 @@ impl CoordinatorState {
                     // The key is still held (its release will end this
                     // recording), so a repeated press means nothing.
                     debug!("Ignoring press for '{}': key is held", input.binding_id);
+                }
+                // Dictation hotkeys are interchangeable for ending a locked
+                // recording: it ends exactly as the starting binding's press
+                // would, so its mode/profile is kept. A held recording still
+                // ends only on its own key's release.
+                Stage::Recording(id)
+                    if self.is_locked()
+                        && is_dictation_binding(id)
+                        && is_dictation_binding(&input.binding_id) =>
+                {
+                    debug!(
+                        "Press for '{}' ends the locked recording of '{id}'",
+                        input.binding_id
+                    );
+                    let id = id.clone();
+                    return Some(self.begin_processing(id, input.hotkey_string));
                 }
                 _ => debug!(
                     "Ignoring press for '{}': another binding is recording",
@@ -2601,19 +2626,14 @@ pub(crate) mod tests {
             WorkflowMode::Raw.binding_id(),
             Some(DictationSession::snapshot(WorkflowMode::Raw, &settings).unwrap()),
         );
-        // Another workflow cannot alter the recording already in progress.
-        assert!(state
-            .on_input(
-                workflow_input(WorkflowMode::Cleanup),
-                now + Duration::from_secs(1)
-            )
-            .is_none());
+        // Another dictation hotkey may end the recording (HANDY-014), but it
+        // cannot alter the recording's workflow: the Raw snapshot is kept.
         assert!(matches!(
             state.on_input(
-                workflow_input(WorkflowMode::Raw),
-                now + Duration::from_secs(2)
+                workflow_input(WorkflowMode::Cleanup),
+                now + Duration::from_secs(1)
             ),
-            Some(Effect::Stop { .. })
+            Some(Effect::Stop { binding_id, .. }) if binding_id == WorkflowMode::Raw.binding_id()
         ));
         let session = state.session.take().unwrap();
         let output = process_transcription_output(&session, "TFDQuery.").await;
@@ -2732,28 +2752,138 @@ pub(crate) mod tests {
         }
     }
 
+    /// HANDY-014: any dictation hotkey ends a locked recording, keeping the
+    /// starting binding (and therefore its mode/profile).
     #[test]
-    fn handy008_second_dictation_profile_is_ignored_while_first_records() {
+    fn handy014_second_dictation_profile_ends_toggle_recording_as_first() {
         let mut state = CoordinatorState::new();
         let now = Instant::now();
         assert!(matches!(
             state.on_input(toggle_input_for(DICTATION_A, false), now),
             Some(Effect::Start { binding_id, .. }) if binding_id == DICTATION_A
         ));
-        assert!(state
-            .on_input(
-                toggle_input_for(DICTATION_B, false),
-                now + Duration::from_millis(100)
-            )
-            .is_none());
-        assert_eq!(state.stage, Stage::Recording(DICTATION_A.into()));
         assert!(matches!(
             state.on_input(
-                toggle_input_for(DICTATION_A, false),
-                now + Duration::from_millis(200)
+                toggle_input_for(DICTATION_B, false),
+                now + Duration::from_millis(100)
             ),
             Some(Effect::Stop { binding_id, .. }) if binding_id == DICTATION_A
         ));
+        assert_eq!(state.stage, Stage::Processing);
+        assert!(state.on_processing_finished().is_none());
+        assert_eq!(state.stage, Stage::Idle);
+    }
+
+    fn tap_into_locked_recording(state: &mut CoordinatorState, binding: &str, t0: Instant) {
+        let mode = ShortcutActivation::HoldOrToggle;
+        assert!(matches!(
+            state.on_input(input_for(binding, mode, true), t0),
+            Some(Effect::Start { binding_id, .. }) if binding_id == binding
+        ));
+        assert!(state
+            .on_input(input_for(binding, mode, false), t0 + ms(100))
+            .is_none());
+        assert!(state.on_grace_expired().is_none());
+        assert!(state.is_locked());
+    }
+
+    #[test]
+    fn handy014_raw_hotkey_ends_tapped_post_process_recording_in_post_process_mode() {
+        let mode = ShortcutActivation::HoldOrToggle;
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        tap_into_locked_recording(&mut state, "transcribe_with_post_process", t0);
+
+        assert!(matches!(
+            state.on_input(input_for("transcribe", mode, true), t0 + ms(3000)),
+            Some(Effect::Stop { binding_id, .. }) if binding_id == "transcribe_with_post_process"
+        ));
+        assert_eq!(state.stage, Stage::Processing);
+        // The finishing key's release lands in the busy window: nothing queued.
+        assert!(state
+            .on_input(input_for("transcribe", mode, false), t0 + ms(3080))
+            .is_none());
+        assert!(state.on_grace_expired().is_none());
+        assert!(state.on_processing_finished().is_none());
+        assert_eq!(state.stage, Stage::Idle);
+    }
+
+    #[test]
+    fn handy014_post_process_and_profile_hotkeys_end_tapped_raw_recording() {
+        let mode = ShortcutActivation::HoldOrToggle;
+        for finisher in ["transcribe_with_post_process", DICTATION_A] {
+            let mut state = CoordinatorState::new();
+            let t0 = Instant::now();
+            tap_into_locked_recording(&mut state, "transcribe", t0);
+            assert!(matches!(
+                state.on_input(input_for(finisher, mode, true), t0 + ms(2000)),
+                Some(Effect::Stop { binding_id, .. }) if binding_id == "transcribe"
+            ));
+        }
+    }
+
+    #[test]
+    fn handy014_other_hotkey_ignored_while_starting_key_is_held() {
+        for mode in [
+            ShortcutActivation::HoldOrToggle,
+            ShortcutActivation::PushToTalk,
+        ] {
+            let mut state = CoordinatorState::new();
+            let t0 = Instant::now();
+            assert!(matches!(
+                state.on_input(input_for("transcribe", mode, true), t0),
+                Some(Effect::Start { .. })
+            ));
+            assert!(state
+                .on_input(
+                    input_for("transcribe_with_post_process", mode, true),
+                    t0 + ms(200)
+                )
+                .is_none());
+            assert_eq!(state.stage, Stage::Recording("transcribe".into()));
+        }
+    }
+
+    #[test]
+    fn handy014_assistant_and_cancel_do_not_end_a_locked_dictation() {
+        let mode = ShortcutActivation::HoldOrToggle;
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        tap_into_locked_recording(&mut state, "transcribe", t0);
+        assert_eq!(
+            state.on_input(input_for("assistant", mode, true), t0 + ms(1000)),
+            Some(Effect::RejectAssistant)
+        );
+        assert!(state
+            .on_input(input_for("cancel", mode, true), t0 + ms(2000))
+            .is_none());
+        assert_eq!(state.stage, Stage::Recording("transcribe".into()));
+    }
+
+    #[test]
+    fn handy014_dictation_hotkey_does_not_end_a_locked_assistant_session() {
+        let mode = ShortcutActivation::Toggle;
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        let Some(Effect::BeginCapture { session, .. }) =
+            state.on_input(input_for("assistant", mode, true), t0)
+        else {
+            panic!("expected assistant capture");
+        };
+        assert!(matches!(
+            state.on_capture_done(session, true),
+            CaptureResolution::Start(Effect::StartAssistant { .. })
+        ));
+        assert!(state.is_locked());
+        for (i, other) in ["transcribe", "transcribe_with_post_process", DICTATION_A]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(state
+                .on_input(input_for(other, mode, true), t0 + ms(1000 * (i as u64 + 1)))
+                .is_none());
+        }
+        assert_eq!(state.stage, Stage::Recording("assistant".into()));
     }
 
     #[test]

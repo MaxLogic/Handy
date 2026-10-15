@@ -1068,6 +1068,10 @@ pub fn run(cli_args: CliArgs) {
                 let _ = crate::managers::transcription::get_available_accelerators(&tm);
             });
 
+            // Load and warm up the selected model in the background so the
+            // first dictation after start does not wait for it (HANDY-014).
+            managers::transcription::preload_in_background(&app_handle, headless_mode, "startup");
+
             // Hide tray icon if --no-tray was passed
             if cli_args.no_tray {
                 tray::set_tray_visibility(&app_handle, false);

@@ -805,6 +805,14 @@ impl TranscriptionManager {
         });
     }
 
+    /// Block until any model load in progress has finished.
+    fn wait_for_load(&self) {
+        let mut is_loading = self.is_loading.lock().unwrap();
+        while *is_loading {
+            is_loading = self.loading_condvar.wait(is_loading).unwrap();
+        }
+    }
+
     pub fn get_current_model(&self) -> Option<String> {
         let current_model = self.current_model_id.lock().unwrap();
         current_model.clone()
@@ -1181,17 +1189,10 @@ impl TranscriptionManager {
             return Ok((String::new(), OutputLanguageEvidence::Unknown));
         }
 
-        // Check if model is loaded, if not try to load it
-        {
-            // If the model is loading, wait for it to complete.
-            let mut is_loading = self.is_loading.lock().unwrap();
-            while *is_loading {
-                is_loading = self.loading_condvar.wait(is_loading).unwrap();
-            }
-
-            if !self.is_model_loaded() {
-                return Err(anyhow::anyhow!("Model is not loaded for transcription."));
-            }
+        // If the model is loading, wait for it to complete.
+        self.wait_for_load();
+        if !self.is_model_loaded() {
+            return Err(anyhow::anyhow!("Model is not loaded for transcription."));
         }
 
         // Get current settings for configuration; the session's language is
@@ -2195,9 +2196,117 @@ pub fn get_available_accelerators(tm: &TranscriptionManager) -> AvailableAcceler
     }
 }
 
+/// Whether to load and warm up the selected model in the background (at
+/// startup and after a cancel). Not for the headless CLI, which loads its own
+/// model, and not when the user wants the model unloaded right after each use.
+fn should_preload_in_background(
+    headless: bool,
+    unload_timeout: ModelUnloadTimeout,
+    model_available: bool,
+) -> bool {
+    !headless && unload_timeout != ModelUnloadTimeout::Immediately && model_available
+}
+
+/// One second of 16 kHz silence: enough for a real run through the engine,
+/// which compiles its GPU pipelines, at negligible cost.
+const WARM_UP_SAMPLES: usize = 16_000;
+
+/// Load the selected model and the VAD on a background thread, then run one
+/// discarded inference on silence so the first dictation does not pay for
+/// worker start-up or GPU shader compilation. Nothing reaches history, the
+/// clipboard, the overlay or the UI. A dictation started meanwhile waits for
+/// the load as it always does.
+pub fn preload_in_background(app: &AppHandle, headless: bool, reason: &'static str) {
+    let app = app.clone();
+    thread::spawn(move || {
+        let settings = get_settings(&app);
+        let model_id = settings.selected_model.clone();
+        let model_available = !model_id.is_empty()
+            && app
+                .try_state::<Arc<ModelManager>>()
+                .is_some_and(|mm| mm.get_model_path(&model_id).is_ok());
+        if !should_preload_in_background(headless, settings.model_unload_timeout, model_available) {
+            info!(
+                "Background model preload ({reason}) skipped: unload timeout {:?}, model '{model_id}' available: {model_available}",
+                settings.model_unload_timeout
+            );
+            return;
+        }
+        let Some(tm) = app.try_state::<Arc<TranscriptionManager>>() else {
+            return;
+        };
+        let tm = Arc::clone(&tm);
+        if let Some(audio) = app.try_state::<Arc<AudioRecordingManager>>() {
+            if let Err(e) = audio.preload_vad() {
+                debug!("VAD pre-load failed: {}", e);
+            }
+        }
+
+        let started = Instant::now();
+        info!("Background model preload ({reason}): loading '{model_id}'");
+        tm.initiate_model_load();
+        tm.wait_for_load();
+        if !tm.is_model_loaded() {
+            warn!("Background model preload ({reason}): model '{model_id}' did not load");
+            return;
+        }
+        info!(
+            "Background model preload ({reason}): model '{model_id}' loaded in {}ms",
+            started.elapsed().as_millis()
+        );
+
+        // A recording already running will transcribe soon enough by itself;
+        // don't queue a warm-up run in front of it.
+        if app
+            .try_state::<Arc<AudioRecordingManager>>()
+            .is_some_and(|a| a.is_recording())
+        {
+            info!("Background warm-up ({reason}) skipped: recording in progress");
+            return;
+        }
+        let warm_up_started = Instant::now();
+        match tm.transcribe(vec![0.0; WARM_UP_SAMPLES]) {
+            Ok(_) => info!(
+                "Background warm-up ({reason}): first inference done in {}ms, model ready",
+                warm_up_started.elapsed().as_millis()
+            ),
+            Err(e) => warn!("Background warm-up ({reason}) failed: {e}"),
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handy014_background_preload_skipped_for_immediate_unload_headless_or_no_model() {
+        assert!(should_preload_in_background(
+            false,
+            ModelUnloadTimeout::Min5,
+            true
+        ));
+        assert!(should_preload_in_background(
+            false,
+            ModelUnloadTimeout::Never,
+            true
+        ));
+        assert!(!should_preload_in_background(
+            false,
+            ModelUnloadTimeout::Immediately,
+            true
+        ));
+        assert!(!should_preload_in_background(
+            true,
+            ModelUnloadTimeout::Min5,
+            true
+        ));
+        assert!(!should_preload_in_background(
+            false,
+            ModelUnloadTimeout::Min5,
+            false
+        ));
+    }
 
     fn languages(codes: &[&str]) -> Vec<String> {
         codes.iter().map(|code| (*code).to_string()).collect()

@@ -106,6 +106,9 @@ impl CancellationContext for AppHandle {
         hide_recording_overlay(self);
         self.state::<Arc<TranscriptionManager>>()
             .maybe_unload_immediately("cancellation");
+        // A cancel may have stopped the engine's worker; get the next one
+        // started and warm before the next dictation (HANDY-014).
+        crate::managers::transcription::preload_in_background(self, false, "cancel");
     }
     fn request_cancel(&self) -> bool {
         self.try_state::<TranscriptionCoordinator>()
