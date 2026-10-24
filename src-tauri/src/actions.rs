@@ -350,6 +350,16 @@ where
                             route,
                             prompt_sent,
                         }) => {
+                            // Prompted dictation may echo a formatting cue even after
+                            // inserting a break. Consume only source-backed echoes.
+                            let text = if prompt_sent {
+                                crate::dictation_formatting::consume_echoed_cues(
+                                    transcription,
+                                    &text,
+                                )
+                            } else {
+                                text
+                            };
                             post_processed_text = Some(text.clone());
                             final_text = text;
                             llm_route = Some(route);
@@ -1416,6 +1426,37 @@ mod tests {
         .await;
         assert_eq!(output.final_text, "Cleaned.");
         assert_eq!(output.paste_outcome(), Outcome::Pasted);
+    }
+
+    #[tokio::test]
+    async fn echoed_formatting_is_repaired_for_delivery_and_history_only_in_prompted_cleanup() {
+        let session = DictationSession::snapshot(
+            WorkflowMode::Cleanup,
+            &configured_settings("http://unused.invalid"),
+        )
+        .unwrap();
+        for prompt_sent in [true, false] {
+            let output = process_transcription_output_with(
+                &session,
+                "First. New paragraph, second.",
+                |_, _| {
+                    future::ready(Ok(prompts::CleanupOutcome::Cleaned {
+                        text: "First.\nNew paragraph, second.".into(),
+                        route: dictation_timing::LlmRoute::Default,
+                        prompt_sent,
+                    }))
+                },
+            )
+            .await;
+            let expected = if prompt_sent {
+                "First.\n\nsecond."
+            } else {
+                "First.\nNew paragraph, second."
+            };
+            assert_eq!(output.final_text, expected);
+            assert_eq!(output.post_processed_text.as_deref(), Some(expected));
+            assert!(output.cleanup_error.is_none());
+        }
     }
 
     #[tokio::test]

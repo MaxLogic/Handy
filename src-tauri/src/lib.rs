@@ -11,6 +11,7 @@ pub mod cli;
 mod clipboard;
 mod commands;
 mod custom_words;
+mod dictation_formatting;
 mod dictation_timing;
 pub mod engine_supervisor;
 mod fork_identity;
@@ -35,7 +36,7 @@ mod upstream_import;
 mod utils;
 
 pub use cli::CliArgs;
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 use specta_typescript::{BigIntExportBehavior, Typescript};
 use tauri_specta::{collect_commands, collect_events, Builder};
 pub use utils::{env_flag_enabled, set_env_default_unless};
