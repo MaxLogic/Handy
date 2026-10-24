@@ -374,10 +374,24 @@ impl CoordinatorState {
         // Releases in the hold modes are deferred above to absorb X11 auto-repeat.
         // External triggers are exempt: each one is a deliberate edge from the
         // user's own integration, and dropping it desyncs toggle parity.
+        // A different built-in stop key must also take priority, even just
+        // after a start or an ignored press. Same-binding repeats still follow
+        // the normal debounce and held-key rules.
+        let universal_stop = input.is_pressed
+            && matches!(
+                input.binding_id.as_str(),
+                "transcribe" | "transcribe_with_post_process"
+            )
+            && matches!(
+                &self.stage,
+                Stage::Capturing(active) | Stage::Recording(active)
+                    if active != &input.binding_id
+            );
         if input.is_pressed && !input.external {
-            if self
-                .last_press
-                .is_some_and(|t| now.duration_since(t) < DEBOUNCE)
+            if !universal_stop
+                && self
+                    .last_press
+                    .is_some_and(|t| now.duration_since(t) < DEBOUNCE)
             {
                 debug!("Debounced press for '{}'", input.binding_id);
                 return None;
@@ -395,6 +409,14 @@ impl CoordinatorState {
             return Some(Effect::RejectAssistant);
         }
         if let Stage::Capturing(id) = &self.stage {
+            if input.is_pressed
+                && matches!(
+                    input.binding_id.as_str(),
+                    "transcribe" | "transcribe_with_post_process"
+                )
+            {
+                return self.cancel_capture();
+            }
             if id != &input.binding_id {
                 return None;
             }
@@ -504,17 +526,21 @@ impl CoordinatorState {
                     // recording), so a repeated press means nothing.
                     debug!("Ignoring press for '{}': key is held", input.binding_id);
                 }
-                // Dictation hotkeys are interchangeable for ending a locked
-                // recording: it ends exactly as the starting binding's press
-                // would, so its mode/profile is kept. A held recording still
-                // ends only on its own key's release.
+                // Either built-in dictation shortcut finishes any recording,
+                // including held assistant/profile sessions. Keep the starting
+                // binding so its workflow and session snapshot finish normally.
+                // Other profile shortcuts remain interchangeable only for a
+                // locked dictation recording.
                 Stage::Recording(id)
-                    if self.is_locked()
+                    if matches!(
+                        input.binding_id.as_str(),
+                        "transcribe" | "transcribe_with_post_process"
+                    ) || (self.is_locked()
                         && is_dictation_binding(id)
-                        && is_dictation_binding(&input.binding_id) =>
+                        && is_dictation_binding(&input.binding_id)) =>
                 {
                     debug!(
-                        "Press for '{}' ends the locked recording of '{id}'",
+                        "Press for '{}' ends the recording of '{id}'",
                         input.binding_id
                     );
                     let id = id.clone();
@@ -2215,17 +2241,14 @@ pub(crate) mod tests {
         drop(slots);
     }
     #[test]
-    fn raw_and_cleanup_inputs_during_capture_are_ignored() {
+    fn other_profile_inputs_during_capture_are_ignored() {
         let mut state = CoordinatorState::new();
         let now = Instant::now();
         let id = capture(&mut state, ShortcutActivation::Toggle, now);
-        for (n, workflow) in [WorkflowMode::Raw, WorkflowMode::Cleanup]
-            .into_iter()
-            .enumerate()
-        {
+        for (n, binding) in [DICTATION_A, DICTATION_B].into_iter().enumerate() {
             assert!(state
                 .on_input(
-                    workflow_input(workflow),
+                    input_for(binding, ShortcutActivation::Toggle, true),
                     now + Duration::from_millis(100 + n as u64 * 100)
                 )
                 .is_none());
@@ -2288,13 +2311,13 @@ pub(crate) mod tests {
         );
         assert_eq!(executor.app.runtime.lock().unwrap().starts, 1);
         assert_eq!(released.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert!(matches!(
-            state.on_input(
-                assistant_input(ShortcutActivation::Toggle, true),
-                now + Duration::from_secs(1)
-            ),
-            Some(Effect::Stop { .. })
-        ));
+        let Some(Effect::Stop { binding_id, .. }) = state.on_input(
+            workflow_input(WorkflowMode::Raw),
+            now + Duration::from_secs(1),
+        ) else {
+            panic!("built-in shortcut must finish the assistant recording");
+        };
+        assert_eq!(binding_id, "assistant");
         // Simulate the audio/STT boundary after the real coordinator stop edge.
         executor.app.runtime.lock().unwrap().mic = None;
         let session = state
@@ -2823,7 +2846,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn handy014_other_hotkey_ignored_while_starting_key_is_held() {
+    fn handy014_other_profile_hotkey_ignored_while_starting_key_is_held() {
         for mode in [
             ShortcutActivation::HoldOrToggle,
             ShortcutActivation::PushToTalk,
@@ -2835,10 +2858,7 @@ pub(crate) mod tests {
                 Some(Effect::Start { .. })
             ));
             assert!(state
-                .on_input(
-                    input_for("transcribe_with_post_process", mode, true),
-                    t0 + ms(200)
-                )
+                .on_input(input_for(DICTATION_A, mode, true), t0 + ms(200))
                 .is_none());
             assert_eq!(state.stage, Stage::Recording("transcribe".into()));
         }
@@ -2861,29 +2881,80 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn handy014_dictation_hotkey_does_not_end_a_locked_assistant_session() {
-        let mode = ShortcutActivation::Toggle;
-        let mut state = CoordinatorState::new();
-        let t0 = Instant::now();
-        let Some(Effect::BeginCapture { session, .. }) =
-            state.on_input(input_for("assistant", mode, true), t0)
-        else {
-            panic!("expected assistant capture");
-        };
-        assert!(matches!(
-            state.on_capture_done(session, true),
-            CaptureResolution::Start(Effect::StartAssistant { .. })
-        ));
-        assert!(state.is_locked());
-        for (i, other) in ["transcribe", "transcribe_with_post_process", DICTATION_A]
-            .into_iter()
-            .enumerate()
-        {
-            assert!(state
-                .on_input(input_for(other, mode, true), t0 + ms(1000 * (i as u64 + 1)))
-                .is_none());
+    fn builtin_stop_shortcuts_finish_any_recording_in_its_starting_workflow() {
+        for starter in [
+            "transcribe",
+            "transcribe_with_post_process",
+            DICTATION_A,
+            "assistant",
+            COMMAND_X,
+        ] {
+            for finisher in ["transcribe", "transcribe_with_post_process"] {
+                // A repeated key-down while that same key is held is not a
+                // second intentional shortcut press. Existing hold tests cover it.
+                if starter == finisher {
+                    continue;
+                }
+                for mode in [
+                    ShortcutActivation::Toggle,
+                    ShortcutActivation::PushToTalk,
+                    ShortcutActivation::HoldOrToggle,
+                ] {
+                    let mut state = CoordinatorState::new();
+                    let t0 = Instant::now();
+                    match state.on_input(input_for(starter, mode, true), t0) {
+                        Some(Effect::Start { .. }) => {}
+                        Some(Effect::BeginCapture { session, .. }) => {
+                            assert!(matches!(
+                                state.on_capture_done(session, true),
+                                CaptureResolution::Start(Effect::StartAssistant { .. })
+                            ));
+                        }
+                        other => panic!("expected recording start: {other:?}"),
+                    }
+                    assert_eq!(state.stage, Stage::Recording(starter.into()));
+                    assert!(
+                        matches!(state.on_input(input_for(finisher, mode, true), t0 + ms(20)), Some(Effect::Stop { binding_id, .. }) if binding_id == starter),
+                        "{finisher} must stop {starter} in {mode:?}"
+                    );
+                    assert_eq!(state.stage, Stage::Processing);
+                    assert!(state
+                        .on_input(input_for(finisher, mode, false), t0 + ms(150))
+                        .is_none());
+                    assert!(state
+                        .on_input(input_for(starter, mode, false), t0 + ms(200))
+                        .is_none());
+                    assert!(state.on_grace_expired().is_none());
+                    assert!(state.on_processing_finished().is_none());
+                    assert_eq!(state.stage, Stage::Idle);
+                }
+            }
         }
-        assert_eq!(state.stage, Stage::Recording("assistant".into()));
+    }
+
+    #[test]
+    fn builtin_stop_shortcuts_cancel_pending_selection_capture() {
+        for finisher in ["transcribe", "transcribe_with_post_process"] {
+            let mut state = CoordinatorState::new();
+            let t0 = Instant::now();
+            let Some(Effect::BeginCapture { session, .. }) =
+                state.on_input(input_for("assistant", ShortcutActivation::Toggle, true), t0)
+            else {
+                panic!("expected capture");
+            };
+            assert_eq!(
+                state.on_input(
+                    input_for(finisher, ShortcutActivation::Toggle, true),
+                    t0 + ms(20)
+                ),
+                Some(Effect::CancelCapture { session })
+            );
+            assert_eq!(state.stage, Stage::Idle);
+            assert_eq!(
+                state.on_capture_done(session, true),
+                CaptureResolution::Discard
+            );
+        }
     }
 
     #[test]
