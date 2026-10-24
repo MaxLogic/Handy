@@ -834,6 +834,10 @@ struct FakePlatform {
     validations: VecDeque<Result<(), StaleReason>>,
     begin: Option<BeginClipboardError>,
     still_owned: bool,
+    ownership: Option<Arc<AtomicBool>>,
+    validation_delay: Duration,
+    prepare_delay: Duration,
+    clipboard_busy_until: Option<Instant>,
     modifier_polls_held: usize,
     modifier_polls: std::cell::Cell<usize>,
     /// Answers of successive `clipboard_free` calls, then the default.
@@ -862,6 +866,10 @@ impl FakePlatform {
             validations: VecDeque::new(),
             begin: None,
             still_owned: true,
+            ownership: None,
+            validation_delay: Duration::ZERO,
+            prepare_delay: Duration::ZERO,
+            clipboard_busy_until: None,
             modifier_polls_held: 0,
             modifier_polls: std::cell::Cell::new(0),
             clipboard_free_script: std::cell::RefCell::new(VecDeque::new()),
@@ -883,20 +891,18 @@ impl FakePlatform {
     }
 
     fn injected(&self) -> bool {
+        assert!(self.calls.iter().filter(|c| *c == "inject").count() <= 1);
         self.calls.iter().any(|c| c == "inject")
     }
 }
 
 impl CommitPlatform for FakePlatform {
-    fn validate(
-        &mut self,
-        _id: TargetId,
-        boundary: bool,
-        deadline: Instant,
-    ) -> Result<(), StaleReason> {
+    fn validate(&mut self, _id: TargetId, deadline: Instant) -> Result<(), StaleReason> {
         assert!(deadline > Instant::now());
+        let boundary = self.calls.iter().any(|c| c == "begin_clipboard");
         self.calls.push(format!("validate(boundary={boundary})"));
         if boundary {
+            std::thread::sleep(self.validation_delay);
             self.modifier_after_boundary
                 .set(self.hold_modifier_at_boundary);
             if let Some(on_validate) = &self.on_boundary_validate {
@@ -904,6 +910,12 @@ impl CommitPlatform for FakePlatform {
             }
         }
         self.validations.pop_front().unwrap_or(Ok(()))
+    }
+    fn prepare_injection(&mut self, _id: TargetId, deadline: Instant) -> Result<(), StaleReason> {
+        assert!(deadline > Instant::now());
+        self.calls.push("prepare_injection".into());
+        std::thread::sleep(self.prepare_delay);
+        Ok(())
     }
     fn begin_clipboard(
         &mut self,
@@ -921,10 +933,17 @@ impl CommitPlatform for FakePlatform {
     }
     fn clipboard_still_owned(&self) -> bool {
         self.still_owned
+            && self
+                .ownership
+                .as_ref()
+                .is_none_or(|owned| owned.load(Ordering::SeqCst))
     }
     fn clipboard_free(&self) -> bool {
         let mut script = self.clipboard_free_script.borrow_mut();
-        let free = script.pop_front().unwrap_or(self.clipboard_free_default);
+        let free = script.pop_front().unwrap_or(self.clipboard_free_default)
+            && self
+                .clipboard_busy_until
+                .is_none_or(|until| Instant::now() >= until);
         self.calls_free.set(self.calls_free.get() + 1);
         if self.calls_free.get() == 1 {
             if let Some(on_check) = &self.on_first_free_check {
@@ -999,6 +1018,7 @@ fn commit_receipt_and_verified_text_is_delivered() {
             "validate(boundary=false)",
             "begin_clipboard",
             "validate(boundary=true)",
+            "prepare_injection",
             "inject",
             "await_settlement",
             "verify(8)",
@@ -1187,7 +1207,7 @@ fn commit_refuses_held_modifiers_after_wait() {
     p.modifier_polls_held = 3;
     let (outcome, _) = run(&mut p, "x");
     assert!(matches!(outcome, CommitOutcome::Delivered { .. }));
-    assert_eq!(p.modifier_polls.get(), 5); // release wait plus injection-boundary check
+    assert_eq!(p.modifier_polls.get(), 6); // release wait plus both injection-boundary checks
 }
 
 #[test]
@@ -1199,7 +1219,11 @@ fn commit_waits_for_held_clipboard_then_injects() {
         .extend([false, false, true]);
     let (outcome, _) = run(&mut p, "x");
     assert!(matches!(outcome, CommitOutcome::Delivered { .. }));
-    assert_eq!(p.calls_free.get(), 4, "3 waiting polls + 1 final check");
+    assert_eq!(
+        p.calls_free.get(),
+        5,
+        "3 readiness checks + validated and prepared checks"
+    );
     assert!(p.injected());
 }
 
@@ -1222,25 +1246,179 @@ fn commit_held_clipboard_past_deadline_refuses_and_restores() {
         "nothing may be sent while the clipboard is held"
     );
     assert_eq!(p.calls.last().map(String::as_str), Some("abort"));
-    // Waiting happens before the boundary validation.
-    assert!(!p.calls.contains(&"validate(boundary=true)".to_string()));
+    // Repeated validation keeps the original target protected while waiting.
+    assert!(p.calls.contains(&"validate(boundary=true)".to_string()));
+    assert!(!p.calls.contains(&"prepare_injection".to_string()));
     assert_eq!(released.try_recv().ok(), Some(TargetId(5)));
 }
 
 #[test]
-fn commit_clipboard_grabbed_during_boundary_validation_refuses() {
+fn commit_clipboard_grabbed_during_validation_retries_before_injection() {
     let mut p = FakePlatform::new();
     p.clipboard_free_script.borrow_mut().extend([true, false]);
     let (outcome, _) = run(&mut p, "x");
+    assert!(matches!(outcome, CommitOutcome::Delivered { .. }));
     assert_eq!(
+        p.calls.iter().filter(|c| *c == "begin_clipboard").count(),
+        1
+    );
+    assert_eq!(p.calls.iter().filter(|c| *c == "inject").count(), 1);
+    assert_eq!(
+        p.calls
+            .iter()
+            .filter(|c| *c == "validate(boundary=true)")
+            .count(),
+        2,
+        "the original target must be revalidated after contention"
+    );
+}
+
+#[test]
+fn commit_retry_revalidates_original_target_and_refuses_stale() {
+    let mut p = FakePlatform::new();
+    p.clipboard_free_script.borrow_mut().extend([true, false]);
+    p.validations
+        .extend([Ok(()), Ok(()), Err(StaleReason::SelectionChanged)]);
+    let (outcome, _) = run(&mut p, "x");
+    assert!(matches!(
+        outcome,
+        CommitOutcome::Refused {
+            reason: RefuseReason::TargetStale(StaleReason::SelectionChanged),
+            clipboard: ClipboardSettlement::Restored,
+        }
+    ));
+    assert!(!p.injected());
+    assert!(!p.calls.iter().any(|c| c == "prepare_injection"));
+    assert_eq!(
+        p.calls.iter().filter(|c| *c == "begin_clipboard").count(),
+        1
+    );
+}
+
+#[test]
+fn commit_retry_preserves_original_aba_invalidation() {
+    let mut p = FakePlatform::new();
+    p.clipboard_free_default = false;
+    let (tok, released) = token(5, 1);
+    let original = Arc::clone(&tok.invalidation);
+    p.on_first_free_check = Some(Box::new(move || {
+        // A return to the captured endpoint does not restore authority.
+        invalidate(&original, InvalidationReason::TextSelection);
+    }));
+    let outcome = run_commit(
+        &mut p,
+        CommitRequest {
+            token: tok,
+            session: SessionId(1),
+            replacement: "recoverable replacement",
+            clipboard_handling: ClipboardHandling::DontModify,
+            is_cancelled: &not_cancelled,
+        },
+        &|| false,
+    );
+    assert!(matches!(
+        outcome,
+        CommitOutcome::Refused {
+            reason: RefuseReason::TargetStale(StaleReason::Invalidated(
+                InvalidationReason::TextSelection
+            )),
+            clipboard: ClipboardSettlement::Restored,
+        }
+    ));
+    assert!(!p.injected());
+    assert!(!p.calls.iter().any(|c| c == "prepare_injection"));
+    assert_eq!(released.try_recv().ok(), Some(TargetId(5)));
+}
+
+#[test]
+fn commit_busy_after_preparation_refuses_without_retry_or_injection() {
+    let mut p = FakePlatform::new();
+    p.clipboard_free_script
+        .borrow_mut()
+        .extend([true, true, false]);
+    let (outcome, _) = run(&mut p, "x");
+    assert!(matches!(
         outcome,
         CommitOutcome::Refused {
             reason: RefuseReason::ClipboardBusy,
             clipboard: ClipboardSettlement::Restored,
         }
+    ));
+    assert_eq!(
+        p.calls.iter().filter(|c| *c == "prepare_injection").count(),
+        1
     );
-    assert!(p.calls.contains(&"validate(boundary=true)".to_string()));
+    assert_eq!(
+        p.calls
+            .iter()
+            .filter(|c| *c == "validate(boundary=true)")
+            .count(),
+        1
+    );
     assert!(!p.injected());
+}
+
+#[test]
+fn commit_recovers_clipboard_contention_longer_than_previous_budget() {
+    let mut p = FakePlatform::new();
+    let started = Instant::now();
+    p.clipboard_busy_until = Some(started + Duration::from_millis(500));
+    let (outcome, _) = run(&mut p, "x");
+    assert!(matches!(outcome, CommitOutcome::Delivered { .. }));
+    assert!(started.elapsed() >= Duration::from_millis(500));
+    assert!(started.elapsed() < CLIPBOARD_FREE_WAIT + Duration::from_millis(500));
+    assert_eq!(
+        p.calls.iter().filter(|c| *c == "begin_clipboard").count(),
+        1
+    );
+    assert_eq!(p.calls.iter().filter(|c| *c == "inject").count(), 1);
+}
+
+#[test]
+fn commit_ownership_loss_during_readiness_validation_never_injects() {
+    let mut p = FakePlatform::new();
+    let owned = Arc::new(AtomicBool::new(true));
+    let changed = Arc::clone(&owned);
+    p.ownership = Some(owned);
+    p.clipboard_free_default = false;
+    p.on_boundary_validate = Some(Box::new(move || changed.store(false, Ordering::SeqCst)));
+    p.abort_result = ClipboardSettlement::ExternallyChanged;
+    let (outcome, _) = run(&mut p, "x");
+    assert!(matches!(
+        outcome,
+        CommitOutcome::Refused {
+            reason: RefuseReason::ClipboardChanged,
+            clipboard: ClipboardSettlement::ExternallyChanged,
+        }
+    ));
+    assert!(!p.injected());
+    assert!(!p.calls.iter().any(|c| c == "prepare_injection"));
+}
+
+#[test]
+fn commit_late_validation_or_preparation_reply_cannot_extend_readiness_budget() {
+    for prepare in [false, true] {
+        let mut p = FakePlatform::new();
+        let delay = CLIPBOARD_FREE_WAIT + Duration::from_millis(20);
+        if prepare {
+            p.prepare_delay = delay;
+        } else {
+            p.validation_delay = delay;
+        }
+        let (outcome, _) = run(&mut p, "x");
+        assert!(matches!(
+            outcome,
+            CommitOutcome::Refused {
+                reason: RefuseReason::ClipboardBusy,
+                clipboard: ClipboardSettlement::Restored,
+            }
+        ));
+        assert!(!p.injected());
+        assert_eq!(
+            p.calls.iter().filter(|c| *c == "prepare_injection").count(),
+            usize::from(prepare)
+        );
+    }
 }
 
 #[test]

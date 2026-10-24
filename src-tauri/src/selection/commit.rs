@@ -13,8 +13,9 @@ use crate::paste_tx::{ChordResult, StrictSettlement};
 pub(crate) const MODIFIER_WAIT: Duration = Duration::from_millis(300);
 pub(crate) const MODIFIER_POLL: Duration = Duration::from_millis(10);
 /// How long injection may wait for another process to close the clipboard.
-pub(crate) const CLIPBOARD_FREE_WAIT: Duration = Duration::from_millis(300);
-pub(crate) const CLIPBOARD_FREE_POLL: Duration = Duration::from_millis(3);
+pub(crate) const CLIPBOARD_FREE_WAIT: Duration = Duration::from_millis(1500);
+pub(crate) const CLIPBOARD_FREE_POLL: Duration = Duration::from_millis(5);
+const CLIPBOARD_FREE_MAX_POLL: Duration = Duration::from_millis(50);
 
 /// Why the strict clipboard transaction could not start. Each carries the
 /// clipboard state it left behind.
@@ -26,15 +27,11 @@ pub(crate) enum BeginClipboardError {
 
 /// Platform operations of a strict commit.
 pub(crate) trait CommitPlatform {
-    /// Re-validates the target. `boundary = true` is the final check right
-    /// before injection; on success it also disarms the event hooks so the
-    /// paste's own events are not counted.
-    fn validate(
-        &mut self,
-        id: TargetId,
-        boundary: bool,
-        deadline: Instant,
-    ) -> Result<(), StaleReason>;
+    /// Re-validates the original target while retaining all invalidation hooks.
+    fn validate(&mut self, id: TargetId, deadline: Instant) -> Result<(), StaleReason>;
+    /// Drains pending invalidations and disarms hooks only on success.
+    /// No waits or retries are permitted after this injection preparation.
+    fn prepare_injection(&mut self, id: TargetId, deadline: Instant) -> Result<(), StaleReason>;
     /// Strict snapshot and publish of `text`, verbatim.
     fn begin_clipboard(
         &mut self,
@@ -58,7 +55,8 @@ fn refused(reason: RefuseReason, clipboard: ClipboardSettlement) -> CommitOutcom
 }
 
 /// Runs the strict commit. The token is consumed and dropped (released) on
-/// every path. Nothing is retried; cancellation after injection is ignored.
+/// every path. Only pre-injection clipboard readiness is retried; publication
+/// and injection each happen at most once. Cancellation after injection is ignored.
 pub(crate) fn run_commit<P: CommitPlatform>(
     platform: &mut P,
     req: CommitRequest<'_>,
@@ -95,7 +93,7 @@ pub(crate) fn run_commit<P: CommitPlatform>(
     }
 
     // 2. Validate before any clipboard work: no churn for a stale target.
-    if let Err(stale) = platform.validate(id, false, Instant::now() + VALIDATE_TIMEOUT) {
+    if let Err(stale) = platform.validate(id, Instant::now() + VALIDATE_TIMEOUT) {
         return refused(RefuseReason::TargetStale(stale), untouched());
     }
 
@@ -108,10 +106,28 @@ pub(crate) fn run_commit<P: CommitPlatform>(
         }
     }
 
-    // 4. Physically held modifiers would change the chord (Alt+Ctrl+V is
-    // AltGr+V); wait briefly for release.
+    // Hooks retain the capture-time authority throughout every wait and every
+    // endpoint read, including change-and-change-back events.
+    let authority_refusal = || {
+        if is_cancelled() {
+            Some(RefuseReason::Cancelled)
+        } else if shutting_down() {
+            Some(RefuseReason::Shutdown)
+        } else {
+            token
+                .invalidation()
+                .map(|reason| RefuseReason::TargetStale(StaleReason::Invalidated(reason)))
+        }
+    };
     let modifier_deadline = Instant::now() + MODIFIER_WAIT;
     while platform.modifiers_held() {
+        let reason = authority_refusal().or_else(|| {
+            (!platform.clipboard_still_owned()).then_some(RefuseReason::ClipboardChanged)
+        });
+        if let Some(reason) = reason {
+            let clipboard = platform.abort_clipboard();
+            return refused(reason, clipboard);
+        }
         if Instant::now() >= modifier_deadline {
             let clipboard = platform.abort_clipboard();
             return refused(RefuseReason::ModifiersHeld, clipboard);
@@ -119,72 +135,110 @@ pub(crate) fn run_commit<P: CommitPlatform>(
         std::thread::sleep(MODIFIER_POLL);
     }
 
-    // 5. Last chance to honour cancellation or shutdown.
-    if is_cancelled() {
-        let clipboard = platform.abort_clipboard();
-        return refused(RefuseReason::Cancelled, clipboard);
-    }
-    if shutting_down() {
-        let clipboard = platform.abort_clipboard();
-        return refused(RefuseReason::Shutdown, clipboard);
-    }
-
-    // 5b. Another process holding the clipboard open when the target pastes
-    // makes the target's own OpenClipboard fail, and the paste silently does
-    // nothing (observed live with WSLg's msrdc clipboard sync). Wait, bounded,
-    // until the clipboard is free; if it never frees, refuse before sending
-    // anything. Waiting happens before the boundary validation, which
-    // disarms the change hooks, so the target stays protected while we wait.
-    let free_deadline = Instant::now() + CLIPBOARD_FREE_WAIT;
-    while !platform.clipboard_free() {
+    // Clipboard readers (notably WSLg synchronization) can hold the clipboard
+    // briefly, including during target validation. Retry readiness only; never
+    // republish the replacement or reacquire capture authority.
+    let started = Instant::now();
+    let free_deadline = started + CLIPBOARD_FREE_WAIT;
+    let mut backoff = CLIPBOARD_FREE_POLL;
+    let mut retries = 0;
+    loop {
+        if let Some(reason) = authority_refusal() {
+            let clipboard = platform.abort_clipboard();
+            return refused(reason, clipboard);
+        }
+        if !platform.clipboard_still_owned() {
+            let clipboard = platform.abort_clipboard();
+            return refused(RefuseReason::ClipboardChanged, clipboard);
+        }
+        if Instant::now() >= free_deadline {
+            log::debug!(
+                "[selection] clipboard busy: phase=readiness retries={} elapsed_ms={}",
+                retries,
+                started.elapsed().as_millis()
+            );
+            let clipboard = platform.abort_clipboard();
+            return refused(RefuseReason::ClipboardBusy, clipboard);
+        }
+        let free_before_validation = platform.clipboard_free();
+        if let Err(stale) =
+            platform.validate(id, (Instant::now() + VALIDATE_TIMEOUT).min(free_deadline))
+        {
+            let clipboard = platform.abort_clipboard();
+            return refused(RefuseReason::TargetStale(stale), clipboard);
+        }
+        if let Some(reason) = authority_refusal() {
+            let clipboard = platform.abort_clipboard();
+            return refused(reason, clipboard);
+        }
+        if !platform.clipboard_still_owned() {
+            let clipboard = platform.abort_clipboard();
+            return refused(RefuseReason::ClipboardChanged, clipboard);
+        }
         if Instant::now() >= free_deadline {
             let clipboard = platform.abort_clipboard();
             return refused(RefuseReason::ClipboardBusy, clipboard);
         }
-        std::thread::sleep(CLIPBOARD_FREE_POLL);
-    }
-    // Cancellation and shutdown can arrive while a clipboard reader holds
-    // the lock. They still precede injection and must leave text recoverable.
-    if is_cancelled() {
-        let clipboard = platform.abort_clipboard();
-        return refused(RefuseReason::Cancelled, clipboard);
-    }
-    if shutting_down() {
-        let clipboard = platform.abort_clipboard();
-        return refused(RefuseReason::Shutdown, clipboard);
-    }
-
-    // 6. Final validation at the injection boundary, then clipboard
-    // ownership: a user copy made after publishing must not be pasted.
-    if let Err(stale) = platform.validate(id, true, Instant::now() + VALIDATE_TIMEOUT) {
-        let clipboard = platform.abort_clipboard();
-        return refused(RefuseReason::TargetStale(stale), clipboard);
-    }
-    if !platform.clipboard_still_owned() {
-        let clipboard = platform.abort_clipboard();
-        return refused(RefuseReason::ClipboardChanged, clipboard);
-    }
-    // Re-check without waiting: the hooks are disarmed now, so a reader that
-    // grabbed the clipboard during validation means refusing, not waiting.
-    if !platform.clipboard_free() {
-        let clipboard = platform.abort_clipboard();
-        return refused(RefuseReason::ClipboardBusy, clipboard);
-    }
-
-    // Validation may block for a full UIA timeout. These checks must be after
-    // every wait/read and immediately before the chord, with guarded abort.
-    if is_cancelled() {
-        let clipboard = platform.abort_clipboard();
-        return refused(RefuseReason::Cancelled, clipboard);
-    }
-    if shutting_down() {
-        let clipboard = platform.abort_clipboard();
-        return refused(RefuseReason::Shutdown, clipboard);
+        if free_before_validation && platform.clipboard_free() {
+            break;
+        }
+        let remaining = free_deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            std::thread::sleep(backoff.min(remaining));
+        }
+        retries += 1;
+        backoff = (backoff * 2).min(CLIPBOARD_FREE_MAX_POLL);
     }
     if platform.modifiers_held() {
         let clipboard = platform.abort_clipboard();
         return refused(RefuseReason::ModifiersHeld, clipboard);
     }
+    // Commit the hook lifecycle only after readiness succeeds. This operation
+    // drains the worker queue and checks the original invalidation flag before
+    // unhooking, preserving ABA protection until the last immediate boundary.
+    if let Err(stale) = platform.prepare_injection(id, free_deadline) {
+        let clipboard = platform.abort_clipboard();
+        return refused(RefuseReason::TargetStale(stale), clipboard);
+    }
+    if let Some(reason) = authority_refusal() {
+        let clipboard = platform.abort_clipboard();
+        return refused(reason, clipboard);
+    }
+    if !platform.clipboard_still_owned() {
+        let clipboard = platform.abort_clipboard();
+        return refused(RefuseReason::ClipboardChanged, clipboard);
+    }
+    if Instant::now() >= free_deadline {
+        let clipboard = platform.abort_clipboard();
+        return refused(RefuseReason::ClipboardBusy, clipboard);
+    }
+    // No waiting after hooks are disarmed: a newly arriving reader refuses.
+    if !platform.clipboard_free() {
+        log::debug!(
+            "[selection] clipboard busy: phase=prepared retries={} elapsed_ms={}",
+            retries,
+            started.elapsed().as_millis()
+        );
+        let clipboard = platform.abort_clipboard();
+        return refused(RefuseReason::ClipboardBusy, clipboard);
+    }
+    if platform.modifiers_held() {
+        let clipboard = platform.abort_clipboard();
+        return refused(RefuseReason::ModifiersHeld, clipboard);
+    }
+    if let Some(reason) = authority_refusal() {
+        let clipboard = platform.abort_clipboard();
+        return refused(reason, clipboard);
+    }
+    if Instant::now() >= free_deadline {
+        let clipboard = platform.abort_clipboard();
+        return refused(RefuseReason::ClipboardBusy, clipboard);
+    }
+    log::debug!(
+        "[selection] clipboard ready: retries={} elapsed_ms={}",
+        retries,
+        started.elapsed().as_millis()
+    );
     // 7. Inject immediately.
     let chord = platform.inject_paste();
     if let ChordResult::NotSent(message) = chord {

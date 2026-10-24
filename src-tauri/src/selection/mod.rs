@@ -15,8 +15,14 @@
 
 mod commit;
 mod evidence;
+#[cfg(target_os = "windows")]
+mod native_scintilla;
+#[cfg(any(test, target_os = "windows"))]
+mod native_scintilla_evidence;
 #[cfg(all(test, target_os = "windows"))]
 mod probe;
+#[cfg(all(test, target_os = "windows"))]
+mod scintilla_probe;
 #[cfg(test)]
 mod tests;
 #[cfg(target_os = "windows")]

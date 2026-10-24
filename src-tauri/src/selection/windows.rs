@@ -52,6 +52,8 @@ use super::evidence::{
     self, classify_capture, compare_evidence, CaptureFacts, LiveTarget, OriginalSelection,
     TargetIdentity, WIN32_EDIT_CLASSES,
 };
+use super::native_scintilla::{self, Target as ScintillaTarget};
+use super::native_scintilla_evidence::Error as NativeError;
 use super::{
     invalidate, invalidation_of, CaptureError, CaptureReply, Captured, CapturedText,
     ClipboardHandling, ClipboardSettlement, FailReason, InvalidationReason, RefuseReason, Releaser,
@@ -112,7 +114,11 @@ enum Cmd {
     },
     Validate {
         id: TargetId,
-        boundary: bool,
+        deadline: Instant,
+        reply: Sender<Result<(), StaleReason>>,
+    },
+    PrepareInjection {
+        id: TargetId,
         deadline: Instant,
         reply: Sender<Result<(), StaleReason>>,
     },
@@ -200,7 +206,6 @@ pub(super) fn probe_validate(id: TargetId) -> Result<(), StaleReason> {
     request(
         |reply| Cmd::Validate {
             id,
-            boundary: false,
             deadline,
             reply,
         },
@@ -365,7 +370,14 @@ unsafe extern "system" fn win_event_proc(
     _thread: u32,
     _time: u32,
 ) {
-    if let Some(reason) = evidence::classify_event(event, id_object) {
+    // NAMECHANGE is hooked only for native Notepad++: status updates carry
+    // selection/content dirty flags, including anchor-only change-and-return.
+    let reason = if event == 0x800C {
+        Some(InvalidationReason::TextSelection)
+    } else {
+        evidence::classify_event(event, id_object)
+    };
+    if let Some(reason) = reason {
         HOOK_FLAG.with(|slot| {
             if let Ok(slot) = slot.try_borrow() {
                 if let Some(flag) = slot.as_ref() {
@@ -387,14 +399,21 @@ fn unhook_all(hooks: &mut Vec<HWINEVENTHOOK>) {
 }
 
 /// Installs the four invalidation hooks for `pid` (foreground is global).
-fn install_hooks(pid: u32, flag: &Arc<AtomicU8>) -> Result<Vec<HWINEVENTHOOK>, CaptureError> {
+fn install_hooks(
+    pid: u32,
+    flag: &Arc<AtomicU8>,
+    native: bool,
+) -> Result<Vec<HWINEVENTHOOK>, CaptureError> {
     HOOK_FLAG.with(|slot| *slot.borrow_mut() = Some(flag.clone()));
-    let specs = [
+    let mut specs = vec![
         (evidence::EVENT_SYSTEM_FOREGROUND, 0u32),
         (evidence::EVENT_OBJECT_FOCUS, pid),
         (evidence::EVENT_OBJECT_LOCATIONCHANGE, pid),
         (evidence::EVENT_OBJECT_TEXTSELECTIONCHANGED, pid),
     ];
+    if native {
+        specs.push((0x800C, pid));
+    }
     let mut hooks = Vec::with_capacity(specs.len());
     for (event, process) in specs {
         // SAFETY: out-of-context hook with a 'static callback; removed by
@@ -489,10 +508,17 @@ fn create_uia() -> windows::core::Result<Uia> {
 
 struct Tracked {
     id: TargetId,
-    identity: TargetIdentity,
-    range: IUIAutomationTextRange,
+    target: TrackedTarget,
     flag: Arc<AtomicU8>,
     hooks: Vec<HWINEVENTHOOK>,
+}
+
+enum TrackedTarget {
+    Uia {
+        identity: TargetIdentity,
+        range: IUIAutomationTextRange,
+    },
+    Scintilla(ScintillaTarget),
 }
 
 struct Worker {
@@ -509,7 +535,90 @@ struct CaptureRead {
     range: Option<IUIAutomationTextRange>,
 }
 
+fn native_capture_error(error: NativeError) -> CaptureError {
+    match error {
+        NativeError::Unsupported => CaptureError::UnsupportedTarget,
+        NativeError::Disabled => CaptureError::Disabled,
+        NativeError::ReadOnly => CaptureError::ReadOnly,
+        NativeError::MultipleSelections => CaptureError::MultipleSelections,
+        NativeError::TooLarge => CaptureError::SelectionTooLarge,
+        NativeError::InvalidText => CaptureError::InvalidText,
+        NativeError::Changed => CaptureError::TargetChangedDuringCapture,
+        NativeError::Timeout => CaptureError::Timeout,
+        NativeError::Identity => CaptureError::TargetIdentityUnavailable,
+        NativeError::InvalidPosition | NativeError::ReadFailed => {
+            CaptureError::Provider("native selection read failed".into())
+        }
+    }
+}
+
+fn native_stale_error(error: NativeError) -> StaleReason {
+    match error {
+        NativeError::Timeout => StaleReason::Unresponsive,
+        NativeError::Identity => StaleReason::FocusChanged,
+        NativeError::Changed => StaleReason::SelectionChanged,
+        _ => StaleReason::Provider("native target no longer verifiable".into()),
+    }
+}
+
 impl Worker {
+    fn capture_native(
+        &mut self,
+        session: SessionId,
+        foreground: HWND,
+        deadline: Instant,
+    ) -> Result<Captured, CaptureError> {
+        let (pid, _) = window_pid_tid(foreground);
+        if pid == self.own_pid {
+            return Err(CaptureError::HandyWindowFocused);
+        }
+        let mut native =
+            ScintillaTarget::open(foreground, deadline).map_err(native_capture_error)?;
+        // Flush pre-capture dirty flags before installing the native name hook.
+        // Capture evidence begins only after hooks are armed.
+        native.barrier(deadline).map_err(native_capture_error)?;
+        drain_messages();
+        let flag = Arc::new(AtomicU8::new(0));
+        super::track_live_target(&flag);
+        let mut hooks = install_hooks(pid, &flag, true)?;
+        let read = native.capture(deadline).and_then(|text| {
+            native.barrier(deadline)?;
+            Ok(text)
+        });
+        drain_messages();
+        let outcome = read.map_err(native_capture_error).and_then(|text| {
+            if invalidation_of(&flag).is_some() {
+                return Err(CaptureError::TargetChangedDuringCapture);
+            }
+            if Instant::now() >= deadline {
+                return Err(CaptureError::Timeout);
+            }
+            Ok(text
+                .map(CapturedText::Selected)
+                .unwrap_or(CapturedText::Empty))
+        });
+        let text = match outcome {
+            Ok(text) => text,
+            Err(error) => {
+                unhook_all(&mut hooks);
+                return Err(error);
+            }
+        };
+        self.next_id += 1;
+        let id = TargetId(self.next_id);
+        let empty = matches!(text, CapturedText::Empty);
+        self.target = Some(Tracked {
+            id,
+            target: TrackedTarget::Scintilla(native),
+            flag: flag.clone(),
+            hooks,
+        });
+        Ok(Captured {
+            text,
+            token: TargetToken::new(id, session, empty, flag, releaser()),
+        })
+    }
+
     fn release_current(&mut self, reason: Option<InvalidationReason>) {
         if let Some(mut tracked) = self.target.take() {
             if let Some(reason) = reason {
@@ -523,6 +632,15 @@ impl Worker {
     fn capture(&mut self, session: SessionId) -> Result<Captured, CaptureError> {
         self.release_current(Some(InvalidationReason::Superseded));
         let started = Instant::now();
+        // Kept fail-closed until the independent notification/barrier proof.
+        let native_foreground = unsafe { GetForegroundWindow() };
+        if native_scintilla::ENABLED && ScintillaTarget::recognizes(native_foreground) {
+            return self.capture_native(
+                session,
+                native_foreground,
+                started + super::CAPTURE_TIMEOUT,
+            );
+        }
         let uia = self
             .uia
             .as_ref()
@@ -546,7 +664,7 @@ impl Worker {
         // Hooks go in before any UIA read so changes during capture count.
         let flag = Arc::new(AtomicU8::new(0));
         super::track_live_target(&flag);
-        let mut hooks = install_hooks(pid, &flag)?;
+        let mut hooks = install_hooks(pid, &flag, false)?;
         let read = read_capture(uia, pid, self.own_pid);
         drain_messages();
         let outcome = read.and_then(|read| {
@@ -577,17 +695,19 @@ impl Worker {
         let empty = matches!(text, CapturedText::Empty);
         self.target = Some(Tracked {
             id,
-            identity: TargetIdentity {
-                foreground_hwnd: foreground.0 as usize,
-                pid,
-                thread_id: tid,
-                process_created: created,
-                gui_focus_hwnd: gui_focus,
-                runtime_id,
-                focused_pid,
-                original,
+            target: TrackedTarget::Uia {
+                identity: TargetIdentity {
+                    foreground_hwnd: foreground.0 as usize,
+                    pid,
+                    thread_id: tid,
+                    process_created: created,
+                    gui_focus_hwnd: gui_focus,
+                    runtime_id,
+                    focused_pid,
+                    original,
+                },
+                range,
             },
-            range,
             flag: flag.clone(),
             hooks,
         });
@@ -602,27 +722,45 @@ impl Worker {
         })
     }
 
-    fn validate(&mut self, id: TargetId, boundary: bool) -> Result<(), StaleReason> {
+    fn validate(&mut self, id: TargetId, deadline: Instant) -> Result<(), StaleReason> {
         drain_messages();
-        let uia = self
-            .uia
-            .as_ref()
-            .map_err(|e| StaleReason::Provider(e.clone()))?;
         let Some(tracked) = self.target.as_mut().filter(|t| t.id == id) else {
             return Err(StaleReason::Released);
         };
-        let mut live = WinLive::new(uia, &tracked.range);
-        let result = compare_evidence(&tracked.identity, invalidation_of(&tracked.flag), &mut live);
-        evidence::finish_validation(result, boundary, &tracked.flag, drain_messages, || {
-            unhook_all(&mut tracked.hooks);
-        })
+        let result = match &tracked.target {
+            TrackedTarget::Uia { identity, range } => {
+                let uia = self
+                    .uia
+                    .as_ref()
+                    .map_err(|e| StaleReason::Provider(e.clone()))?;
+                let mut live = WinLive::new(uia, range);
+                compare_evidence(identity, invalidation_of(&tracked.flag), &mut live)
+            }
+            TrackedTarget::Scintilla(native) => {
+                if let Some(reason) = invalidation_of(&tracked.flag) {
+                    Err(StaleReason::Invalidated(reason))
+                } else {
+                    native
+                        .validate(deadline)
+                        .and_then(|()| native.barrier(deadline))
+                        .map_err(native_stale_error)
+                }
+            }
+        };
+        evidence::finish_validation(result, false, &tracked.flag, drain_messages, || {})
     }
 
-    fn verify(&mut self, id: TargetId, text: &str) -> bool {
-        let Ok(uia) = self.uia.as_ref() else {
+    fn verify(&mut self, id: TargetId, text: &str, deadline: Instant) -> bool {
+        let Some(tracked) = self.target.as_ref().filter(|t| t.id == id) else {
             return false;
         };
-        let Some(tracked) = self.target.as_ref().filter(|t| t.id == id) else {
+        let TrackedTarget::Uia { identity, range } = &tracked.target else {
+            return match &tracked.target {
+                TrackedTarget::Scintilla(native) => native.verify(text, deadline),
+                _ => false,
+            };
+        };
+        let Ok(uia) = self.uia.as_ref() else {
             return false;
         };
         let check = || -> windows::core::Result<bool> {
@@ -632,7 +770,7 @@ impl Worker {
                     .automation
                     .GetFocusedElementBuildCache(&uia.focus_cache)?;
                 let runtime_id = cached_variant(&el, UIA_RuntimeIdPropertyId)?.as_i32_vec();
-                if runtime_id.as_ref() != Some(&tracked.identity.runtime_id) {
+                if runtime_id.as_ref() != Some(&identity.runtime_id) {
                     return Ok(false);
                 }
                 let pattern: IUIAutomationTextPattern =
@@ -657,11 +795,11 @@ impl Worker {
                     -evidence::verify_span(text),
                 )?;
                 let read = before.GetText(-1)?;
-                let empty_target = matches!(tracked.identity.original, OriginalSelection::Empty);
+                let empty_target = matches!(identity.original, OriginalSelection::Empty);
                 let caret_from_original_start = if empty_target {
                     caret.CompareEndpoints(
                         TextPatternRangeEndpoint_Start,
-                        &tracked.range,
+                        range,
                         TextPatternRangeEndpoint_Start,
                     )?
                 } else {
@@ -1012,7 +1150,6 @@ fn worker_main(rx: Receiver<Cmd>, ready: Sender<u32>) {
                 }
                 Cmd::Validate {
                     id,
-                    boundary,
                     deadline,
                     reply,
                 } => {
@@ -1021,7 +1158,30 @@ fn worker_main(rx: Receiver<Cmd>, ready: Sender<u32>) {
                     let result = if Instant::now() >= deadline {
                         Err(StaleReason::Unresponsive)
                     } else {
-                        worker.validate(id, boundary)
+                        worker.validate(id, deadline)
+                    };
+                    let _ = reply.send(result);
+                }
+                Cmd::PrepareInjection {
+                    id,
+                    deadline,
+                    reply,
+                } => {
+                    drain_messages();
+                    let result = if Instant::now() >= deadline {
+                        Err(StaleReason::Unresponsive)
+                    } else if let Some(tracked) = worker.target.as_mut().filter(|t| t.id == id) {
+                        evidence::finish_validation(
+                            Ok(()),
+                            true,
+                            &tracked.flag,
+                            || {},
+                            || {
+                                unhook_all(&mut tracked.hooks);
+                            },
+                        )
+                    } else {
+                        Err(StaleReason::Released)
                     };
                     let _ = reply.send(result);
                 }
@@ -1031,7 +1191,7 @@ fn worker_main(rx: Receiver<Cmd>, ready: Sender<u32>) {
                     deadline,
                     reply,
                 } => {
-                    let result = Instant::now() < deadline && worker.verify(id, &text);
+                    let result = Instant::now() < deadline && worker.verify(id, &text, deadline);
                     let _ = reply.send(result);
                 }
                 Cmd::Release(id) => {
@@ -1099,16 +1259,22 @@ fn begin_error(e: PublishError) -> BeginClipboardError {
 }
 
 impl CommitPlatform for WinCommitPlatform {
-    fn validate(
-        &mut self,
-        id: TargetId,
-        boundary: bool,
-        deadline: Instant,
-    ) -> Result<(), StaleReason> {
+    fn validate(&mut self, id: TargetId, deadline: Instant) -> Result<(), StaleReason> {
         request(
             |reply| Cmd::Validate {
                 id,
-                boundary,
+                deadline,
+                reply,
+            },
+            deadline,
+        )
+        .unwrap_or(Err(StaleReason::Unresponsive))
+    }
+
+    fn prepare_injection(&mut self, id: TargetId, deadline: Instant) -> Result<(), StaleReason> {
+        request(
+            |reply| Cmd::PrepareInjection {
+                id,
                 deadline,
                 reply,
             },
