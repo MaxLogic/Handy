@@ -30,21 +30,21 @@ This repository is also the source of **Handy MaxLogic**, a personal Windows bui
 
 ### Local configuration (RTX 3090)
 
-Speech: model `turbo` (Whisper Large v3 Turbo), GPU acceleration on the RTX 3090 Vulkan device, model unload timeout `Never`, overlay `None`, short or custom start/stop cues.
+See [Local models and shortcuts](docs/local-models.md) for the configuration checked on 2026-10-16, model purposes, server controls and current hotkeys. A copy is kept at `C:\models\README.md`.
 
-LLM servers are llama.cpp instances started by `C:\models\commands\start-*.cmd` (stop with `stop-*.cmd`; see `C:\models\commands\README.txt`). They run hidden, stay loaded and do not start at login.
+- Speech recognition: Whisper Large v3 Q5_K_M on Vulkan, kept loaded.
+- English transcript cleanup: S1-mini on port 8082.
+- Assistant, Polish-to-English dictation and other cleanup: Qwen3.5-9B Q4_K_M on port 8080.
+- Optional profile alternative: Qwen3.5-4B Q4_K_M on port 8081.
+- The Windows login task starts Qwen 9B and S1-mini after a 20-second delay.
 
-| Port | API base URL               | Model name                       | Use                                             | Context |
-| ---- | -------------------------- | -------------------------------- | ----------------------------------------------- | ------- |
-| 8080 | `http://127.0.0.1:8080/v1` | `qwen3.5:9b` (Qwen3.5-9B Q4_K_M) | Default cleanup and assistant                   | 16384   |
-| 8081 | `http://127.0.0.1:8081/v1` | `qwen3.5:4b` (Qwen3.5-4B Q4_K_M) | Faster alternative, as a profile model override | 16384   |
-| 8082 | `http://127.0.0.1:8082/v1` | `S1-mini`                        | English cleanup (thinking off, temperature 0)   | 4096    |
+Shortcuts: Ctrl+Space for processed dictation, Ctrl+Shift+Space for raw dictation, Ctrl+Alt+Space for the Selected Text Assistant, and Ctrl+Win+F9 for Polish-to-English dictation. Either dictation shortcut finishes any active recording while preserving its original mode. Escape cancels.
 
-In Handy MaxLogic: Post Process provider **Custom** with base URL `http://127.0.0.1:8080/v1` and model `qwen3.5:9b`. English cleanup uses base URL `http://127.0.0.1:8082/v1` and model `S1-mini`. A profile can override its model with `http://127.0.0.1:8081/v1` and `qwen3.5:4b`. Each server has one request slot. Before relying on a model, check its availability and reasoning behavior against the running server, and measure VRAM with speech and LLM models loaded together. Timing measurement is described in [docs/dictation-timing.md](docs/dictation-timing.md).
+Timing measurement is described in [docs/dictation-timing.md](docs/dictation-timing.md).
 
 ### Deferred
 
-- A separate arbitrary-language speech translation hotkey. Translation through a selected-text instruction works today.
+- Additional language-specific translation profiles beyond the configured Polish-to-English profile.
 - Integrations for additional custom editors and terminals.
 - Installer packages, code signing, distinct icons, and macOS/Linux fork builds.
 - Importing from an upstream portable install, or offering the import again after a decision.
